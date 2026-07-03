@@ -17,6 +17,8 @@ export interface Projectile {
   /** Thrown weapons arc under gravity and bounce; ranged shots fly flat. */
   arc: boolean;
   color: string;
+  /** VFX glow color derived from the owner's weapon (render-only). */
+  glow: string;
   radius: number;
 }
 
@@ -113,6 +115,7 @@ export function spawnProjectile(
     ttl: opts.arc ? 2.6 : 1.8,
     arc: opts.arc,
     color: owner.color,
+    glow: owner.style.glow,
     radius: opts.radius,
   });
 }

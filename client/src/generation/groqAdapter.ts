@@ -1,5 +1,6 @@
 import { DEFAULT_CHARACTER, parseCharacterSpec, type CharacterSpec } from "../types/character";
 import { balanceCharacter } from "../balance/statBudget";
+import { enrichCharacter } from "./enrich";
 import type { ModelAdapter } from "./modelAdapter";
 
 /**
@@ -37,10 +38,14 @@ export async function generateCharacter(prompt: string): Promise<GenerationResul
     const spec = parseCharacterSpec(extractJson(body.content));
     if (!spec) throw new Error("LLM response failed CharacterSpec validation");
 
-    return { spec: balanceCharacter(spec), fallback: false, mocked: Boolean(body.mocked) };
+    return {
+      spec: enrichCharacter(balanceCharacter(spec)),
+      fallback: false,
+      mocked: Boolean(body.mocked),
+    };
   } catch (err) {
     console.warn("[vibearena] generation failed, using default character:", err);
-    return { spec: balanceCharacter(DEFAULT_CHARACTER), fallback: true, mocked: false };
+    return { spec: enrichCharacter(balanceCharacter(DEFAULT_CHARACTER)), fallback: true, mocked: false };
   }
 }
 

@@ -12,10 +12,14 @@ import {
 } from "./combat";
 import { createKeyboard, emptyInput } from "./input";
 import { createBotBrain } from "./bot";
+import { createTheme, type ThemeView } from "./arena/themes";
+import { withAlpha } from "../render/color";
 
 /**
- * requestAnimationFrame loop with a fixed physics timestep. Rendering is
- * custom canvas chalk drawing over the Matter bodies.
+ * requestAnimationFrame loop with a fixed physics timestep. Rendering is a
+ * layered cinematic pass: themed parallax backdrop → world (fighters,
+ * projectiles, effects) under a follow camera → foreground parallax →
+ * letterbox bars.
  */
 
 export interface HudState {
@@ -36,6 +40,10 @@ const STEP = 1 / 60;
 const INTRO_SECONDS = 1.1;
 /** Let the loser flop around before cutting to the result screen. */
 const OUTRO_SECONDS = 1.6;
+
+/** Where the camera anchor lands on screen (ground sits low in frame). */
+const SCREEN_ANCHOR_Y = 0.74;
+const LETTERBOX_FRAC = 0.055;
 
 export function startGame(
   canvas: HTMLCanvasElement,
@@ -64,6 +72,10 @@ export function startGame(
   const keyboard = createKeyboard();
   keyboard.attach();
   const brain = createBotBrain();
+  const theme = createTheme();
+
+  // Follow camera: eases toward the fighters' midpoint, zooms with distance.
+  const cam = { x: ARENA_WIDTH / 2, zoom: 1.05 };
 
   let time = 0;
   let fightAnnounced = false;
@@ -85,7 +97,7 @@ export function startGame(
         x: ARENA_WIDTH / 2,
         y: ARENA_HEIGHT * 0.32,
         ttl: 0.9,
-        color: "#e0483e",
+        color: "#ffe6a3",
         text: "FIGHT!",
       });
     }
@@ -108,7 +120,7 @@ export function startGame(
           x: ARENA_WIDTH / 2,
           y: ARENA_HEIGHT * 0.3,
           ttl: OUTRO_SECONDS,
-          color: "#e8b33c",
+          color: "#ffd75e",
           text: winner === "player" ? "K.O." : "FLATTENED",
         });
       }
@@ -121,44 +133,62 @@ export function startGame(
     }
   }
 
-  function drawBoard(): void {
-    ctx2d.clearRect(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
-    ctx2d.save();
-    ctx2d.strokeStyle = "rgba(242, 240, 228, 0.5)";
-    ctx2d.lineWidth = 3;
-    ctx2d.lineCap = "round";
-    // Ground chalk line, slightly scuffed.
-    ctx2d.beginPath();
-    ctx2d.moveTo(14, arena.groundY + 2);
-    ctx2d.lineTo(ARENA_WIDTH - 14, arena.groundY + 2);
-    ctx2d.stroke();
-    // Center mark.
-    ctx2d.globalAlpha = 0.25;
-    ctx2d.setLineDash([4, 10]);
-    ctx2d.beginPath();
-    ctx2d.moveTo(ARENA_WIDTH / 2, arena.groundY - 6);
-    ctx2d.lineTo(ARENA_WIDTH / 2, arena.groundY - 40);
-    ctx2d.stroke();
-    ctx2d.restore();
+  function updateCamera(): void {
+    const px = player.root.position.x;
+    const bx = bot.root.position.x;
+    const midX = Math.max(280, Math.min(680, (px + bx) / 2));
+    const dist = Math.abs(px - bx);
+    const targetZoom = Math.max(0.95, Math.min(1.28, ARENA_WIDTH / (dist + 560)));
+    cam.x += (midX - cam.x) * 0.06;
+    cam.zoom += (targetZoom - cam.zoom) * 0.05;
+  }
+
+  /**
+   * Camera transform for a given parallax factor. factor 1 = the world plane
+   * the fighters live on; smaller factors track the camera less (far away),
+   * larger track it more (foreground).
+   */
+  function applyLayerTransform(factor: number): void {
+    const layerCamX = ARENA_WIDTH / 2 + (cam.x - ARENA_WIDTH / 2) * factor;
+    ctx2d.translate(ARENA_WIDTH / 2, ARENA_HEIGHT * SCREEN_ANCHOR_Y);
+    ctx2d.scale(cam.zoom, cam.zoom);
+    ctx2d.translate(-layerCamX, -(arena.groundY - 40));
   }
 
   function drawProjectiles(): void {
     for (const p of combat.projectiles) {
       ctx2d.save();
-      ctx2d.strokeStyle = p.color;
-      ctx2d.lineWidth = 3;
-      ctx2d.beginPath();
-      ctx2d.arc(p.body.position.x, p.body.position.y, p.radius, 0, Math.PI * 2);
-      ctx2d.stroke();
       // Motion streak.
-      ctx2d.globalAlpha = 0.35;
+      ctx2d.globalCompositeOperation = "lighter";
+      ctx2d.strokeStyle = withAlpha(p.glow, 0.4);
+      ctx2d.lineWidth = p.radius * 1.2;
+      ctx2d.lineCap = "round";
       ctx2d.beginPath();
       ctx2d.moveTo(p.body.position.x, p.body.position.y);
       ctx2d.lineTo(
-        p.body.position.x - p.body.velocity.x * 2.2,
-        p.body.position.y - p.body.velocity.y * 2.2,
+        p.body.position.x - p.body.velocity.x * 2.4,
+        p.body.position.y - p.body.velocity.y * 2.4,
       );
       ctx2d.stroke();
+      ctx2d.globalCompositeOperation = "source-over";
+      // Glowing core.
+      ctx2d.shadowColor = p.glow;
+      ctx2d.shadowBlur = 14;
+      ctx2d.fillStyle = p.color;
+      ctx2d.beginPath();
+      ctx2d.arc(p.body.position.x, p.body.position.y, p.radius, 0, Math.PI * 2);
+      ctx2d.fill();
+      ctx2d.shadowBlur = 0;
+      ctx2d.fillStyle = withAlpha("#ffffff", 0.5);
+      ctx2d.beginPath();
+      ctx2d.arc(
+        p.body.position.x - p.radius * 0.3,
+        p.body.position.y - p.radius * 0.3,
+        p.radius * 0.35,
+        0,
+        Math.PI * 2,
+      );
+      ctx2d.fill();
       ctx2d.restore();
     }
   }
@@ -173,11 +203,15 @@ export function startGame(
       if (e.kind === "ring") {
         const r = (e.radius ?? 20) * (1.6 - life * 0.6);
         ctx2d.lineWidth = 3;
+        ctx2d.shadowColor = e.color;
+        ctx2d.shadowBlur = 10;
         ctx2d.beginPath();
         ctx2d.arc(e.x, e.y, r, 0, Math.PI * 2);
         ctx2d.stroke();
       } else if (e.kind === "spark") {
         ctx2d.lineWidth = 2.5;
+        ctx2d.shadowColor = e.color;
+        ctx2d.shadowBlur = 8;
         const r = e.radius ?? 12;
         for (let i = 0; i < 5; i++) {
           const a = (i / 5) * Math.PI * 2 + e.maxTtl;
@@ -195,6 +229,9 @@ export function startGame(
           ? "48px Anton, Impact, sans-serif"
           : "20px Anton, Impact, sans-serif";
         ctx2d.textAlign = "center";
+        ctx2d.shadowColor = "rgba(0, 0, 0, 0.45)";
+        ctx2d.shadowBlur = 6;
+        ctx2d.shadowOffsetY = 2;
         ctx2d.fillText(e.text ?? "", e.x, e.y - (1 - life) * 26);
       }
       ctx2d.restore();
@@ -202,11 +239,56 @@ export function startGame(
   }
 
   function render(): void {
-    drawBoard();
-    renderFighter(ctx2d, player, time);
-    renderFighter(ctx2d, bot, time);
+    updateCamera();
+    const view: ThemeView = {
+      w: ARENA_WIDTH,
+      h: ARENA_HEIGHT,
+      time,
+      groundY: arena.groundY,
+    };
+
+    // 1. Sky — pure screen space.
+    theme.drawSky(ctx2d, view);
+
+    // 2. Background parallax layers (includes the ground plane at factor 1).
+    for (const layer of theme.layers) {
+      ctx2d.save();
+      applyLayerTransform(layer.parallax);
+      layer.draw(ctx2d, view);
+      ctx2d.restore();
+    }
+
+    // 3. World pass: everything that lives on the fight plane.
+    ctx2d.save();
+    applyLayerTransform(1);
+    renderFighter(ctx2d, player, time, arena.groundY);
+    renderFighter(ctx2d, bot, time, arena.groundY);
     drawProjectiles();
     drawEffects();
+    ctx2d.restore();
+
+    // 4. Foreground parallax.
+    for (const layer of theme.foreground) {
+      ctx2d.save();
+      applyLayerTransform(layer.parallax);
+      layer.draw(ctx2d, view);
+      ctx2d.restore();
+    }
+
+    // 5. Cinematic frame: soft vignette + letterbox bars.
+    const vignette = ctx2d.createRadialGradient(
+      ARENA_WIDTH / 2, ARENA_HEIGHT * 0.45, ARENA_HEIGHT * 0.45,
+      ARENA_WIDTH / 2, ARENA_HEIGHT * 0.45, ARENA_HEIGHT * 1.05,
+    );
+    vignette.addColorStop(0, "rgba(0, 0, 0, 0)");
+    vignette.addColorStop(1, "rgba(10, 12, 10, 0.32)");
+    ctx2d.fillStyle = vignette;
+    ctx2d.fillRect(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
+
+    const bar = Math.round(ARENA_HEIGHT * LETTERBOX_FRAC);
+    ctx2d.fillStyle = "#06080a";
+    ctx2d.fillRect(0, 0, ARENA_WIDTH, bar);
+    ctx2d.fillRect(0, ARENA_HEIGHT - bar, ARENA_WIDTH, bar);
   }
 
   function tick(now: number): void {

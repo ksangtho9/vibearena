@@ -1,18 +1,44 @@
 import { z } from "zod";
 
+export const WEAPON_ARCHETYPES = [
+  "sword", "spear", "staff", "bow", "thrown", "shield", "gauntlet", "orb",
+] as const;
+export type WeaponArchetypeId = (typeof WEAPON_ARCHETYPES)[number];
+
+export const ELEMENTS = ["fire", "ice", "lightning", "poison", "none"] as const;
+export type ElementKind = (typeof ELEMENTS)[number];
+
+export interface WeaponVfx {
+  glow: string;
+  element?: ElementKind;
+  trail?: boolean;
+}
+
 /**
  * The contract between the LLM and the game. The LLM proposes a character on
  * loose 1–10 scales; balance/statBudget.ts then rebalances everything onto a
  * fixed budget so a prompt defines identity, never dominance.
+ *
+ * The optional fields (archetype, vfx, accentColor, outline) are DERIVED by
+ * generation/enrich.ts after validation — they are stripped from raw LLM
+ * output and always recomputed, never trusted from the model.
  */
 export interface CharacterSpec {
   name: string;
-  appearance: { color: string; accessories: string[]; height: number }; // height 0.8–1.2
+  appearance: {
+    color: string;
+    accessories: string[];
+    height: number; // 0.8–1.2
+    accentColor?: string;
+    outline?: string;
+  };
   weapon: {
     type: "melee" | "ranged" | "thrown";
     name: string;
     range: number;
     damage: number;
+    archetype?: WeaponArchetypeId;
+    vfx?: WeaponVfx;
   };
   ability: {
     name: string;
@@ -33,12 +59,22 @@ export const characterSpecSchema = z.object({
     color: z.string().min(1).max(48),
     accessories: z.array(z.string().max(48)).max(6).default([]),
     height: z.coerce.number().finite(),
+    accentColor: z.string().max(48).optional(),
+    outline: z.string().max(48).optional(),
   }),
   weapon: z.object({
     type: z.enum(WEAPON_TYPES),
     name: z.string().min(1).max(48),
     range: z.coerce.number().finite(),
     damage: z.coerce.number().finite(),
+    archetype: z.enum(WEAPON_ARCHETYPES).optional(),
+    vfx: z
+      .object({
+        glow: z.string().max(48),
+        element: z.enum(ELEMENTS).optional(),
+        trail: z.boolean().optional(),
+      })
+      .optional(),
   }),
   ability: z.object({
     name: z.string().min(1).max(48),
@@ -88,9 +124,20 @@ function normalizeRaw(raw: unknown): unknown {
   if (typeof raw !== "object" || raw === null) return raw;
   const clone = JSON.parse(JSON.stringify(raw)) as Record<string, unknown>;
   const weapon = clone.weapon as Record<string, unknown> | undefined;
-  if (weapon && typeof weapon.type === "string") {
-    const key = weapon.type.toLowerCase().trim();
-    weapon.type = WEAPON_ALIASES[key] ?? key;
+  if (weapon) {
+    if (typeof weapon.type === "string") {
+      const key = weapon.type.toLowerCase().trim();
+      weapon.type = WEAPON_ALIASES[key] ?? key;
+    }
+    // Derived fields: recomputed by enrichCharacter, never taken from the model
+    // (and junk values here must not fail validation of an otherwise good spec).
+    delete weapon.archetype;
+    delete weapon.vfx;
+  }
+  const appearance = clone.appearance as Record<string, unknown> | undefined;
+  if (appearance) {
+    delete appearance.accentColor;
+    delete appearance.outline;
   }
   const ability = clone.ability as Record<string, unknown> | undefined;
   if (ability && typeof ability.kind === "string") {

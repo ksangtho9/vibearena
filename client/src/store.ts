@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { CharacterSpec } from "./types/character";
 import { generateCharacter } from "./generation/groqAdapter";
+import { enrichCharacter } from "./generation/enrich";
 import { balanceCharacter } from "./balance/statBudget";
 import { pickBotSpec } from "./game/bot";
 import type { Side } from "./game/stickman";
@@ -58,7 +59,12 @@ export const useVibeStore = create<VibeStore>((set, get) => ({
 
   enterFight: () => {
     // A fresh house fighter each match, balanced on the same budget.
-    set({ botSpec: balanceCharacter(pickBotSpec()), result: null, hud: null, phase: "fight" });
+    set({
+      botSpec: enrichCharacter(balanceCharacter(pickBotSpec())),
+      result: null,
+      hud: null,
+      phase: "fight",
+    });
   },
 
   setHud: (hud) => set({ hud }),
