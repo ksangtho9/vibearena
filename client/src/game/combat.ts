@@ -3,10 +3,15 @@ import type { Arena } from "./arena";
 import { collapse, type Fighter, type Side } from "./stickman";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
+import { ATTACK_TIMING } from "./animation";
+import { ARCHETYPES } from "./weapons/archetypes";
 
 /**
- * Damage, knockback, HP and projectiles. All tuning constants live here so
- * the feel of the game is adjustable in one place.
+ * Damage, knockback, HP and projectiles. Weapons have NO physics bodies:
+ * during an attack's ACTIVE frames the weapon's world-space segment is
+ * computed from the hand joint + archetype geometry and raycast against the
+ * opponent's hurtbox (their root capsule). Hits apply damage, knockback,
+ * hitstun/launched reactions, VFX and a brief hit-stop.
  */
 
 export interface Projectile {
@@ -37,15 +42,27 @@ export interface CombatCtx {
   arena: Arena;
   projectiles: Projectile[];
   effects: Effect[];
+  /** Global freeze remaining (seconds) — set on weapon hits for punch. */
+  hitstop: number;
+  /** Game clock, fed by the loop; the animators sway/bob off it. */
+  time: number;
 }
 
 const DAMAGE_SCALE = 2.2;
 const MELEE_ATTACK_COOLDOWN = 0.55;
 const MISSILE_ATTACK_COOLDOWN = 0.8;
-const ATTACK_WINDOW = 0.2;
+
+const HITSTUN_TIME = 0.26;
+const LAUNCH_TIME = 0.5;
+/** Mitigated damage at or above this sends the target flying. */
+const LAUNCH_DAMAGE = 15;
+const HITSTOP_TIME = 0.07;
 
 const speedOf = (f: Fighter) => (3 + f.spec.stats.speed * 0.035) * f.buffs.speedMul;
 const jumpVelOf = (f: Fighter) => 11 + f.spec.stats.speed * 0.015;
+
+const isMissile = (f: Fighter) => f.spec.weapon.type !== "melee";
+const attackTiming = (f: Fighter) => (isMissile(f) ? ATTACK_TIMING.missile : ATTACK_TIMING.melee);
 
 /** Attacker-side damage before the defender's mitigation. */
 export function rawDamage(attacker: Fighter, base: number): number {
@@ -56,7 +73,10 @@ export function pushEffect(ctx: CombatCtx, effect: Omit<Effect, "maxTtl">): void
   ctx.effects.push({ ...effect, maxTtl: effect.ttl });
 }
 
-/** Apply mitigated damage + knockback. Handles death (ragdoll collapse). */
+/**
+ * Apply mitigated damage + knockback + hit reaction. Normal hits cause
+ * hitstun; heavy hits launch; lethal hits hand the body to the ragdoll.
+ */
 export function dealDamage(
   target: Fighter,
   amount: number,
@@ -82,7 +102,19 @@ export function dealDamage(
     y: Math.min(target.root.velocity.y, -kb * 0.4),
   });
 
-  if (target.hp <= 0) collapse(target);
+  // Hit reaction: interrupted, staggered, or sent flying.
+  if (dmg >= LAUNCH_DAMAGE || knockbackMul > 1.3) {
+    target.launchedTimer = LAUNCH_TIME;
+    target.hitstunTimer = 0;
+  } else if (target.shieldTimer <= 0) {
+    target.hitstunTimer = HITSTUN_TIME;
+  }
+  target.attackAnim = 0;
+  target.attackWindow = 0;
+
+  ctx.hitstop = Math.max(ctx.hitstop, HITSTOP_TIME);
+
+  if (target.hp <= 0) collapse(target, ctx.arena.world);
 }
 
 export function spawnProjectile(
@@ -90,10 +122,11 @@ export function spawnProjectile(
   ctx: CombatCtx,
   opts: { damage: number; speed: number; radius: number; arc: boolean },
 ): void {
-  const { x, y } = owner.root.position;
+  // Launch from the weapon hand joint.
+  const hand = owner.skeleton.handR;
   const body = Matter.Bodies.circle(
-    x + owner.facing * 26 * owner.scale,
-    y - 24 * owner.scale,
+    hand.x + owner.facing * 6 * owner.scale,
+    hand.y,
     opts.radius,
     {
       collisionFilter: { group: owner.root.collisionFilter.group }, // never hits its owner
@@ -120,45 +153,75 @@ export function spawnProjectile(
   });
 }
 
-function startAttack(f: Fighter, ctx: CombatCtx): void {
-  const { weapon } = f.spec;
-  f.attackWindow = ATTACK_WINDOW;
+function startAttack(f: Fighter): void {
+  f.attackCooldown = isMissile(f) ? MISSILE_ATTACK_COOLDOWN : MELEE_ATTACK_COOLDOWN;
+  f.attackAnim = attackTiming(f).total;
+  f.attackWindow = 0;
   f.hasHitThisSwing = false;
-
-  if (weapon.type === "melee") {
-    f.attackCooldown = MELEE_ATTACK_COOLDOWN;
-    // Fling the weapon arm forward for the visual swing.
-    Matter.Body.setVelocity(f.arms[1].body, {
-      x: f.facing * 14,
-      y: -6,
-    });
-  } else {
-    f.attackCooldown = MISSILE_ATTACK_COOLDOWN;
-    spawnProjectile(f, ctx, {
-      damage: rawDamage(f, weapon.damage),
-      speed: weapon.type === "ranged" ? 13 : 10,
-      radius: weapon.type === "ranged" ? 5 : 7,
-      arc: weapon.type === "thrown",
-    });
-  }
+  f.projectileFired = false;
 }
 
-/** Melee hitbox in front of the fighter, sized by weapon range. */
-function resolveMelee(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
-  if (f.spec.weapon.type !== "melee" || f.attackWindow <= 0 || f.hasHitThisSwing) return;
-
-  const { x, y } = f.root.position;
-  const reach = f.spec.weapon.range;
-  const x1 = x + f.facing * 6;
-  const x2 = x + f.facing * (6 + reach);
-  const bounds = {
-    min: { x: Math.min(x1, x2), y: y - 55 * f.scale },
-    max: { x: Math.max(x1, x2), y: y + 45 * f.scale },
+/**
+ * The weapon's world-space segment: from the hand joint out along the
+ * animated weapon angle, as far as the archetype's drawn length or the
+ * balanced gameplay range, whichever is longer.
+ */
+function weaponSegment(f: Fighter): { from: Matter.Vector; to: Matter.Vector } {
+  const hand = f.skeleton.handR;
+  const tip = ARCHETYPES[f.style.archetype].tip * f.scale * 0.95;
+  const reach = Math.max(tip, f.spec.weapon.range * 0.6);
+  return {
+    from: { x: hand.x, y: hand.y },
+    to: {
+      x: hand.x + Math.cos(f.weaponAngle) * reach,
+      y: hand.y + Math.sin(f.weaponAngle) * reach,
+    },
   };
-  const hits = Matter.Query.region(opponent.hittable, bounds);
-  if (hits.length > 0) {
-    f.hasHitThisSwing = true;
-    dealDamage(opponent, rawDamage(f, f.spec.weapon.damage), f.facing, ctx);
+}
+
+/** Advance the attack phases: active-frame hit tests and projectile release. */
+function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
+  if (f.attackAnim <= 0) {
+    f.attackWindow = 0;
+    return;
+  }
+  const timing = attackTiming(f);
+  const elapsed = timing.total - f.attackAnim;
+  const activeEnd = timing.windup + timing.active;
+
+  f.attackWindow =
+    elapsed >= timing.windup && elapsed < activeEnd ? activeEnd - elapsed : 0;
+
+  if (isMissile(f)) {
+    if (elapsed >= timing.windup && !f.projectileFired) {
+      f.projectileFired = true;
+      const { weapon } = f.spec;
+      spawnProjectile(f, ctx, {
+        damage: rawDamage(f, weapon.damage),
+        speed: weapon.type === "ranged" ? 13 : 10,
+        radius: weapon.type === "ranged" ? 5 : 7,
+        arc: weapon.type === "thrown",
+      });
+    }
+    return;
+  }
+
+  // Melee: raycast the weapon segment against the opponent's hurtbox.
+  if (f.attackWindow > 0 && !f.hasHitThisSwing && opponent.alive) {
+    const seg = weaponSegment(f);
+    const hits = Matter.Query.ray([opponent.root], seg.from, seg.to, 10 * f.scale);
+    if (hits.length > 0) {
+      f.hasHitThisSwing = true;
+      dealDamage(opponent, rawDamage(f, f.spec.weapon.damage), f.facing, ctx);
+      pushEffect(ctx, {
+        kind: "ring",
+        x: seg.to.x,
+        y: seg.to.y,
+        ttl: 0.25,
+        color: f.style.glow,
+        radius: 16,
+      });
+    }
   }
 }
 
@@ -174,18 +237,24 @@ function updateGrounded(f: Fighter, ctx: CombatCtx): void {
 
 function tickTimers(f: Fighter, dt: number): void {
   f.attackCooldown = Math.max(0, f.attackCooldown - dt);
-  f.attackWindow = Math.max(0, f.attackWindow - dt);
+  f.attackAnim = Math.max(0, f.attackAnim - dt);
   f.jumpCooldown = Math.max(0, f.jumpCooldown - dt);
   f.abilityCooldown = Math.max(0, f.abilityCooldown - dt);
   f.shieldTimer = Math.max(0, f.shieldTimer - dt);
   f.introTimer = Math.max(0, f.introTimer - dt);
+  f.hitstunTimer = Math.max(0, f.hitstunTimer - dt);
+  f.launchedTimer = Math.max(0, f.launchedTimer - dt);
+  f.castTimer = Math.max(0, f.castTimer - dt);
   if (f.buffTimer > 0) {
     f.buffTimer = Math.max(0, f.buffTimer - dt);
     if (f.buffTimer === 0) f.buffs = { speedMul: 1, strengthMul: 1 };
   }
 }
 
-/** One simulation tick for one fighter: timers, facing, movement, attacks. */
+/**
+ * One simulation tick for one fighter: timers, control, attack progression,
+ * then the animator poses the skeleton (the render just draws it).
+ */
 export function updateFighter(
   f: Fighter,
   opponent: Fighter,
@@ -194,35 +263,63 @@ export function updateFighter(
   dt: number,
 ): void {
   tickTimers(f, dt);
-  if (!f.alive) return;
+  if (!f.alive) return; // the KO ragdoll belongs to the physics engine now
 
   updateGrounded(f, ctx);
 
   // Fighters always square up to their opponent.
   f.facing = opponent.root.position.x >= f.root.position.x ? 1 : -1;
 
-  if (f.introTimer > 0) return; // round intro: no inputs yet
-
-  const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+  const stunned = f.hitstunTimer > 0 || f.launchedTimer > 0;
   const v = f.root.velocity;
-  if (dir !== 0) {
-    Matter.Body.setVelocity(f.root, { x: dir * speedOf(f), y: v.y });
-  } else if (f.grounded) {
-    Matter.Body.setVelocity(f.root, { x: v.x * 0.8, y: v.y });
+
+  if (f.introTimer <= 0 && !stunned) {
+    const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    if (dir !== 0) {
+      Matter.Body.setVelocity(f.root, { x: dir * speedOf(f), y: v.y });
+    } else if (f.grounded) {
+      Matter.Body.setVelocity(f.root, { x: v.x * 0.8, y: v.y });
+    }
+
+    if (input.jump && f.grounded && f.jumpCooldown <= 0) {
+      Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
+      f.jumpCooldown = 0.3;
+    }
+
+    if (input.attack && f.attackCooldown <= 0 && f.attackAnim <= 0) startAttack(f);
+
+    if (input.ability && f.abilityCooldown <= 0) {
+      f.abilityCooldown = f.spec.ability.cooldown;
+      useAbility(f, opponent, ctx);
+    }
+  } else if (stunned && f.grounded) {
+    // Staggered: skid to a stop, no control.
+    Matter.Body.setVelocity(f.root, { x: v.x * 0.85, y: v.y });
   }
 
-  if (input.jump && f.grounded && f.jumpCooldown <= 0) {
-    Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
-    f.jumpCooldown = 0.3;
-  }
+  progressAttack(f, opponent, ctx);
 
-  if (input.attack && f.attackCooldown <= 0) startAttack(f, ctx);
-  resolveMelee(f, opponent, ctx);
-
-  if (input.ability && f.abilityCooldown <= 0) {
-    f.abilityCooldown = f.spec.ability.cooldown;
-    useAbility(f, opponent, ctx);
-  }
+  // Pose the skeleton — the single source of truth for how this looks.
+  const timing = attackTiming(f);
+  const frame = f.animator.update(dt, {
+    rootX: f.root.position.x,
+    rootY: f.root.position.y,
+    vx: f.root.velocity.x,
+    vy: f.root.velocity.y,
+    grounded: f.grounded,
+    facing: f.facing,
+    moving: Math.abs(f.root.velocity.x) > 0.6 && f.grounded,
+    alive: f.alive,
+    attackElapsed: f.attackAnim > 0 ? timing.total - f.attackAnim : -1,
+    missileWeapon: isMissile(f),
+    castTimer: f.castTimer,
+    hitstunTimer: f.hitstunTimer,
+    launchedTimer: f.launchedTimer,
+    groundY: ctx.arena.groundY,
+    time: ctx.time,
+  });
+  f.skeleton = frame.skeleton;
+  f.weaponAngle = frame.weaponAngle;
 }
 
 export function updateProjectiles(
@@ -246,21 +343,22 @@ export function updateProjectiles(
     }
 
     const target = p.ownerSide === "player" ? fighters.bot : fighters.player;
-    const hit = Matter.Query.collides(p.body, target.hittable).length > 0;
+    const hit =
+      target.alive && Matter.Query.collides(p.body, [target.root]).length > 0;
     const hitGround = Matter.Query.collides(p.body, [arena.ground]).length > 0;
     const out =
       p.ttl <= 0 ||
       p.body.position.x < -60 ||
       p.body.position.x > arena.width + 60;
 
-    if (hit && target.alive) {
+    if (hit) {
       dealDamage(target, p.damage, Math.sign(p.body.velocity.x) || 1, ctx);
       pushEffect(ctx, {
         kind: "ring",
         x: p.body.position.x,
         y: p.body.position.y,
         ttl: 0.3,
-        color: p.color,
+        color: p.glow,
         radius: p.radius * 4,
       });
     }

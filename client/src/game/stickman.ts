@@ -3,30 +3,31 @@ import type { CharacterSpec } from "../types/character";
 import { resolveStyle, type ResolvedStyle } from "../generation/enrich";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
 import { ARCHETYPES, type WeaponStyle } from "./weapons/archetypes";
+import {
+  bonesFor,
+  createAnimator,
+  type Animator,
+  type Bones,
+  type Skeleton,
+  type Vec,
+} from "./animation";
 
 // Re-exported for UI code that colors HP bars etc.
 export { safeCssColor } from "../render/color";
 
 /**
- * Ragdoll stickman: head, torso, two arms, two legs, held together with
- * constraints. While alive the torso has infinite inertia (it stays upright
- * and controllable) and the limbs dangle with real physics. On death the
- * torso's inertia is restored and the whole thing collapses into a ragdoll.
+ * A fighter is ONE kinematic root capsule in Matter (collision, walking,
+ * jumping, knockback) plus a Skeleton posed by the AnimationController every
+ * step — skeletal animation is the source of truth for motion. Physics takes
+ * over only for the KO ragdoll: on death a full multi-body ragdoll is spawned
+ * seeded from the current pose and velocity, and rendering switches to it.
  *
- * Rendering is flat "animator" style: slim tapered capsules over the ragdoll
- * joints in a single uniform body color — no internal shading of any kind.
- * The only shadow is the soft contact shadow on the ground. The drawn vector
- * weapon from the archetype library attaches to the weapon hand. While alive
- * the head is rendered upright on the neck (tracking the torso, not the
- * dangling physics head body); the floppy head is KO-ragdoll only.
+ * Rendering is flat "animator" style: slim continuous tapered limbs drawn
+ * from the skeleton joints (real IK elbows/knees), one uniform body color,
+ * ground contact shadow only, weapon archetype attached to the hand joint.
  */
 
 export type Side = "player" | "bot";
-
-export interface Limb {
-  body: Matter.Body;
-  halfLen: number;
-}
 
 export interface FighterBuffs {
   speedMul: number;
@@ -39,6 +40,21 @@ interface TrailPoint {
   t: number;
 }
 
+interface RagdollLimb {
+  body: Matter.Body;
+  halfLen: number;
+}
+
+export interface Ragdoll {
+  torso: RagdollLimb;
+  head: Matter.Body;
+  armL: RagdollLimb;
+  armR: RagdollLimb;
+  legL: RagdollLimb;
+  legR: RagdollLimb;
+  all: Matter.Body[];
+}
+
 export interface Fighter {
   spec: CharacterSpec;
   side: Side;
@@ -47,13 +63,15 @@ export interface Fighter {
   scale: number;
   facing: 1 | -1;
 
+  /** The only physics body during normal play. */
   root: Matter.Body;
-  head: Matter.Body;
-  arms: [Limb, Limb]; // [left, right] — right hand holds the weapon
-  legs: [Limb, Limb];
-  /** Bodies that count as "hit me here". */
-  hittable: Matter.Body[];
-  constraints: Matter.Constraint[];
+  bones: Bones;
+  animator: Animator;
+  /** Last posed skeleton — combat reads hand joints, rendering draws it. */
+  skeleton: Skeleton;
+  weaponAngle: number;
+  /** Spawned on KO; when set, rendering and shadows read from it. */
+  ragdoll: Ragdoll | null;
 
   hp: number;
   maxHp: number;
@@ -62,18 +80,22 @@ export interface Fighter {
 
   // Countdown timers, in seconds.
   attackCooldown: number;
+  /** Remaining time of the whole attack animation (windup+active+recovery). */
+  attackAnim: number;
+  /** >0 during the attack's ACTIVE frames (bot AI + trail read this). */
   attackWindow: number;
   hasHitThisSwing: boolean;
+  projectileFired: boolean;
   jumpCooldown: number;
   abilityCooldown: number;
   shieldTimer: number;
   buffTimer: number;
   introTimer: number;
+  hitstunTimer: number;
+  launchedTimer: number;
+  castTimer: number;
 
   buffs: FighterBuffs;
-  savedInertia: number;
-
-  /** Recent weapon-tip positions for the swing trail (render-only state). */
   trail: TrailPoint[];
 }
 
@@ -88,109 +110,41 @@ export function createFighter(
 ): Fighter {
   const s = spec.appearance.height; // already clamped to 0.8–1.2 by the balancer
   const group = COLLISION_GROUP[side];
-  const filter = { group };
 
-  const rootHalfH = 44 * s;
-  const rootY = groundY - rootHalfH;
-  const headR = 11 * s;
-  const armLen = 30 * s;
-  const legLen = 34 * s;
-  const shoulderY = -26 * s; // offsets from root center
-  const hipY = 14 * s;
-
-  const root = Matter.Bodies.rectangle(x, rootY, 16 * s, rootHalfH * 2, {
-    collisionFilter: filter,
+  const root = Matter.Bodies.rectangle(x, groundY - 44 * s, 18 * s, 88 * s, {
+    chamfer: { radius: 9 * s },
+    collisionFilter: { group },
+    inertia: Infinity, // kinematic capsule: never tips over
     density: 0.004,
     friction: 0.05,
     frictionAir: 0.015,
     restitution: 0,
     label: `${side}-root`,
   });
-  const savedInertia = root.inertia;
-  Matter.Body.setInertia(root, Infinity); // stands upright until it dies
+  Matter.Composite.add(world, root);
 
-  const head = Matter.Bodies.circle(x, rootY - rootHalfH - headR * 0.7, headR, {
-    collisionFilter: filter,
-    density: 0.0015,
-    frictionAir: 0.02,
-    label: `${side}-head`,
+  const bones = bonesFor(s);
+  const animator = createAnimator(bones);
+  const facing: 1 | -1 = side === "player" ? 1 : -1;
+
+  // Pose once so the skeleton is valid before the first step.
+  const frame = animator.update(0, {
+    rootX: x,
+    rootY: groundY - 44 * s,
+    vx: 0,
+    vy: 0,
+    grounded: true,
+    facing,
+    moving: false,
+    alive: true,
+    attackElapsed: -1,
+    missileWeapon: spec.weapon.type !== "melee",
+    castTimer: 0,
+    hitstunTimer: 0,
+    launchedTimer: 0,
+    groundY,
+    time: 0,
   });
-
-  const limb = (
-    lx: number,
-    ly: number,
-    thickness: number,
-    length: number,
-    label: string,
-  ): Limb => ({
-    body: Matter.Bodies.rectangle(lx, ly + length / 2, thickness, length, {
-      collisionFilter: filter,
-      density: 0.0008,
-      frictionAir: 0.03,
-      friction: 0.4,
-      label,
-    }),
-    halfLen: length / 2,
-  });
-
-  const arms: [Limb, Limb] = [
-    limb(x - 3 * s, rootY + shoulderY, 5 * s, armLen, `${side}-arm-l`),
-    limb(x + 3 * s, rootY + shoulderY, 5 * s, armLen, `${side}-arm-r`),
-  ];
-  const legs: [Limb, Limb] = [
-    limb(x - 4 * s, rootY + hipY, 6 * s, legLen, `${side}-leg-l`),
-    limb(x + 4 * s, rootY + hipY, 6 * s, legLen, `${side}-leg-r`),
-  ];
-
-  const pin = (
-    bodyB: Matter.Body,
-    pointA: Matter.Vector,
-    pointB: Matter.Vector,
-    stiffness = 0.9,
-  ): Matter.Constraint =>
-    Matter.Constraint.create({
-      bodyA: root,
-      bodyB,
-      pointA,
-      pointB,
-      length: 0,
-      stiffness,
-      damping: 0.1,
-    });
-
-  /** Soft spring that keeps a dangling limb loosely at rest — the jiggle. */
-  const restSpring = (
-    limbOf: Limb,
-    anchorOnRoot: Matter.Vector,
-    stiffness: number,
-  ): Matter.Constraint =>
-    Matter.Constraint.create({
-      bodyA: root,
-      bodyB: limbOf.body,
-      pointA: anchorOnRoot,
-      pointB: { x: 0, y: limbOf.halfLen },
-      length: 8 * s,
-      stiffness,
-      damping: 0.05,
-    });
-
-  const constraints = [
-    // Neck: head bobbles above the torso.
-    pin(head, { x: 0, y: -rootHalfH }, { x: 0, y: headR * 0.7 }, 0.7),
-    // Shoulders and hips.
-    pin(arms[0].body, { x: -3 * s, y: shoulderY }, { x: 0, y: -arms[0].halfLen }),
-    pin(arms[1].body, { x: 3 * s, y: shoulderY }, { x: 0, y: -arms[1].halfLen }),
-    pin(legs[0].body, { x: -4 * s, y: hipY }, { x: 0, y: -legs[0].halfLen }),
-    pin(legs[1].body, { x: 4 * s, y: hipY }, { x: 0, y: -legs[1].halfLen }),
-    // Rest springs so limbs hang instead of flailing.
-    restSpring(arms[0], { x: -9 * s, y: shoulderY + armLen * 0.8 }, 0.012),
-    restSpring(arms[1], { x: 9 * s, y: shoulderY + armLen * 0.8 }, 0.012),
-    restSpring(legs[0], { x: -6 * s, y: rootHalfH }, 0.02),
-    restSpring(legs[1], { x: 6 * s, y: rootHalfH }, 0.02),
-  ];
-
-  const bodies = [root, head, arms[0].body, arms[1].body, legs[0].body, legs[1].body];
-  Matter.Composite.add(world, [...bodies, ...constraints]);
 
   const style = resolveStyle(spec);
 
@@ -200,27 +154,31 @@ export function createFighter(
     color: style.fill,
     style,
     scale: s,
-    facing: side === "player" ? 1 : -1,
+    facing,
     root,
-    head,
-    arms,
-    legs,
-    hittable: bodies,
-    constraints,
+    bones,
+    animator,
+    skeleton: frame.skeleton,
+    weaponAngle: frame.weaponAngle,
+    ragdoll: null,
     hp: maxHpOf(spec),
     maxHp: maxHpOf(spec),
     alive: true,
     grounded: false,
     attackCooldown: 0,
+    attackAnim: 0,
     attackWindow: 0,
     hasHitThisSwing: false,
+    projectileFired: false,
     jumpCooldown: 0,
     abilityCooldown: 0,
     shieldTimer: 0,
     buffTimer: 0,
     introTimer: 0,
+    hitstunTimer: 0,
+    launchedTimer: 0,
+    castTimer: 0,
     buffs: { speedMul: 1, strengthMul: 1 },
-    savedInertia,
     trail: [],
   };
 }
@@ -229,20 +187,111 @@ export function maxHpOf(spec: CharacterSpec): number {
   return Math.round(spec.stats.hp * 1.5);
 }
 
-/** Death: give the torso its inertia back and let physics have the body. */
-export function collapse(fighter: Fighter): void {
-  fighter.alive = false;
-  Matter.Body.setInertia(fighter.root, fighter.savedInertia);
-  Matter.Body.setAngularVelocity(fighter.root, -fighter.facing * (0.15 + Math.random() * 0.1));
+/** X position that stays meaningful after death (camera, distances). */
+export function fighterX(fighter: Fighter): number {
+  return fighter.ragdoll ? fighter.ragdoll.torso.body.position.x : fighter.root.position.x;
 }
 
 // ---------------------------------------------------------------------------
-// Solid-fill rendering
+// KO ragdoll: physics takes over from the animator
 // ---------------------------------------------------------------------------
 
-const TRAIL_SECONDS = 0.22;
+/** A limb body laid along from→to, so its endpoints match skeleton joints. */
+function limbBody(
+  from: Vec,
+  to: Vec,
+  thickness: number,
+  group: number,
+  label: string,
+): RagdollLimb {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const len = Math.max(8, Math.hypot(dx, dy));
+  const body = Matter.Bodies.rectangle((from.x + to.x) / 2, (from.y + to.y) / 2, thickness, len, {
+    collisionFilter: { group },
+    density: 0.0008,
+    frictionAir: 0.02,
+    friction: 0.4,
+    label,
+  });
+  Matter.Body.setAngle(body, Math.atan2(-dx / len, dy / len));
+  return { body, halfLen: len / 2 };
+}
 
-function limbEndpoints(l: Limb): [Matter.Vector, Matter.Vector] {
+/**
+ * Death: spawn a full multi-body ragdoll seeded from the current skeleton
+ * pose and the root's velocity, remove the kinematic capsule, and flop.
+ */
+export function collapse(fighter: Fighter, world: Matter.World): void {
+  if (!fighter.alive) return;
+  fighter.alive = false;
+
+  const sk = fighter.skeleton;
+  const s = fighter.scale;
+  const group = fighter.root.collisionFilter.group ?? 0;
+  const vel = fighter.root.velocity;
+  const side = fighter.side;
+
+  const torso = limbBody(sk.hips, sk.neck, 7 * s, group, `${side}-rag-torso`);
+  const head = Matter.Bodies.circle(sk.head.x, sk.head.y, 8.5 * s, {
+    collisionFilter: { group },
+    density: 0.0015,
+    frictionAir: 0.02,
+    label: `${side}-rag-head`,
+  });
+  const armL = limbBody(sk.shoulderL, sk.handL, 4 * s, group, `${side}-rag-armL`);
+  const armR = limbBody(sk.shoulderR, sk.handR, 4 * s, group, `${side}-rag-armR`);
+  const legL = limbBody(sk.hipL, sk.footL, 5 * s, group, `${side}-rag-legL`);
+  const legR = limbBody(sk.hipR, sk.footR, 5 * s, group, `${side}-rag-legR`);
+
+  const pin = (
+    a: Matter.Body,
+    b: Matter.Body,
+    pointA: Vec,
+    pointB: Vec,
+  ): Matter.Constraint =>
+    Matter.Constraint.create({
+      bodyA: a,
+      bodyB: b,
+      pointA,
+      pointB,
+      length: 0,
+      stiffness: 0.9,
+      damping: 0.1,
+    });
+
+  const local = (body: Matter.Body, world: Vec): Vec => {
+    const c = Math.cos(-body.angle);
+    const sn = Math.sin(-body.angle);
+    const rx = world.x - body.position.x;
+    const ry = world.y - body.position.y;
+    return { x: rx * c - ry * sn, y: rx * sn + ry * c };
+  };
+
+  const constraints = [
+    pin(torso.body, head, local(torso.body, sk.neck), local(head, sk.neck)),
+    pin(torso.body, armL.body, local(torso.body, sk.shoulderL), { x: 0, y: -armL.halfLen }),
+    pin(torso.body, armR.body, local(torso.body, sk.shoulderR), { x: 0, y: -armR.halfLen }),
+    pin(torso.body, legL.body, local(torso.body, sk.hipL), { x: 0, y: -legL.halfLen }),
+    pin(torso.body, legR.body, local(torso.body, sk.hipR), { x: 0, y: -legR.halfLen }),
+  ];
+
+  const all = [torso.body, head, armL.body, armR.body, legL.body, legR.body];
+  for (const body of all) {
+    Matter.Body.setVelocity(body, {
+      x: vel.x + (Math.random() - 0.5) * 2,
+      y: vel.y + (Math.random() - 0.5) * 2,
+    });
+    Matter.Body.setAngularVelocity(body, (Math.random() - 0.5) * 0.4);
+  }
+
+  Matter.Composite.remove(world, fighter.root);
+  Matter.Composite.add(world, [...all, ...constraints]);
+
+  fighter.ragdoll = { torso, head, armL, armR, legL, legR, all };
+}
+
+function limbJoints(l: RagdollLimb): [Vec, Vec] {
   const { position, angle } = l.body;
   const dx = -Math.sin(angle) * l.halfLen;
   const dy = Math.cos(angle) * l.halfLen;
@@ -251,6 +300,39 @@ function limbEndpoints(l: Limb): [Matter.Vector, Matter.Vector] {
     { x: position.x + dx, y: position.y + dy },
   ];
 }
+
+/** Rebuild a drawable skeleton from the ragdoll bodies (KO rendering). */
+function skeletonFromRagdoll(r: Ragdoll, facing: 1 | -1): Skeleton {
+  const [hips, neck] = limbJoints(r.torso);
+  const [shL, handL] = limbJoints(r.armL);
+  const [shR, handR] = limbJoints(r.armR);
+  const [hipL, footL] = limbJoints(r.legL);
+  const [hipR, footR] = limbJoints(r.legR);
+  return {
+    hips,
+    neck,
+    head: { x: r.head.position.x, y: r.head.position.y },
+    torsoAngle: r.torso.body.angle,
+    shoulderL: shL,
+    elbowL: bendPoint(shL, handL, facing * 0.12),
+    handL,
+    shoulderR: shR,
+    elbowR: bendPoint(shR, handR, facing * 0.12),
+    handR,
+    hipL,
+    kneeL: bendPoint(hipL, footL, -facing * 0.1),
+    footL,
+    hipR,
+    kneeR: bendPoint(hipR, footR, -facing * 0.1),
+    footR,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Flat solid-fill rendering (Pass A style, driven by skeleton joints)
+// ---------------------------------------------------------------------------
+
+const TRAIL_SECONDS = 0.22;
 
 /** Tapered capsule between two points: round-capped, r1 at p1 → r2 at p2. */
 function capsulePath(
@@ -273,11 +355,6 @@ function circlePath(x: number, y: number, r: number): Path2D {
   const p = new Path2D();
   p.arc(x, y, r, 0, Math.PI * 2);
   return p;
-}
-
-interface Vec {
-  x: number;
-  y: number;
 }
 
 /**
@@ -328,8 +405,9 @@ function taperedPath(p0: Vec, via: Vec, p2: Vec, r0: number, r2: number): Path2D
 }
 
 /**
- * Relaxed joint position for a limb: the midpoint pushed perpendicular to
- * the base→tip axis by `frac` of the limb length (sign picks the side).
+ * Relaxed joint position for a straight segment: the midpoint pushed
+ * perpendicular to the base→tip axis by `frac` of the length (sign = side).
+ * Used only where no real joint exists (KO ragdoll limbs, preview).
  */
 function bendPoint(base: Vec, tip: Vec, frac: number): Vec {
   const dx = tip.x - base.x;
@@ -391,8 +469,8 @@ export function drawContactShadow(
   const air = Math.max(0, Math.min(1, (groundY - footY) / 240));
   const spread = 1 - air * 0.55;
   const alpha = 0.28 * (1 - air * 0.7);
-  const rx = 34 * scale * spread;
-  const ry = 6.5 * scale * spread;
+  const rx = 30 * scale * spread;
+  const ry = 6 * scale * spread;
   ctx.save();
   ctx.translate(x, groundY + 4);
   ctx.scale(rx, ry);
@@ -416,16 +494,10 @@ function weaponStyle(style: ResolvedStyle): WeaponStyle {
   };
 }
 
-/** Weapon angle: swings flat toward the opponent mid-attack, else hangs with the arm. */
-function weaponAngle(fighter: Fighter, shoulder: Matter.Vector, hand: Matter.Vector): number {
-  if (fighter.attackWindow > 0) return fighter.facing > 0 ? 0 : Math.PI;
-  return Math.atan2(hand.y - shoulder.y, hand.x - shoulder.x);
-}
-
 function drawWeapon(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
-  hand: Matter.Vector,
+  hand: Vec,
   angle: number,
   time: number,
 ): void {
@@ -438,11 +510,11 @@ function drawWeapon(
   ctx.restore();
 }
 
-/** Fading ribbon behind the weapon tip during a swing. */
+/** Fading ribbon behind the weapon tip during a swing's active frames. */
 function updateAndDrawTrail(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
-  hand: Matter.Vector,
+  hand: Vec,
   angle: number,
   time: number,
 ): void {
@@ -481,27 +553,22 @@ function updateAndDrawTrail(
   ctx.restore();
 }
 
-interface HeadPose {
-  x: number;
-  y: number;
-  angle: number;
-}
-
 function drawAccessories(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
-  headPose: HeadPose,
+  sk: Skeleton,
+  headAngle: number,
   which: "back" | "front",
   time: number,
 ): void {
   const n = fighter.spec.appearance.accessories.length;
-  const { root, scale: s, style } = fighter;
+  const { scale: s, style } = fighter;
 
   if (which === "back" && n >= 2) {
     // Cape: filled flowing shape off the back shoulder, drawn behind the body.
-    const sway = Math.sin(time * 3 + root.position.x * 0.01) * 6 * s;
-    const sx = root.position.x - fighter.facing * 6 * s;
-    const sy = root.position.y - 26 * s;
+    const sway = Math.sin(time * 3 + sk.hips.x * 0.01) * 6 * s;
+    const sx = sk.neck.x - fighter.facing * 4 * s;
+    const sy = sk.neck.y + 2 * s;
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(sx, sy);
@@ -528,8 +595,8 @@ function drawAccessories(
   if (n >= 1) {
     // Hat riding on the head: brim capsule + crown.
     ctx.save();
-    ctx.translate(headPose.x, headPose.y);
-    ctx.rotate(headPose.angle);
+    ctx.translate(sk.head.x, sk.head.y);
+    ctx.rotate(headAngle);
     const r = 8.5 * s;
     flatPart(ctx, capsulePath(-r * 1.45, -r * 0.72, r * 1.45, -r * 0.72, 2.2 * s, 2.2 * s), style.accent);
     const crown = new Path2D();
@@ -539,18 +606,14 @@ function drawAccessories(
   }
   if (n >= 3) {
     // Belt with a glowing buckle.
-    const y = root.position.y + 10 * s;
-    flatPart(
-      ctx,
-      capsulePath(root.position.x - 8.5 * s, y, root.position.x + 8.5 * s, y, 3 * s, 3 * s),
-      style.accent,
-    );
+    const y = sk.hips.y - 4 * s;
+    flatPart(ctx, capsulePath(sk.hips.x - 6 * s, y, sk.hips.x + 6 * s, y, 2.6 * s, 2.6 * s), style.accent);
     ctx.save();
     ctx.shadowColor = fighter.style.glow;
     ctx.shadowBlur = 6;
     ctx.fillStyle = fighter.style.glow;
     ctx.beginPath();
-    ctx.arc(root.position.x + fighter.facing * 2 * s, y, 1.8 * s, 0, Math.PI * 2);
+    ctx.arc(sk.hips.x + fighter.facing * 2 * s, y, 1.6 * s, 0, Math.PI * 2);
     ctx.fill();
     ctx.restore();
   }
@@ -562,77 +625,69 @@ export function renderFighter(
   time: number,
   groundY: number,
 ): void {
-  const { root, head, scale: s, style } = fighter;
-  const fill = style.fill;
+  const s = fighter.scale;
+  const fill = fighter.style.fill;
+
+  const sk = fighter.ragdoll
+    ? skeletonFromRagdoll(fighter.ragdoll, fighter.facing)
+    : fighter.skeleton;
+  const headAngle = fighter.ragdoll ? fighter.ragdoll.head.angle : sk.torsoAngle;
+  const weaponAngle = fighter.ragdoll
+    ? Math.atan2(sk.handR.y - sk.elbowR.y, sk.handR.x - sk.elbowR.x)
+    : fighter.weaponAngle;
 
   // Contact shadow first, under everything — the only shadow on a fighter.
-  const feetY = Math.max(limbEndpoints(fighter.legs[0])[1].y, limbEndpoints(fighter.legs[1])[1].y);
-  drawContactShadow(ctx, root.position.x, groundY, feetY, s);
+  const feetY = Math.max(sk.footL.y, sk.footR.y);
+  drawContactShadow(ctx, sk.hips.x, groundY, feetY, s);
 
   ctx.save();
   ctx.globalAlpha = fighter.alive ? 1 : 0.8;
 
-  // Torso axis endpoints (neck → pelvis) from the root body's angle.
-  const dx = -Math.sin(root.angle);
-  const dy = Math.cos(root.angle);
-  const neck = { x: root.position.x - dx * 30 * s, y: root.position.y - dy * 30 * s };
-  const pelvis = { x: root.position.x + dx * 22 * s, y: root.position.y + dy * 22 * s };
-
-  // Alive: head sits upright and firm on the neck, tracking the torso.
-  // KO only: read the dangling physics head body for the full ragdoll flop.
-  const headPose: HeadPose = fighter.alive
-    ? { x: neck.x - dx * 11.5 * s, y: neck.y - dy * 11.5 * s, angle: root.angle }
-    : { x: head.position.x, y: head.position.y, angle: head.angle };
-
-  const [lShoulder, lHand] = limbEndpoints(fighter.arms[0]);
-  const [rShoulder, rHand] = limbEndpoints(fighter.arms[1]);
-  const [lHip, lFoot] = limbEndpoints(fighter.legs[0]);
-  const [rHip, rFoot] = limbEndpoints(fighter.legs[1]);
-
   // Lean build: thin arms (finer than legs), slim legs, half-width spine.
   const armR0 = 1.9 * s, armR1 = 1.1 * s;
   const legR0 = 2.4 * s, legR1 = 1.4 * s;
-  // Relaxed joints: elbows bend away from facing, knees toward it.
-  const elbow = (sh: Vec, hd: Vec) => bendPoint(sh, hd, -fighter.facing * 0.16);
-  const knee = (hp: Vec, ft: Vec) => bendPoint(hp, ft, fighter.facing * 0.1);
 
-  // Back-to-front: cape, whole body as one silhouette, accessories, weapon.
-  drawAccessories(ctx, fighter, headPose, "back", time);
+  drawAccessories(ctx, fighter, sk, headAngle, "back", time);
 
   // Every body part in one batch so overlaps merge into a single continuous
-  // silhouette: limbs, slim spine, thin short neck, small round head.
+  // silhouette. Joints come straight from the animated skeleton.
   flatBody(
     ctx,
     [
-      taperedPath(lShoulder, elbow(lShoulder, lHand), lHand, armR0, armR1),
-      taperedPath(lHip, knee(lHip, lFoot), lFoot, legR0, legR1),
-      taperedPath(neck, { x: (neck.x + pelvis.x) / 2, y: (neck.y + pelvis.y) / 2 }, pelvis, 2.8 * s, 2 * s),
-      taperedPath(rHip, knee(rHip, rFoot), rFoot, legR0, legR1),
-      capsulePath(neck.x, neck.y, headPose.x, headPose.y, 1.5 * s, 1.5 * s),
-      circlePath(headPose.x, headPose.y, 8.5 * s),
-      taperedPath(rShoulder, elbow(rShoulder, rHand), rHand, armR0, armR1),
+      taperedPath(sk.shoulderL, sk.elbowL, sk.handL, armR0, armR1),
+      taperedPath(sk.hipL, sk.kneeL, sk.footL, legR0, legR1),
+      taperedPath(
+        sk.neck,
+        { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
+        sk.hips,
+        2.8 * s,
+        2 * s,
+      ),
+      taperedPath(sk.hipR, sk.kneeR, sk.footR, legR0, legR1),
+      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 1.5 * s, 1.5 * s),
+      circlePath(sk.head.x, sk.head.y, 8.5 * s),
+      taperedPath(sk.shoulderR, sk.elbowR, sk.handR, armR0, armR1),
     ],
     fill,
   );
 
-  drawAccessories(ctx, fighter, headPose, "front", time);
+  drawAccessories(ctx, fighter, sk, headAngle, "front", time);
 
-  // Swing trail + weapon over the hand.
-  const wAngle = weaponAngle(fighter, rShoulder, rHand);
-  updateAndDrawTrail(ctx, fighter, rHand, wAngle, time);
-  drawWeapon(ctx, fighter, rHand, wAngle, time);
+  // Swing trail + weapon attached to the hand joint.
+  updateAndDrawTrail(ctx, fighter, sk.handR, weaponAngle, time);
+  drawWeapon(ctx, fighter, sk.handR, weaponAngle, time);
 
   // Shield bubble.
   if (fighter.shieldTimer > 0) {
     ctx.save();
     ctx.globalAlpha = 0.3 + 0.15 * Math.sin(time * 10);
-    ctx.strokeStyle = style.glow;
+    ctx.strokeStyle = fighter.style.glow;
     ctx.lineWidth = 2.5;
-    ctx.shadowColor = style.glow;
+    ctx.shadowColor = fighter.style.glow;
     ctx.shadowBlur = 12;
     ctx.setLineDash([10, 7]);
     ctx.beginPath();
-    ctx.arc(root.position.x, root.position.y - 10 * s, 58 * s, 0, Math.PI * 2);
+    ctx.arc(sk.hips.x, sk.hips.y - 24 * s, 58 * s, 0, Math.PI * 2);
     ctx.stroke();
     ctx.setLineDash([]);
     ctx.restore();
@@ -641,15 +696,15 @@ export function renderFighter(
   if (fighter.buffTimer > 0) {
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
-    ctx.fillStyle = withAlpha(style.glow, 0.8);
-    ctx.shadowColor = style.glow;
+    ctx.fillStyle = withAlpha(fighter.style.glow, 0.8);
+    ctx.shadowColor = fighter.style.glow;
     ctx.shadowBlur = 8;
     for (let i = 0; i < 3; i++) {
       const a = time * 6 + (i * Math.PI * 2) / 3;
       ctx.beginPath();
       ctx.arc(
-        root.position.x + Math.cos(a) * 30 * s,
-        root.position.y - 20 * s + Math.sin(a) * 40 * s,
+        sk.hips.x + Math.cos(a) * 30 * s,
+        sk.hips.y - 20 * s + Math.sin(a) * 40 * s,
         2.2 * s,
         0,
         Math.PI * 2,

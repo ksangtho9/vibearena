@@ -1,5 +1,6 @@
 import Matter from "matter-js";
 import type { Fighter } from "./stickman";
+import { CAST_TIME } from "./animation";
 import {
   dealDamage,
   pushEffect,
@@ -16,6 +17,7 @@ import {
 export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   const { ability } = user.spec;
   const pos = user.root.position;
+  user.castTimer = CAST_TIME; // cast pose for the animator
 
   // Announce the move with its LLM-given name.
   pushEffect(ctx, {

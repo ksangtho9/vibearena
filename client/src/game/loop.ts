@@ -1,7 +1,7 @@
 import Matter from "matter-js";
 import type { CharacterSpec } from "../types/character";
 import { ARENA_HEIGHT, ARENA_WIDTH, createArena, destroyArena } from "./arena";
-import { createFighter, renderFighter, type Side } from "./stickman";
+import { createFighter, fighterX, renderFighter, type Side } from "./stickman";
 import {
   checkWinner,
   pushEffect,
@@ -68,7 +68,7 @@ export function startGame(
   player.introTimer = INTRO_SECONDS;
   bot.introTimer = INTRO_SECONDS;
 
-  const combat: CombatCtx = { arena, projectiles: [], effects: [] };
+  const combat: CombatCtx = { arena, projectiles: [], effects: [], hitstop: 0, time: 0 };
   const keyboard = createKeyboard();
   keyboard.attach();
   const brain = createBotBrain();
@@ -88,7 +88,14 @@ export function startGame(
   let acc = 0;
 
   function step(dt: number): void {
+    // Hit-stop: the whole fight freezes for a beat when a hit lands.
+    if (combat.hitstop > 0) {
+      combat.hitstop -= dt;
+      return;
+    }
+
     time += dt;
+    combat.time = time;
 
     if (!fightAnnounced && time >= INTRO_SECONDS) {
       fightAnnounced = true;
@@ -134,8 +141,8 @@ export function startGame(
   }
 
   function updateCamera(): void {
-    const px = player.root.position.x;
-    const bx = bot.root.position.x;
+    const px = fighterX(player);
+    const bx = fighterX(bot);
     const midX = Math.max(280, Math.min(680, (px + bx) / 2));
     const dist = Math.abs(px - bx);
     const targetZoom = Math.max(0.95, Math.min(1.28, ARENA_WIDTH / (dist + 560)));
