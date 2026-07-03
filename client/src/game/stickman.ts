@@ -1,7 +1,7 @@
 import Matter from "matter-js";
 import type { CharacterSpec } from "../types/character";
 import { resolveStyle, type ResolvedStyle } from "../generation/enrich";
-import { mix, shade, withAlpha } from "../render/color";
+import { mix, parseColor, shade, withAlpha } from "../render/color";
 import { ARCHETYPES, type WeaponStyle } from "./weapons/archetypes";
 
 // Re-exported for UI code that colors HP bars etc.
@@ -13,10 +13,12 @@ export { safeCssColor } from "../render/color";
  * and controllable) and the limbs dangle with real physics. On death the
  * torso's inertia is restored and the whole thing collapses into a ragdoll.
  *
- * Rendering is solid-fill "animator" style: weighted tapered capsules over
- * the ragdoll joints, flat fill + top-right rim light + core shadow + thin
- * outline, a soft contact shadow on the ground, and a drawn vector weapon
- * from the archetype library attached to the weapon hand.
+ * Rendering is flat "animator" style: slim tapered capsules over the ragdoll
+ * joints in a single uniform body color — no internal shading of any kind.
+ * The only shadow is the soft contact shadow on the ground. The drawn vector
+ * weapon from the archetype library attaches to the weapon hand. While alive
+ * the head is rendered upright on the neck (tracking the torso, not the
+ * dangling physics head body); the floppy head is KO-ragdoll only.
  */
 
 export type Side = "player" | "bot";
@@ -273,43 +275,109 @@ function circlePath(x: number, y: number, r: number): Path2D {
   return p;
 }
 
-interface PartStyle {
-  fill: string;
-  rim: string;
-  outline: string;
+interface Vec {
+  x: number;
+  y: number;
 }
 
 /**
- * The signature fill: flat color, a 1–2px lighter rim on the top-right
- * (light source), a soft core shadow along the bottom-left, thin outline.
- * Done with the clip-and-offset trick — cheap and resolution-independent.
+ * ONE continuous smoothly-tapered stroke: a quadratic curve from `p0`
+ * through the joint point `via` to `p2`, whose half-width interpolates from
+ * r0 to r2 along the whole path, with round caps at both ends. Elbows and
+ * knees are BENDS in this single silhouette — never a separate capsule per
+ * bone and never a ball at the joint.
  */
-function fillPart(ctx: CanvasRenderingContext2D, path: Path2D, style: PartStyle): void {
-  ctx.save();
-  // Rim color underneath; the offset main fill leaves a top-right crescent.
-  ctx.fillStyle = style.rim;
-  ctx.fill(path);
-  ctx.clip(path);
-  ctx.translate(-1.6, 1.6);
-  ctx.fillStyle = style.fill;
-  ctx.fill(path);
-  // Core shadow: the shifted outline's inner edge lands on the bottom-left.
-  ctx.translate(4, -4);
-  ctx.strokeStyle = "rgba(0, 0, 0, 0.16)";
-  ctx.lineWidth = 5;
-  ctx.stroke(path);
-  ctx.restore();
-  ctx.strokeStyle = style.outline;
-  ctx.lineWidth = 1.4;
-  ctx.stroke(path);
+function taperedPath(p0: Vec, via: Vec, p2: Vec, r0: number, r2: number): Path2D {
+  // Control point chosen so the curve passes through `via` at t = 0.5.
+  const cx = 2 * via.x - (p0.x + p2.x) / 2;
+  const cy = 2 * via.y - (p0.y + p2.y) / 2;
+
+  const N = 10;
+  const left: Vec[] = [];
+  const right: Vec[] = [];
+  let nStart: Vec = { x: 0, y: 0 };
+  let nEnd: Vec = { x: 0, y: 0 };
+  for (let i = 0; i <= N; i++) {
+    const t = i / N;
+    const mt = 1 - t;
+    const x = mt * mt * p0.x + 2 * mt * t * cx + t * t * p2.x;
+    const y = mt * mt * p0.y + 2 * mt * t * cy + t * t * p2.y;
+    let tx = 2 * mt * (cx - p0.x) + 2 * t * (p2.x - cx);
+    let ty = 2 * mt * (cy - p0.y) + 2 * t * (p2.y - cy);
+    const tl = Math.hypot(tx, ty) || 1;
+    tx /= tl;
+    ty /= tl;
+    const n = { x: ty, y: -tx };
+    if (i === 0) nStart = n;
+    if (i === N) nEnd = n;
+    const r = r0 + (r2 - r0) * t;
+    left.push({ x: x + n.x * r, y: y + n.y * r });
+    right.push({ x: x - n.x * r, y: y - n.y * r });
+  }
+
+  const p = new Path2D();
+  p.moveTo(left[0].x, left[0].y);
+  for (let i = 1; i <= N; i++) p.lineTo(left[i].x, left[i].y);
+  const aEnd = Math.atan2(nEnd.y, nEnd.x);
+  p.arc(p2.x, p2.y, r2, aEnd, aEnd + Math.PI); // round tip cap
+  for (let i = N; i >= 0; i--) p.lineTo(right[i].x, right[i].y);
+  const aStart = Math.atan2(nStart.y, nStart.x);
+  p.arc(p0.x, p0.y, r0, aStart + Math.PI, aStart + 2 * Math.PI); // round base cap
+  p.closePath();
+  return p;
 }
 
-function partStyle(style: ResolvedStyle): PartStyle {
+/**
+ * Relaxed joint position for a limb: the midpoint pushed perpendicular to
+ * the base→tip axis by `frac` of the limb length (sign picks the side).
+ */
+function bendPoint(base: Vec, tip: Vec, frac: number): Vec {
+  const dx = tip.x - base.x;
+  const dy = tip.y - base.y;
   return {
-    fill: style.fill,
-    rim: shade(style.fill, 1.45),
-    outline: style.outline,
+    x: (base.x + tip.x) / 2 + dy * frac,
+    y: (base.y + tip.y) / 2 - dx * frac,
   };
+}
+
+function luminance(color: string): number {
+  const [r, g, b] = parseColor(color);
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
+/**
+ * Flat silhouette fill — one uniform color, no gradient, rim, gloss or core
+ * shadow. Light-colored fills get a thin, slightly-darker edge so they still
+ * read against a busy background; dark fills get no outline at all.
+ */
+function flatPart(ctx: CanvasRenderingContext2D, path: Path2D, fill: string): void {
+  ctx.fillStyle = fill;
+  ctx.fill(path);
+  const lum = luminance(fill);
+  if (lum > 0.5) {
+    const alpha = Math.min(0.85, (lum - 0.5) * 3);
+    ctx.strokeStyle = shade(fill, 0.7, alpha);
+    ctx.lineWidth = 1;
+    ctx.stroke(path);
+  }
+}
+
+/**
+ * Whole-body flat fill: strokes every part FIRST, then fills them all, so
+ * the fills bury each part's internal stroke edges wherever parts overlap —
+ * the figure reads as ONE continuous silhouette with only an outer edge
+ * (and, for dark fighters, no edge at all).
+ */
+function flatBody(ctx: CanvasRenderingContext2D, paths: Path2D[], fill: string): void {
+  const lum = luminance(fill);
+  if (lum > 0.5) {
+    const alpha = Math.min(0.85, (lum - 0.5) * 3);
+    ctx.strokeStyle = shade(fill, 0.7, alpha);
+    ctx.lineWidth = 2; // half of it sticks out; the inner half gets filled over
+    for (const p of paths) ctx.stroke(p);
+  }
+  ctx.fillStyle = fill;
+  for (const p of paths) ctx.fill(p);
 }
 
 /** Soft blurred ellipse under the fighter — sells the weight. */
@@ -413,19 +481,21 @@ function updateAndDrawTrail(
   ctx.restore();
 }
 
+interface HeadPose {
+  x: number;
+  y: number;
+  angle: number;
+}
+
 function drawAccessories(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
+  headPose: HeadPose,
   which: "back" | "front",
   time: number,
 ): void {
   const n = fighter.spec.appearance.accessories.length;
-  const { head, root, scale: s, style } = fighter;
-  const accStyle: PartStyle = {
-    fill: style.accent,
-    rim: shade(style.accent, 1.4),
-    outline: style.outline,
-  };
+  const { root, scale: s, style } = fighter;
 
   if (which === "back" && n >= 2) {
     // Cape: filled flowing shape off the back shoulder, drawn behind the body.
@@ -450,9 +520,6 @@ function drawAccessories(
     ctx.closePath();
     ctx.fillStyle = mix(style.accent, "#20242a", 0.25);
     ctx.fill();
-    ctx.strokeStyle = style.outline;
-    ctx.lineWidth = 1.2;
-    ctx.stroke();
     ctx.restore();
   }
 
@@ -461,22 +528,22 @@ function drawAccessories(
   if (n >= 1) {
     // Hat riding on the head: brim capsule + crown.
     ctx.save();
-    ctx.translate(head.position.x, head.position.y);
-    ctx.rotate(head.angle);
-    const r = 11 * s;
-    fillPart(ctx, capsulePath(-r * 1.45, -r * 0.72, r * 1.45, -r * 0.72, 2.2 * s, 2.2 * s), accStyle);
+    ctx.translate(headPose.x, headPose.y);
+    ctx.rotate(headPose.angle);
+    const r = 8.5 * s;
+    flatPart(ctx, capsulePath(-r * 1.45, -r * 0.72, r * 1.45, -r * 0.72, 2.2 * s, 2.2 * s), style.accent);
     const crown = new Path2D();
     crown.roundRect(-r * 0.75, -r * 1.75, r * 1.5, r, 2.5 * s);
-    fillPart(ctx, crown, accStyle);
+    flatPart(ctx, crown, style.accent);
     ctx.restore();
   }
   if (n >= 3) {
     // Belt with a glowing buckle.
     const y = root.position.y + 10 * s;
-    fillPart(
+    flatPart(
       ctx,
       capsulePath(root.position.x - 8.5 * s, y, root.position.x + 8.5 * s, y, 3 * s, 3 * s),
-      accStyle,
+      style.accent,
     );
     ctx.save();
     ctx.shadowColor = fighter.style.glow;
@@ -496,9 +563,9 @@ export function renderFighter(
   groundY: number,
 ): void {
   const { root, head, scale: s, style } = fighter;
-  const body = partStyle(style);
+  const fill = style.fill;
 
-  // Contact shadow first, under everything.
+  // Contact shadow first, under everything — the only shadow on a fighter.
   const feetY = Math.max(limbEndpoints(fighter.legs[0])[1].y, limbEndpoints(fighter.legs[1])[1].y);
   drawContactShadow(ctx, root.position.x, groundY, feetY, s);
 
@@ -511,36 +578,48 @@ export function renderFighter(
   const neck = { x: root.position.x - dx * 30 * s, y: root.position.y - dy * 30 * s };
   const pelvis = { x: root.position.x + dx * 22 * s, y: root.position.y + dy * 22 * s };
 
+  // Alive: head sits upright and firm on the neck, tracking the torso.
+  // KO only: read the dangling physics head body for the full ragdoll flop.
+  const headPose: HeadPose = fighter.alive
+    ? { x: neck.x - dx * 11.5 * s, y: neck.y - dy * 11.5 * s, angle: root.angle }
+    : { x: head.position.x, y: head.position.y, angle: head.angle };
+
   const [lShoulder, lHand] = limbEndpoints(fighter.arms[0]);
   const [rShoulder, rHand] = limbEndpoints(fighter.arms[1]);
   const [lHip, lFoot] = limbEndpoints(fighter.legs[0]);
   const [rHip, rFoot] = limbEndpoints(fighter.legs[1]);
 
-  // Back-to-front: cape, far limbs, torso, near leg, head, front arm + weapon.
-  drawAccessories(ctx, fighter, "back", time);
+  // Lean build: thin arms (finer than legs), slim legs, half-width spine.
+  const armR0 = 1.9 * s, armR1 = 1.1 * s;
+  const legR0 = 2.4 * s, legR1 = 1.4 * s;
+  // Relaxed joints: elbows bend away from facing, knees toward it.
+  const elbow = (sh: Vec, hd: Vec) => bendPoint(sh, hd, -fighter.facing * 0.16);
+  const knee = (hp: Vec, ft: Vec) => bendPoint(hp, ft, fighter.facing * 0.1);
 
-  fillPart(ctx, capsulePath(lShoulder.x, lShoulder.y, lHand.x, lHand.y, 5 * s, 3 * s), body);
-  fillPart(ctx, capsulePath(lHip.x, lHip.y, lFoot.x, lFoot.y, 5.6 * s, 3.6 * s), body);
+  // Back-to-front: cape, whole body as one silhouette, accessories, weapon.
+  drawAccessories(ctx, fighter, headPose, "back", time);
 
-  // Torso: tapered capsule, broad at the shoulders, narrowing to the pelvis.
-  fillPart(ctx, capsulePath(neck.x, neck.y, pelvis.x, pelvis.y, 9 * s, 6.2 * s), body);
-
-  fillPart(ctx, capsulePath(rHip.x, rHip.y, rFoot.x, rFoot.y, 5.6 * s, 3.6 * s), body);
-
-  // Neck + head (faceless, animator style).
-  fillPart(
+  // Every body part in one batch so overlaps merge into a single continuous
+  // silhouette: limbs, slim spine, thin short neck, small round head.
+  flatBody(
     ctx,
-    capsulePath(neck.x, neck.y, head.position.x, head.position.y, 3.4 * s, 3.4 * s),
-    body,
+    [
+      taperedPath(lShoulder, elbow(lShoulder, lHand), lHand, armR0, armR1),
+      taperedPath(lHip, knee(lHip, lFoot), lFoot, legR0, legR1),
+      taperedPath(neck, { x: (neck.x + pelvis.x) / 2, y: (neck.y + pelvis.y) / 2 }, pelvis, 2.8 * s, 2 * s),
+      taperedPath(rHip, knee(rHip, rFoot), rFoot, legR0, legR1),
+      capsulePath(neck.x, neck.y, headPose.x, headPose.y, 1.5 * s, 1.5 * s),
+      circlePath(headPose.x, headPose.y, 8.5 * s),
+      taperedPath(rShoulder, elbow(rShoulder, rHand), rHand, armR0, armR1),
+    ],
+    fill,
   );
-  fillPart(ctx, circlePath(head.position.x, head.position.y, 11 * s), body);
 
-  drawAccessories(ctx, fighter, "front", time);
+  drawAccessories(ctx, fighter, headPose, "front", time);
 
-  // Weapon arm on top, weapon over the hand.
+  // Swing trail + weapon over the hand.
   const wAngle = weaponAngle(fighter, rShoulder, rHand);
   updateAndDrawTrail(ctx, fighter, rHand, wAngle, time);
-  fillPart(ctx, capsulePath(rShoulder.x, rShoulder.y, rHand.x, rHand.y, 5 * s, 3 * s), body);
   drawWeapon(ctx, fighter, rHand, wAngle, time);
 
   // Shield bubble.
@@ -598,8 +677,7 @@ export function drawStickmanPreview(
   const cx = w / 2;
   const groundY = h * 0.88;
   const u = (h / 180) * s; // unit scale fitted to the canvas
-  const body: PartStyle = { fill: style.fill, rim: shade(style.fill, 1.45), outline: style.outline };
-  const accStyle: PartStyle = { fill: style.accent, rim: shade(style.accent, 1.4), outline: style.outline };
+  const fill = style.fill;
 
   ctx.clearRect(0, 0, w, h);
 
@@ -612,45 +690,52 @@ export function drawStickmanPreview(
 
   const hipY = groundY - 48 * u;
   const shoulderY = hipY - 40 * u;
-  const headR = 11 * u;
-  const headY = shoulderY - 6 * u - headR;
+  const headR = 8.5 * u;
+  const headY = shoulderY - 11.5 * u;
+
+  const armR0 = 1.9 * u, armR1 = 1.1 * u;
+  const legR0 = 2.4 * u, legR1 = 1.4 * u;
+  const hip = { x: cx, y: hipY };
+  const shoulder = { x: cx, y: shoulderY + 4 * u };
 
   drawContactShadow(ctx, cx, groundY, groundY, u);
 
-  // Legs in a slight stance, torso, off arm down.
-  fillPart(ctx, capsulePath(cx, hipY, cx - 14 * u, groundY, 5.6 * u, 3.6 * u), body);
-  fillPart(ctx, capsulePath(cx, hipY, cx + 14 * u, groundY, 5.6 * u, 3.6 * u), body);
-  fillPart(ctx, capsulePath(cx, shoulderY, cx, hipY, 9 * u, 6.2 * u), body);
-  fillPart(
+  // Whole body in one batch: legs in a slight stance (knees bent), slim
+  // spine, off arm down with a relaxed elbow, thin neck, small round head.
+  const lFoot = { x: cx - 14 * u, y: groundY };
+  const rFoot = { x: cx + 14 * u, y: groundY };
+  const offHand = { x: cx - 20 * u, y: shoulderY + 26 * u };
+  const weaponHand = { x: cx + 23 * u, y: shoulderY - 8 * u };
+  flatBody(
     ctx,
-    capsulePath(cx, shoulderY + 4 * u, cx - 20 * u, shoulderY + 26 * u, 5 * u, 3 * u),
-    body,
+    [
+      taperedPath(hip, bendPoint(hip, lFoot, -0.1), lFoot, legR0, legR1),
+      taperedPath(hip, bendPoint(hip, rFoot, 0.1), rFoot, legR0, legR1),
+      taperedPath({ x: cx, y: shoulderY }, { x: cx, y: (shoulderY + hipY) / 2 }, hip, 2.8 * u, 2 * u),
+      taperedPath(shoulder, bendPoint(shoulder, offHand, -0.16), offHand, armR0, armR1),
+      capsulePath(cx, shoulderY, cx, headY, 1.5 * u, 1.5 * u),
+      circlePath(cx, headY, headR),
+      taperedPath(shoulder, bendPoint(shoulder, weaponHand, 0.12), weaponHand, armR0, armR1),
+    ],
+    fill,
   );
-
-  // Neck + head.
-  fillPart(ctx, capsulePath(cx, shoulderY, cx, headY, 3.4 * u, 3.4 * u), body);
-  fillPart(ctx, circlePath(cx, headY, headR), body);
 
   // Hat.
   if (spec.appearance.accessories.length > 0) {
-    fillPart(
+    flatPart(
       ctx,
       capsulePath(cx - headR * 1.45, headY - headR * 0.72, cx + headR * 1.45, headY - headR * 0.72, 2.2 * u, 2.2 * u),
-      accStyle,
+      style.accent,
     );
     const crown = new Path2D();
     crown.roundRect(cx - headR * 0.75, headY - headR * 1.75, headR * 1.5, headR, 2.5 * u);
-    fillPart(ctx, crown, accStyle);
+    flatPart(ctx, crown, style.accent);
   }
 
-  // Weapon arm raised, weapon pointing up-forward.
-  const handX = cx + 23 * u;
-  const handY = shoulderY - 8 * u;
-  fillPart(ctx, capsulePath(cx, shoulderY + 4 * u, handX, handY, 5 * u, 3 * u), body);
-
+  // Weapon in the raised hand.
   const def = ARCHETYPES[style.archetype];
   ctx.save();
-  ctx.translate(handX, handY);
+  ctx.translate(weaponHand.x, weaponHand.y);
   if (!def.floating) ctx.rotate(-Math.PI / 5);
   ctx.scale(u * 1.05, u * 1.05);
   def.draw(
