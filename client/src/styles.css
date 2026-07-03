@@ -1,0 +1,467 @@
+/* ---------------------------------------------------------------------------
+   VIBE ARENA — chalkboard fight-night poster.
+   Board slate:  #1e2521   Chalk:      #f2f0e4   Dust (muted): #9ba69e
+   Corner red:   #e0483e   Gym gold:   #e8b33c
+--------------------------------------------------------------------------- */
+
+:root {
+  --board: #1e2521;
+  --board-deep: #161c18;
+  --chalk: #f2f0e4;
+  --dust: #9ba69e;
+  --tape-red: #e0483e;
+  --gold: #e8b33c;
+  --display: "Anton", Impact, "Arial Narrow Bold", sans-serif;
+  --body: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  font-family: var(--body);
+  color: var(--chalk);
+  background:
+    radial-gradient(ellipse 120% 90% at 50% 20%, rgba(242, 240, 228, 0.045), transparent 60%),
+    radial-gradient(ellipse 100% 120% at 50% 110%, var(--board-deep), transparent 70%),
+    var(--board);
+}
+
+#root,
+.board {
+  min-height: 100vh;
+}
+
+.board {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(12px, 3vw, 40px);
+}
+
+/* The chalk-drawn frame everything lives inside. */
+.board-frame {
+  width: min(1040px, 100%);
+  min-height: min(680px, 92vh);
+  border: 3px solid rgba(242, 240, 228, 0.75);
+  outline: 1px solid rgba(242, 240, 228, 0.25);
+  outline-offset: 6px;
+  border-radius: 6px 10px 7px 9px / 9px 6px 10px 7px; /* hand-drawn wobble */
+  padding: clamp(16px, 4vw, 48px);
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 18px;
+  text-align: center;
+}
+
+/* --- Type ---------------------------------------------------------------- */
+
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.35em;
+  color: var(--dust);
+}
+
+.poster-title {
+  font-family: var(--display);
+  font-size: clamp(56px, 11vw, 118px);
+  line-height: 0.95;
+  letter-spacing: 0.02em;
+  text-shadow: 3px 3px 0 rgba(0, 0, 0, 0.35);
+}
+
+.title-mark {
+  color: var(--tape-red);
+  padding: 0 0.08em;
+}
+
+.title-win {
+  color: var(--gold);
+}
+
+.title-lose {
+  color: var(--tape-red);
+}
+
+.tagline {
+  color: var(--dust);
+  font-size: clamp(14px, 2vw, 17px);
+  max-width: 46ch;
+}
+
+.fine-print {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+  opacity: 0.8;
+}
+
+/* --- Prompt screen ------------------------------------------------------- */
+
+.prompt-screen {
+  gap: 14px;
+}
+
+.prompt-label {
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--dust);
+  margin-top: 18px;
+}
+
+.prompt-input {
+  width: min(620px, 100%);
+  font-family: var(--body);
+  font-size: 16px;
+  color: var(--chalk);
+  background: rgba(0, 0, 0, 0.22);
+  border: 2px dashed rgba(242, 240, 228, 0.4);
+  border-radius: 4px;
+  padding: 14px 16px;
+  resize: vertical;
+}
+
+.prompt-input:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 2px;
+  border-style: solid;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  max-width: 640px;
+}
+
+.chip {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+  background: none;
+  border: 1px solid rgba(155, 166, 158, 0.5);
+  border-radius: 999px;
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.chip:hover:not(:disabled) {
+  color: var(--chalk);
+  border-color: var(--chalk);
+}
+
+/* --- Buttons ------------------------------------------------------------- */
+
+.btn-tape,
+.btn-chalk {
+  font-family: var(--display);
+  font-size: 20px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 12px 30px;
+  cursor: pointer;
+  transition: transform 0.12s, background 0.15s, color 0.15s;
+}
+
+.btn-tape {
+  color: var(--chalk);
+  background: var(--tape-red);
+  border: none;
+  transform: rotate(-1.2deg);
+  box-shadow: 3px 3px 0 rgba(0, 0, 0, 0.4);
+}
+
+.btn-tape:hover:not(:disabled) {
+  transform: rotate(-1.2deg) translateY(-2px);
+}
+
+.btn-tape:disabled {
+  background: #5a4340;
+  color: rgba(242, 240, 228, 0.5);
+  cursor: not-allowed;
+}
+
+.btn-chalk {
+  color: var(--chalk);
+  background: none;
+  border: 2px solid rgba(242, 240, 228, 0.65);
+  border-radius: 3px 6px 4px 7px / 6px 3px 7px 4px;
+  transform: rotate(0.6deg);
+}
+
+.btn-chalk:hover {
+  background: rgba(242, 240, 228, 0.12);
+}
+
+.btn-tape:focus-visible,
+.btn-chalk:focus-visible,
+.chip:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 3px;
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  justify-content: center;
+  margin-top: 10px;
+}
+
+/* --- Preview card ---------------------------------------------------------- */
+
+.fight-card {
+  display: flex;
+  flex-wrap: wrap;
+  gap: clamp(16px, 3vw, 40px);
+  align-items: center;
+  justify-content: center;
+  text-align: left;
+  width: 100%;
+}
+
+.portrait {
+  border: 2px solid rgba(242, 240, 228, 0.35);
+  border-radius: 8px 5px 9px 6px / 5px 9px 6px 8px;
+  padding: 10px;
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.tape {
+  max-width: 460px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.fighter-name {
+  font-family: var(--display);
+  font-size: clamp(30px, 5vw, 44px);
+  letter-spacing: 0.02em;
+  color: var(--gold);
+}
+
+.flavor {
+  color: var(--dust);
+  font-style: italic;
+}
+
+.gear {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.gear dt {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: var(--dust);
+}
+
+.gear dd {
+  margin: 2px 0 0;
+  font-size: 15px;
+}
+
+.gear-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dust);
+  margin-left: 6px;
+}
+
+.stats {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: 76px 1fr 40px;
+  align-items: center;
+  gap: 10px;
+}
+
+.stat-label {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--dust);
+}
+
+.stat-bar {
+  height: 10px;
+  border: 1px solid rgba(242, 240, 228, 0.4);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.stat-fill {
+  display: block;
+  height: 100%;
+  background: repeating-linear-gradient(
+    -45deg,
+    var(--chalk),
+    var(--chalk) 4px,
+    transparent 4px,
+    transparent 7px
+  );
+}
+
+.stat-value {
+  font-family: var(--mono);
+  font-size: 12px;
+  text-align: right;
+}
+
+.gen-note {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--gold);
+  max-width: 60ch;
+}
+
+/* --- Arena ----------------------------------------------------------------- */
+
+.arena-screen {
+  gap: 12px;
+  width: 100%;
+}
+
+.arena-hud {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  width: 100%;
+}
+
+.vs-mark {
+  font-family: var(--display);
+  font-size: 22px;
+  color: var(--tape-red);
+  padding-top: 2px;
+}
+
+.hp-corner {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.hp-left {
+  align-items: flex-start;
+  text-align: left;
+}
+
+.hp-right {
+  align-items: flex-end;
+  text-align: right;
+}
+
+.hp-name {
+  font-family: var(--display);
+  font-size: 16px;
+  letter-spacing: 0.05em;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hp-track {
+  width: 100%;
+  height: 16px;
+  background: rgba(0, 0, 0, 0.35);
+  border: 2px solid rgba(242, 240, 228, 0.6);
+  transform: skewX(-8deg);
+  overflow: hidden;
+}
+
+.hp-right .hp-track {
+  transform: skewX(8deg);
+  direction: rtl;
+}
+
+.hp-fill {
+  height: 100%;
+  background: var(--tape-red);
+  transition: width 0.2s ease-out;
+}
+
+.hp-left .hp-fill {
+  background: var(--gold);
+}
+
+.canvas-wrap {
+  width: 100%;
+  border: 2px solid rgba(242, 240, 228, 0.3);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.canvas-wrap canvas {
+  display: block;
+}
+
+.controls-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  justify-content: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dust);
+}
+
+.controls-hint kbd {
+  font-family: var(--mono);
+  border: 1px solid rgba(155, 166, 158, 0.6);
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-right: 2px;
+}
+
+.ability-ready {
+  color: var(--gold);
+}
+
+.ability-ready kbd {
+  border-color: var(--gold);
+}
+
+/* --- Motion --------------------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  .btn-tape,
+  .btn-chalk,
+  .chip,
+  .hp-fill {
+    transition: none;
+  }
+}
