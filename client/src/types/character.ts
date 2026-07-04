@@ -16,6 +16,35 @@ export const ELEMENTS = [
 ] as const;
 export type ElementKind = (typeof ELEMENTS)[number];
 
+/** VFX shape an ability takes (visual only — mechanics come from `kind`). */
+export const ABILITY_MOTIFS = [
+  "nova", "beam", "orbs", "shards", "wave", "aura", "slash", "burst",
+] as const;
+export type AbilityMotif = (typeof ABILITY_MOTIFS)[number];
+
+export const BUFF_STATS = ["speed", "strength", "defense"] as const;
+export type BuffStat = (typeof BUFF_STATS)[number];
+
+/**
+ * Per-kind ability tuning, LLM-proposed on loose scales and CLAMPED into
+ * fair bands by statBudget — a prompt can flavor an ability, never make it
+ * oppressive. After balancing these hold final runtime units.
+ */
+export interface AbilityParams {
+  radius?: number; // aoe
+  count?: number; // projectile: 1–5
+  spread?: number; // projectile: 0–1 fan width
+  homing?: boolean; // projectile
+  distance?: number; // dash
+  iframes?: number; // dash: seconds of invulnerability
+  duration?: number; // shield/buff: seconds
+  coverage?: number; // shield: fraction of damage blocked
+  amount?: number; // heal
+  overTime?: boolean; // heal
+  stat?: BuffStat; // buff
+  magnitude?: number; // buff
+}
+
 export interface WeaponVfx {
   glow: string;
   element?: ElementKind;
@@ -61,6 +90,10 @@ export interface CharacterSpec {
     kind: "dash" | "shield" | "aoe" | "heal" | "projectile" | "buff";
     cooldown: number;
     power: number;
+    // LLM-emitted visual/tuning descriptors (snapped/clamped, never raw).
+    element?: ElementKind;
+    motif?: AbilityMotif;
+    params?: AbilityParams;
   };
   stats: { hp: number; speed: number; strength: number; defense: number };
   flavor: string;
@@ -102,6 +135,24 @@ export const characterSpecSchema = z.object({
     kind: z.enum(ABILITY_KINDS),
     cooldown: z.coerce.number().finite(),
     power: z.coerce.number().finite(),
+    element: z.enum(ELEMENTS).optional(),
+    motif: z.enum(ABILITY_MOTIFS).optional(),
+    params: z
+      .object({
+        radius: z.coerce.number().finite().optional(),
+        count: z.coerce.number().finite().optional(),
+        spread: z.coerce.number().finite().optional(),
+        homing: z.boolean().optional(),
+        distance: z.coerce.number().finite().optional(),
+        iframes: z.coerce.number().finite().optional(),
+        duration: z.coerce.number().finite().optional(),
+        coverage: z.coerce.number().finite().optional(),
+        amount: z.coerce.number().finite().optional(),
+        overTime: z.boolean().optional(),
+        stat: z.enum(BUFF_STATS).optional(),
+        magnitude: z.coerce.number().finite().optional(),
+      })
+      .optional(),
   }),
   stats: z.object({
     hp: z.coerce.number().finite(),
@@ -185,9 +236,50 @@ function normalizeRaw(raw: unknown): unknown {
     delete appearance.outline;
   }
   const ability = clone.ability as Record<string, unknown> | undefined;
-  if (ability && typeof ability.kind === "string") {
-    const key = ability.kind.toLowerCase().trim();
-    ability.kind = ABILITY_ALIASES[key] ?? key;
+  if (ability) {
+    if (typeof ability.kind === "string") {
+      const key = ability.kind.toLowerCase().trim();
+      ability.kind = ABILITY_ALIASES[key] ?? key;
+    }
+    const keepAbilityEnum = (field: string, allowed: readonly string[]) => {
+      if (typeof ability[field] === "string") {
+        const v = (ability[field] as string).toLowerCase().trim();
+        if (allowed.includes(v)) ability[field] = v;
+        else delete ability[field];
+      } else if (ability[field] !== undefined) {
+        delete ability[field];
+      }
+    };
+    keepAbilityEnum("element", ELEMENTS);
+    keepAbilityEnum("motif", ABILITY_MOTIFS);
+    if (ability.params !== undefined && (typeof ability.params !== "object" || ability.params === null)) {
+      delete ability.params;
+    }
+    const params = ability.params as Record<string, unknown> | undefined;
+    if (params) {
+      for (const boolField of ["homing", "overTime"] as const) {
+        if (typeof params[boolField] === "string") {
+          params[boolField] = params[boolField] === "true";
+        } else if (params[boolField] !== undefined && typeof params[boolField] !== "boolean") {
+          delete params[boolField];
+        }
+      }
+      if (typeof params.stat === "string") {
+        const v = params.stat.toLowerCase().trim();
+        if ((BUFF_STATS as readonly string[]).includes(v)) params.stat = v;
+        else delete params.stat;
+      } else if (params.stat !== undefined) {
+        delete params.stat;
+      }
+      for (const numField of [
+        "radius", "count", "spread", "distance", "iframes", "duration",
+        "coverage", "amount", "magnitude",
+      ] as const) {
+        if (params[numField] !== undefined && !Number.isFinite(Number(params[numField]))) {
+          delete params[numField];
+        }
+      }
+    }
   }
   return clone;
 }

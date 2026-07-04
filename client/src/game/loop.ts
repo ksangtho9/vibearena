@@ -26,6 +26,7 @@ import {
 import { createKeyboard, emptyInput, INPUT_BINDINGS } from "./input";
 import { createBotBrain, type BotBrain } from "./bot";
 import { createTheme, type ThemeView } from "./arena/themes";
+import { drawMotifEffect } from "./effectsRender";
 import { withAlpha } from "../render/color";
 
 /**
@@ -269,6 +270,10 @@ export function startGame(
 
   function drawEffects(): void {
     for (const e of combat.effects) {
+      if (e.kind === "motif") {
+        drawMotifEffect(ctx2d, e, time);
+        continue;
+      }
       const life = e.ttl / e.maxTtl; // 1 → 0
       ctx2d.save();
       ctx2d.globalAlpha = Math.max(0, life) * 0.9;

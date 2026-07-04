@@ -1,9 +1,15 @@
+import type { WeaponForm, WeaponSize } from "../types/character";
+
 /**
  * Skeletal animation: the source of truth for how fighters MOVE. Physics
  * only handles the root capsule (walking/jumping/knockback collisions) and
  * the KO ragdoll. Every visible pose comes from here — procedural curves
  * per state, with 2-bone IK so feet plant on the ground without sliding and
  * hands reach their targets without stretching.
+ *
+ * Attacks are chosen by the weapon's FORM: a hammer chops two-handed
+ * overhead, a spear thrusts, a whip cracks, a bow draws — same wind-up →
+ * active → recovery phases and hit windows as before, different pose curves.
  */
 
 export interface Vec {
@@ -71,11 +77,93 @@ export function bonesFor(scale: number): Bones {
   };
 }
 
-/** Attack phase timing (seconds) — combat and animation share these. */
-export const ATTACK_TIMING = {
-  melee: { windup: 0.12, active: 0.16, recovery: 0.2, total: 0.48 },
-  missile: { windup: 0.1, active: 0.08, recovery: 0.17, total: 0.35 },
-} as const;
+// ---------------------------------------------------------------------------
+// Attack styles: which animation a weapon form performs
+// ---------------------------------------------------------------------------
+
+export type AttackStyle =
+  | "slash" // one-handed diagonal cut
+  | "chop" // two-handed overhead slam
+  | "thrust" // two-handed stab along the reach line
+  | "reap" // wide horizontal sweep
+  | "crack" // whip wave-and-snap
+  | "cast" // raise + push (staff/orb)
+  | "draw" // bow: pull string, release
+  | "shoot" // gun: aim + recoil
+  | "bash" // shield shove
+  | "throw"; // over-the-shoulder release
+
+type MechType = "melee" | "ranged" | "thrown";
+
+export function attackStyleOf(form: WeaponForm, type: MechType): AttackStyle {
+  if (type === "thrown") return "throw";
+  if (type === "ranged") {
+    if (form === "bow") return "draw";
+    if (form === "gun") return "shoot";
+    return "cast"; // staff, orb
+  }
+  switch (form) {
+    case "greatsword":
+    case "axe":
+    case "hammer":
+    case "flail":
+      return "chop";
+    case "spear":
+    case "halberd":
+      return "thrust";
+    case "scythe":
+      return "reap";
+    case "whip":
+      return "crack";
+    case "staff":
+      return "cast";
+    case "shield":
+      return "bash";
+    default:
+      return "slash"; // sword, dagger, claw + snapped fallbacks
+  }
+}
+
+export interface AttackTiming {
+  windup: number;
+  active: number;
+  recovery: number;
+  total: number;
+}
+
+const timing = (windup: number, active: number, recovery: number): AttackTiming => ({
+  windup,
+  active,
+  recovery,
+  total: windup + active + recovery,
+});
+
+/** Per-style phase timing. Melee totals stay under the 0.55s cooldown. */
+export const ATTACK_TIMINGS: Record<AttackStyle, AttackTiming> = {
+  slash: timing(0.1, 0.14, 0.18),
+  chop: timing(0.16, 0.16, 0.2),
+  thrust: timing(0.1, 0.14, 0.16),
+  reap: timing(0.14, 0.18, 0.2),
+  crack: timing(0.12, 0.14, 0.18),
+  bash: timing(0.08, 0.12, 0.16),
+  cast: timing(0.12, 0.08, 0.16),
+  draw: timing(0.18, 0.08, 0.14),
+  shoot: timing(0.08, 0.08, 0.14),
+  throw: timing(0.12, 0.08, 0.16),
+};
+
+export function attackTimingOf(form: WeaponForm, type: MechType): AttackTiming {
+  return ATTACK_TIMINGS[attackStyleOf(form, type)];
+}
+
+/** Heavy/polearm forms keep both hands on the weapon outside attacks too. */
+function isTwoHanded(form: WeaponForm, size: WeaponSize, type: MechType): boolean {
+  if (type !== "melee") return false;
+  const style = attackStyleOf(form, type);
+  if (style === "chop" || style === "thrust" || style === "reap") return true;
+  if (form === "staff") return true;
+  return size === "large" && style === "slash";
+}
 
 export const CAST_TIME = 0.35;
 
@@ -118,8 +206,9 @@ export interface AnimInputs {
   alive: boolean;
   /** Seconds since the current attack started; -1 when not attacking. */
   attackElapsed: number;
-  /** True for ranged/thrown weapons (shoot pose instead of a swing). */
-  missileWeapon: boolean;
+  weaponForm: WeaponForm;
+  weaponSize: WeaponSize;
+  weaponType: MechType;
   castTimer: number;
   hitstunTimer: number;
   launchedTimer: number;
@@ -139,17 +228,225 @@ export interface Animator {
 }
 
 const easeOut = (t: number) => 1 - (1 - t) * (1 - t);
-
+const easeIn = (t: number) => t * t;
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
-
-const lerpVec = (a: Vec, b: Vec, t: number): Vec => ({
-  x: lerp(a.x, b.x, t),
-  y: lerp(a.y, b.y, t),
-});
 
 interface FootPlant {
   locked: boolean;
   x: number;
+}
+
+type AttackPhase = "windup" | "active" | "recovery";
+
+/** What one attack style contributes to the pose this frame. */
+interface AttackContribution {
+  /** Weapon-hand target, in "forward/up" units relative to the neck. */
+  hand: { fwd: number; up: number };
+  /** Weapon direction as an angle relative to facing (0 = forward, -90° = up). */
+  dirRel: number | null;
+  lean: number;
+  /** Extra hips drop (+down) for weight. */
+  hipsDy: number;
+  /** Off-hand target override (fwd/up rel neck); null = style default. */
+  offHand: { fwd: number; up: number } | null;
+}
+
+/**
+ * Pose curves per attack style and phase. All units are in fighter-scale `s`;
+ * `k` is progress 0→1 within the phase.
+ */
+function attackContribution(
+  style: AttackStyle,
+  phase: AttackPhase,
+  k: number,
+): AttackContribution {
+  const out: AttackContribution = {
+    hand: { fwd: 10, up: -14 },
+    dirRel: -0.55,
+    lean: 0.08,
+    hipsDy: 0,
+    offHand: null,
+  };
+  const K = easeOut(k);
+
+  switch (style) {
+    case "slash": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(6, -6, K), up: lerp(-14, -20, K) };
+        out.dirRel = lerp(-0.55, -1.9, K);
+        out.lean = lerp(0.08, -0.04, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(-6, 24, K), up: lerp(-20, 4, K) };
+        out.dirRel = lerp(-1.9, 0.45, K);
+        out.lean = lerp(-0.04, 0.24, K);
+        out.hipsDy = 1.5 * K;
+      } else {
+        out.hand = { fwd: lerp(24, 10, K), up: lerp(4, -14, K) };
+        out.dirRel = lerp(0.45, -0.55, K);
+        out.lean = lerp(0.24, 0.08, K);
+      }
+      break;
+    }
+    case "chop": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, -4, K), up: lerp(-12, -26, K) };
+        out.dirRel = lerp(-0.7, -1.75, K);
+        out.lean = lerp(0.06, -0.14, K);
+        out.hipsDy = -3 * K; // rise onto the toes
+      } else if (phase === "active") {
+        const D = easeIn(k); // accelerate into the slam
+        out.hand = { fwd: lerp(-4, 18, D), up: lerp(-26, 8, D) };
+        out.dirRel = lerp(-1.75, 0.85, D);
+        out.lean = lerp(-0.14, 0.32, D);
+        out.hipsDy = lerp(-3, 5, D); // drop the weight in
+      } else {
+        out.hand = { fwd: lerp(18, 8, K), up: lerp(8, -12, K) };
+        out.dirRel = lerp(0.85, -0.7, K);
+        out.lean = lerp(0.32, 0.06, K);
+        out.hipsDy = lerp(5, 0, K);
+      }
+      out.offHand = { fwd: out.hand.fwd, up: out.hand.up }; // both on the haft
+      break;
+    }
+    case "thrust": {
+      // Spear stays level: the tip travels the reach line.
+      out.dirRel = -0.05;
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(4, -9, K), up: -6 };
+        out.lean = lerp(0.08, -0.02, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(-9, 15, easeIn(k)), up: -6 };
+        out.lean = lerp(-0.02, 0.26, K);
+        out.hipsDy = 2 * K;
+      } else {
+        out.hand = { fwd: lerp(15, 4, K), up: -6 };
+        out.lean = lerp(0.26, 0.08, K);
+        out.hipsDy = lerp(2, 0, K);
+      }
+      break;
+    }
+    case "reap": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(6, -13, K), up: lerp(-10, -4, K) };
+        out.dirRel = lerp(-0.6, -2.4, K);
+        out.lean = lerp(0.06, -0.1, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(-13, 19, K), up: lerp(-4, -8, K) };
+        out.dirRel = lerp(-2.4, 0.25, K);
+        out.lean = lerp(-0.1, 0.3, K);
+        out.hipsDy = 3 * K;
+      } else {
+        out.hand = { fwd: lerp(19, 6, K), up: lerp(-8, -10, K) };
+        out.dirRel = lerp(0.25, -0.6, K);
+        out.lean = lerp(0.3, 0.06, K);
+        out.hipsDy = lerp(3, 0, K);
+      }
+      break;
+    }
+    case "crack": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, -9, K), up: lerp(-12, -18, K) };
+        out.dirRel = lerp(-0.4, -2.1, K);
+        out.lean = lerp(0.06, -0.06, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(-9, 20, easeIn(k)), up: lerp(-18, -4, K) };
+        out.dirRel = lerp(-2.1, 0.2, easeIn(k));
+        out.lean = lerp(-0.06, 0.26, K);
+      } else {
+        out.hand = { fwd: lerp(20, 8, K), up: lerp(-4, -12, K) };
+        out.dirRel = lerp(0.2, -0.4, K);
+        out.lean = lerp(0.26, 0.06, K);
+      }
+      break;
+    }
+    case "cast": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, 2, K), up: lerp(-12, -20, K) };
+        out.dirRel = lerp(-0.55, -1.25, K);
+        out.lean = lerp(0.06, -0.05, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(2, 17, K), up: lerp(-20, -6, K) };
+        out.dirRel = lerp(-1.25, -0.15, K);
+        out.lean = lerp(-0.05, 0.2, K);
+      } else {
+        out.hand = { fwd: lerp(17, 8, K), up: lerp(-6, -12, K) };
+        out.dirRel = lerp(-0.15, -0.55, K);
+        out.lean = lerp(0.2, 0.06, K);
+      }
+      break;
+    }
+    case "draw": {
+      out.dirRel = -0.08;
+      out.lean = 0.12;
+      if (phase === "windup") {
+        // Bow arm steady forward; string hand pulls back to the cheek.
+        out.hand = { fwd: 14, up: -6 };
+        out.offHand = { fwd: lerp(12, -2, K), up: -5 };
+      } else if (phase === "active") {
+        // Release: string hand snaps forward, slight bow recoil.
+        out.hand = { fwd: lerp(14, 12.5, K), up: -6 };
+        out.offHand = { fwd: lerp(-2, 10, easeOut(k)), up: -5.5 };
+      } else {
+        out.hand = { fwd: lerp(12.5, 10, K), up: lerp(-6, -12, K) };
+        out.offHand = null;
+        out.dirRel = lerp(-0.08, -0.5, K);
+        out.lean = lerp(0.12, 0.08, K);
+      }
+      break;
+    }
+    case "shoot": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, 13, K), up: lerp(-12, -7, K) };
+        out.dirRel = lerp(-0.5, 0, K);
+        out.lean = 0.1;
+      } else if (phase === "active") {
+        // Recoil kick: hand back and up, muzzle climbs.
+        out.hand = { fwd: lerp(13, 8.5, easeOut(k)), up: lerp(-7, -11, easeOut(k)) };
+        out.dirRel = lerp(0, -0.35, easeOut(k));
+        out.lean = lerp(0.1, -0.04, K);
+      } else {
+        out.hand = { fwd: lerp(8.5, 8, K), up: lerp(-11, -12, K) };
+        out.dirRel = lerp(-0.35, -0.5, K);
+        out.lean = lerp(-0.04, 0.08, K);
+      }
+      break;
+    }
+    case "bash": {
+      out.dirRel = -0.3;
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, 1, K), up: lerp(-10, -6, K) };
+        out.lean = lerp(0.06, -0.05, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(1, 18, easeIn(k)), up: -8 };
+        out.lean = lerp(-0.05, 0.3, K);
+        out.hipsDy = 2.5 * K;
+      } else {
+        out.hand = { fwd: lerp(18, 8, K), up: lerp(-8, -10, K) };
+        out.lean = lerp(0.3, 0.06, K);
+        out.hipsDy = lerp(2.5, 0, K);
+      }
+      break;
+    }
+    case "throw": {
+      if (phase === "windup") {
+        out.hand = { fwd: lerp(8, -8, K), up: lerp(-10, -19, K) };
+        out.dirRel = lerp(-0.5, -2.0, K);
+        out.lean = lerp(0.06, -0.08, K);
+      } else if (phase === "active") {
+        out.hand = { fwd: lerp(-8, 19, easeOut(k)), up: lerp(-19, -8, K) };
+        out.dirRel = lerp(-2.0, 0.1, easeOut(k));
+        out.lean = lerp(-0.08, 0.26, K);
+        out.hipsDy = 2 * K;
+      } else {
+        out.hand = { fwd: lerp(19, 8, K), up: lerp(-8, -11, K) };
+        out.dirRel = lerp(0.1, -0.5, K);
+        out.lean = lerp(0.26, 0.06, K);
+        out.hipsDy = lerp(2, 0, K);
+      }
+      break;
+    }
+  }
+  return out;
 }
 
 export function createAnimator(bones: Bones): Animator {
@@ -186,43 +483,49 @@ export function createAnimator(bones: Bones): Animator {
 
       const f = inp.facing;
       const t = inp.time;
+      const style = attackStyleOf(inp.weaponForm, inp.weaponType);
+      const twoHanded = isTwoHanded(inp.weaponForm, inp.weaponSize, inp.weaponType);
 
-      // --- Hips: track the physics root, plus per-state bob/jitter. ---
+      // --- Attack phase bookkeeping. ---
+      const atkTiming = ATTACK_TIMINGS[style];
+      let atk: AttackContribution | null = null;
+      if (state === "attack") {
+        const e = inp.attackElapsed;
+        let phase: AttackPhase;
+        let k: number;
+        if (e < atkTiming.windup) {
+          phase = "windup";
+          k = e / atkTiming.windup;
+        } else if (e < atkTiming.windup + atkTiming.active) {
+          phase = "active";
+          k = (e - atkTiming.windup) / atkTiming.active;
+        } else {
+          phase = "recovery";
+          k = Math.min(1, (e - atkTiming.windup - atkTiming.active) / atkTiming.recovery);
+        }
+        atk = attackContribution(style, phase, k);
+      }
+
+      // --- Hips: track the physics root, plus per-state bob/weight. ---
       let bob = 0;
-      if (state === "idle") bob = Math.sin(t * 2.2) * 1.2 * s;
-      if (state === "run") bob = Math.sin(runPhase * 2) * 1.6 * s;
+      if (state === "idle") bob = Math.sin(t * 2.2) * 1.2 * s + 2.2 * s; // crouched guard
+      if (state === "run") bob = Math.sin(runPhase * 2) * 1.6 * s + 1 * s;
+      if (atk) bob = atk.hipsDy * s + 1.5 * s;
       let hipsX = inp.rootX;
       if (state === "hitstun") hipsX += Math.sin(t * 45) * 1.4 * s;
+      if (state === "idle") hipsX += Math.sin(t * 1.1) * 0.8 * s; // weight shift
       const hips: Vec = { x: hipsX, y: inp.rootY + bones.hipsOffset + bob };
 
       // --- Torso lean (positive leans toward facing). ---
       const moveDir = Math.abs(inp.vx) > 0.3 ? Math.sign(inp.vx) * f : 0;
-      let lean = 0.05;
-      if (state === "run") lean = 0.16 * moveDir + 0.03;
+      let lean = 0.09; // ready stance leans in by default
+      if (state === "run") lean = 0.16 * moveDir + 0.05;
       if (state === "jump") lean = 0.12;
       if (state === "fall") lean = -0.05;
       if (state === "hitstun") lean = -0.32;
       if (state === "launched") lean = -0.6;
       if (state === "cast") lean = 0.1;
-
-      // --- Attack phase bookkeeping. ---
-      const timing = inp.missileWeapon ? ATTACK_TIMING.missile : ATTACK_TIMING.melee;
-      let atkPhase: "windup" | "active" | "recovery" | null = null;
-      let atkK = 0; // 0→1 progress within the current phase
-      if (state === "attack") {
-        const e = inp.attackElapsed;
-        if (e < timing.windup) {
-          atkPhase = "windup";
-          atkK = e / timing.windup;
-        } else if (e < timing.windup + timing.active) {
-          atkPhase = "active";
-          atkK = (e - timing.windup) / timing.active;
-        } else {
-          atkPhase = "recovery";
-          atkK = Math.min(1, (e - timing.windup - timing.active) / timing.recovery);
-        }
-        lean = atkPhase === "windup" ? -0.06 : atkPhase === "active" ? 0.24 : lerp(0.24, 0.05, atkK);
-      }
+      if (atk) lean = atk.lean;
 
       const theta = f * lean;
       const neck: Vec = {
@@ -277,71 +580,77 @@ export function createAnimator(bones: Bones): Animator {
         footTargetR = { x: hips.x - nvx * 8 * s - wig, y: hips.y + 28 * s };
       } else if (state === "attack") {
         // Wide braced stance while swinging.
-        footTargetL = { x: hips.x + f * 10 * s, y: groundFootY };
+        footTargetL = { x: hips.x + f * 11 * s, y: groundFootY };
         footTargetR = { x: hips.x - f * 9 * s, y: groundFootY };
       } else {
-        // idle / cast / hitstun: settled stance.
-        footTargetL = { x: hips.x + f * 7 * s, y: groundFootY };
-        footTargetR = { x: hips.x - f * 6 * s, y: groundFootY };
+        // idle / cast / hitstun: ready stance, front foot leading.
+        footTargetL = { x: hips.x + f * 8 * s, y: groundFootY };
+        footTargetR = { x: hips.x - f * 7 * s, y: groundFootY };
       }
 
       // --- Hand targets. ---
-      // Defaults: relaxed hang (off hand) and a loose weapon hold (weapon hand).
-      const sway = Math.sin(t * 2.2 + 1) * 1.2 * s;
-      let handTargetL: Vec = { x: hips.x - f * 5 * s + sway, y: hips.y + 13 * s };
-      let handTargetR: Vec = { x: hips.x + f * 8 * s, y: hips.y + 5 * s };
-      let weaponDir: Vec | null = null; // world direction the weapon points
+      // Default: GUARD — weapon hand raised at the chest (elbow bent), off
+      // hand forward, weapon angled up-forward. Not a straight stiff arm.
+      const sway = Math.sin(t * 2.2 + 1) * 1 * s;
+      let handTargetR: Vec = {
+        x: hips.x + f * 10 * s,
+        y: hips.y - 14 * s + sway * 0.5,
+      };
+      let handTargetL: Vec = { x: hips.x + f * 3 * s + sway * 0.4, y: hips.y - 8 * s };
+      let dirRel: number | null = -0.55; // guard: blade up-forward
+      if (style === "shoot" || style === "draw") dirRel = -0.35;
 
       if (state === "run") {
-        const armSwing = Math.cos(runPhase) * 9 * s;
-        handTargetL = { x: hips.x - f * armSwing, y: hips.y - 6 * s };
-        // Weapon arm swings less — keeps the weapon presentable.
-        handTargetR = { x: hips.x + f * (4 * s + armSwing * 0.45), y: hips.y - 2 * s };
+        if (twoHanded) {
+          // Two-handed carry: weapon held across the body, little arm swing.
+          handTargetR = { x: hips.x + f * 8 * s, y: hips.y - 11 * s };
+          dirRel = -0.65;
+        } else {
+          const armSwing = Math.cos(runPhase) * 9 * s;
+          handTargetL = { x: hips.x - f * armSwing, y: hips.y - 6 * s };
+          handTargetR = { x: hips.x + f * (5 * s + armSwing * 0.4), y: hips.y - 9 * s };
+          dirRel = -0.5;
+        }
       } else if (state === "jump" || state === "fall") {
         handTargetL = { x: neck.x - f * 9 * s, y: neck.y - 3 * s };
         handTargetR = { x: neck.x + f * 8 * s, y: neck.y - 5 * s };
+        dirRel = null; // weapon follows the forearm mid-air
       } else if (state === "hitstun") {
         handTargetL = { x: neck.x - f * 10 * s, y: neck.y + 4 * s };
         handTargetR = { x: neck.x - f * 5 * s, y: neck.y - 4 * s };
+        dirRel = null;
       } else if (state === "launched") {
         const nvx = Math.max(-1, Math.min(1, inp.vx * 0.3));
         handTargetL = { x: neck.x - nvx * 10 * s, y: neck.y + 2 * s };
         handTargetR = { x: neck.x - nvx * 7 * s, y: neck.y - 5 * s };
+        dirRel = null;
       } else if (state === "cast") {
         const k = easeOut(1 - inp.castTimer / CAST_TIME);
         handTargetL = { x: neck.x + f * (6 + 6 * k) * s, y: neck.y + 6 * s };
         handTargetR = { x: neck.x + f * (8 + 7 * k) * s, y: neck.y - 2 * s };
-        weaponDir = { x: f * 0.4, y: -1 };
-      } else if (state === "attack" && atkPhase) {
-        handTargetL = { x: hips.x - f * 8 * s, y: hips.y + 3 * s }; // counterweight
-        if (inp.missileWeapon) {
-          // Raise, loose, then recoil.
-          const raise: Vec = { x: neck.x + f * 11 * s, y: neck.y + 1 * s };
-          if (atkPhase === "windup") {
-            handTargetR = lerpVec({ x: hips.x + f * 8 * s, y: hips.y + 5 * s }, raise, easeOut(atkK));
-          } else if (atkPhase === "active") {
-            handTargetR = { x: raise.x - f * 3 * s * atkK, y: raise.y };
-          } else {
-            handTargetR = lerpVec(raise, { x: hips.x + f * 8 * s, y: hips.y + 5 * s }, easeOut(atkK));
-          }
-          weaponDir = { x: f, y: 0 };
-        } else {
-          // Swing arc: wind back-and-up → thrust through → settle.
-          const holdPos: Vec = { x: hips.x + f * 8 * s, y: hips.y + 5 * s };
-          const backPos: Vec = { x: neck.x - f * 11 * s, y: neck.y - 5 * s };
-          const outPos: Vec = { x: neck.x + f * 25 * s, y: neck.y + 5 * s };
-          if (atkPhase === "windup") {
-            handTargetR = lerpVec(holdPos, backPos, easeOut(atkK));
-            weaponDir = { x: -f * 0.5, y: -1 };
-          } else if (atkPhase === "active") {
-            handTargetR = lerpVec(backPos, outPos, easeOut(atkK));
-            const wy = lerp(-0.9, 0, easeOut(atkK));
-            weaponDir = { x: f * (1 - Math.abs(wy) * 0.4), y: wy };
-          } else {
-            handTargetR = lerpVec(outPos, holdPos, easeOut(atkK));
-            weaponDir = { x: f, y: 0.3 * atkK };
-          }
-        }
+        dirRel = -1.1;
+      } else if (atk) {
+        handTargetR = { x: neck.x + f * atk.hand.fwd * s, y: neck.y + atk.hand.up * s };
+        dirRel = atk.dirRel;
+        handTargetL = atk.offHand
+          ? { x: neck.x + f * atk.offHand.fwd * s, y: neck.y + atk.offHand.up * s }
+          : { x: hips.x - f * 8 * s, y: hips.y + 3 * s }; // counterweight
+      }
+
+      // Weapon direction from the style's relative angle.
+      const weaponDir: Vec | null =
+        dirRel === null ? null : { x: f * Math.cos(dirRel), y: Math.sin(dirRel) };
+
+      // Two-handed grip: the off hand holds the shaft near the lead hand
+      // (ahead of it for thrusting polearms, behind it for everything else).
+      const gripStates = state === "idle" || state === "run" || state === "attack";
+      const offHandFree = atk?.offHand != null; // style already placed it (draw)
+      if (twoHanded && gripStates && weaponDir && !offHandFree) {
+        const gap = (style === "thrust" ? 8.5 : -8) * s;
+        handTargetL = {
+          x: handTargetR.x + weaponDir.x * gap,
+          y: handTargetR.y + weaponDir.y * gap,
+        };
       }
 
       // --- Solve limbs. ---

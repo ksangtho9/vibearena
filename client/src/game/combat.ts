@@ -1,9 +1,10 @@
 import Matter from "matter-js";
+import type { AbilityMotif, ElementKind } from "../types/character";
 import type { Arena } from "./arena";
 import { collapse, type Fighter, type Side } from "./stickman";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
-import { ATTACK_TIMING } from "./animation";
+import { attackTimingOf } from "./animation";
 
 /**
  * Damage, knockback, HP and projectiles. Weapons have NO physics bodies:
@@ -24,6 +25,8 @@ export interface Projectile {
   ttl: number;
   /** Thrown weapons arc under gravity and bounce; ranged shots fly flat. */
   arc: boolean;
+  /** Gently steers toward the target (ability param, turn-rate capped). */
+  homing: boolean;
   color: string;
   /** VFX glow color derived from the owner's weapon (render-only). */
   glow: string;
@@ -31,7 +34,7 @@ export interface Projectile {
 }
 
 export interface Effect {
-  kind: "ring" | "spark" | "text";
+  kind: "ring" | "spark" | "text" | "motif";
   x: number;
   y: number;
   ttl: number;
@@ -39,6 +42,11 @@ export interface Effect {
   color: string;
   text?: string;
   radius?: number;
+  /** Ability VFX shape + element styling (kind "motif"). */
+  motif?: AbilityMotif;
+  element?: ElementKind;
+  /** Facing for directional motifs (beam/wave/slash). */
+  dir?: number;
 }
 
 export interface CombatCtx {
@@ -88,7 +96,8 @@ const speedOf = (f: Fighter) => (3 + f.spec.stats.speed * 0.035) * f.buffs.speed
 const jumpVelOf = (f: Fighter) => 11 + f.spec.stats.speed * 0.015;
 
 const isMissile = (f: Fighter) => f.spec.weapon.type !== "melee";
-const attackTiming = (f: Fighter) => (isMissile(f) ? ATTACK_TIMING.missile : ATTACK_TIMING.melee);
+/** Phase timing follows the weapon's form (chop ≠ thrust ≠ shoot…). */
+const attackTiming = (f: Fighter) => attackTimingOf(f.style.weapon.form, f.spec.weapon.type);
 
 /** Attacker-side damage before the defender's mitigation. */
 export function rawDamage(attacker: Fighter, base: number): number {
@@ -118,11 +127,20 @@ export function dealDamage(
   opts: DamageOpts = {},
 ): void {
   if (!target.alive) return;
+  // Dash i-frames: the hit whiffs entirely.
+  if (target.invulnTimer > 0) {
+    const { x, y } = target.root.position;
+    pushEffect(ctx, { kind: "text", x, y: y - 70, ttl: 0.5, color: "#9ba69e", text: "MISS" });
+    return;
+  }
   const knockbackMul = opts.knockbackMul ?? 1;
   const source = opts.source ?? "ability";
 
-  let dmg = amount * (130 / (130 + target.spec.stats.defense)) * DAMAGE_SCALE;
-  if (target.shieldTimer > 0) dmg *= 0.3;
+  let dmg =
+    amount *
+    (130 / (130 + target.spec.stats.defense * target.buffs.defenseMul)) *
+    DAMAGE_SCALE;
+  if (target.shieldTimer > 0) dmg *= 1 - target.shieldCoverage;
   dmg = Math.max(1, Math.round(dmg));
 
   target.hp = Math.max(0, target.hp - dmg);
@@ -166,7 +184,17 @@ export function dealDamage(
 export function spawnProjectile(
   owner: Fighter,
   ctx: CombatCtx,
-  opts: { damage: number; speed: number; radius: number; arc: boolean; source: DamageSource },
+  opts: {
+    damage: number;
+    speed: number;
+    radius: number;
+    arc: boolean;
+    source: DamageSource;
+    /** Launch angle offset in radians (negative = upward), for fans. */
+    angle?: number;
+    homing?: boolean;
+    glow?: string;
+  },
 ): void {
   // Launch from the weapon hand joint.
   const hand = owner.skeleton.handR;
@@ -182,9 +210,10 @@ export function spawnProjectile(
       label: `${owner.side}-projectile`,
     },
   );
+  const a = opts.angle ?? 0;
   Matter.Body.setVelocity(body, {
-    x: owner.facing * opts.speed,
-    y: opts.arc ? -5.5 : 0,
+    x: owner.facing * opts.speed * Math.cos(a),
+    y: opts.speed * Math.sin(a) + (opts.arc ? -5.5 : 0),
   });
   Matter.Composite.add(ctx.arena.world, body);
   ctx.projectiles.push({
@@ -194,8 +223,9 @@ export function spawnProjectile(
     source: opts.source,
     ttl: opts.arc ? 2.6 : 1.8,
     arc: opts.arc,
+    homing: opts.homing ?? false,
     color: owner.color,
-    glow: owner.style.glow,
+    glow: opts.glow ?? owner.style.glow,
     radius: opts.radius,
   });
 }
@@ -344,9 +374,15 @@ function tickTimers(f: Fighter, dt: number): void {
   f.launchedTimer = Math.max(0, f.launchedTimer - dt);
   f.castTimer = Math.max(0, f.castTimer - dt);
   f.dropThrough = Math.max(0, f.dropThrough - dt);
+  f.invulnTimer = Math.max(0, f.invulnTimer - dt);
+  if (f.regenTimer > 0 && f.alive) {
+    f.regenTimer = Math.max(0, f.regenTimer - dt);
+    f.hp = Math.min(f.maxHp, f.hp + f.regenRate * dt);
+    if (f.regenTimer === 0) f.hp = Math.round(f.hp);
+  }
   if (f.buffTimer > 0) {
     f.buffTimer = Math.max(0, f.buffTimer - dt);
-    if (f.buffTimer === 0) f.buffs = { speedMul: 1, strengthMul: 1 };
+    if (f.buffTimer === 0) f.buffs = { speedMul: 1, strengthMul: 1, defenseMul: 1 };
   }
 }
 
@@ -416,7 +452,9 @@ export function updateFighter(
     moving: Math.abs(f.root.velocity.x) > 0.6 && f.grounded,
     alive: f.alive,
     attackElapsed: f.attackAnim > 0 ? timing.total - f.attackAnim : -1,
-    missileWeapon: isMissile(f),
+    weaponForm: f.style.weapon.form,
+    weaponSize: f.style.weapon.size,
+    weaponType: f.spec.weapon.type,
     castTimer: f.castTimer,
     hitstunTimer: f.hitstunTimer,
     launchedTimer: f.launchedTimer,
@@ -449,6 +487,26 @@ export function updateProjectiles(
     }
 
     const target = p.ownerSide === "player" ? fighters.bot : fighters.player;
+
+    // Homing: rotate the velocity toward the target, turn rate capped so it
+    // curves rather than snaps.
+    if (p.homing && target.alive) {
+      const v = p.body.velocity;
+      const speed = Math.hypot(v.x, v.y) || 1;
+      const current = Math.atan2(v.y, v.x);
+      const wanted = Math.atan2(
+        target.root.position.y - 20 - p.body.position.y,
+        target.root.position.x - p.body.position.x,
+      );
+      let diff = wanted - current;
+      while (diff > Math.PI) diff -= Math.PI * 2;
+      while (diff < -Math.PI) diff += Math.PI * 2;
+      const turn = Math.max(-0.05, Math.min(0.05, diff));
+      Matter.Body.setVelocity(p.body, {
+        x: Math.cos(current + turn) * speed,
+        y: Math.sin(current + turn) * speed,
+      });
+    }
     const hit =
       target.alive && Matter.Query.collides(p.body, [target.root]).length > 0;
     const hitGround = Matter.Query.collides(p.body, [arena.ground]).length > 0;

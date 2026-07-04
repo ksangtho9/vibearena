@@ -1,6 +1,8 @@
 import Matter from "matter-js";
+import type { AbilityMotif, AbilityParams, ElementKind } from "../types/character";
 import type { Fighter } from "./stickman";
 import { CAST_TIME } from "./animation";
+import { elementGlow } from "../generation/enrich";
 import {
   dealDamage,
   pushEffect,
@@ -10,54 +12,96 @@ import {
 } from "./combat";
 
 /**
- * Deterministic ability effects. The LLM picks the *kind* and the flavor
- * name; what each kind actually does is fixed game logic, scaled only by the
- * budget-clamped `power`.
+ * Ability effects. The LLM picks the KIND (fixed mechanics), the ELEMENT +
+ * MOTIF (visuals), and proposes params that statBudget clamped into fair
+ * bands — so a "Lightning Nova" and a "Toxic Wave" are both AOEs, but they
+ * read and play differently without either being oppressive.
  */
+
+interface AbilityRuntime {
+  element: ElementKind;
+  motif: AbilityMotif;
+  glow: string;
+  params: AbilityParams;
+}
+
+/** Safe accessors with enrich-equivalent fallbacks (handles bare specs). */
+function runtimeOf(user: Fighter): AbilityRuntime {
+  const a = user.spec.ability;
+  const element = a.element ?? "none";
+  return {
+    element,
+    motif: a.motif ?? "burst",
+    glow: elementGlow(element, user.style.glow),
+    params: a.params ?? {},
+  };
+}
+
+function motifEffect(
+  ctx: CombatCtx,
+  rt: AbilityRuntime,
+  x: number,
+  y: number,
+  opts: { radius?: number; dir?: number; ttl?: number } = {},
+): void {
+  pushEffect(ctx, {
+    kind: "motif",
+    x,
+    y,
+    ttl: opts.ttl ?? 0.55,
+    color: rt.glow,
+    motif: rt.motif,
+    element: rt.element,
+    radius: opts.radius ?? 60,
+    dir: opts.dir ?? 1,
+  });
+}
+
 export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   const { ability } = user.spec;
   const pos = user.root.position;
+  const rt = runtimeOf(user);
+  const p = rt.params;
   user.castTimer = CAST_TIME; // cast pose for the animator
 
-  // Announce the move with its LLM-given name.
+  // Announce the move with its LLM-given name, tinted by its element.
   pushEffect(ctx, {
     kind: "text",
     x: pos.x,
     y: pos.y - 95 * user.scale,
     ttl: 0.9,
-    color: user.color,
+    color: rt.glow,
     text: ability.name.toUpperCase(),
   });
 
   switch (ability.kind) {
     case "dash": {
-      Matter.Body.setVelocity(user.root, {
-        x: user.facing * (14 + ability.power * 0.35),
-        y: -2,
+      const burst = p.distance ?? 18;
+      Matter.Body.setVelocity(user.root, { x: user.facing * burst, y: -2 });
+      user.invulnTimer = p.iframes ?? 0.25;
+      motifEffect(ctx, rt, pos.x, pos.y - 20 * user.scale, {
+        radius: 55,
+        dir: -user.facing, // trail behind the dash
+        ttl: 0.45,
       });
-      for (let i = 0; i < 4; i++) {
-        pushEffect(ctx, {
-          kind: "ring",
-          x: pos.x - user.facing * i * 14,
-          y: pos.y,
-          ttl: 0.25 + i * 0.05,
-          color: user.color,
-          radius: 18 - i * 3,
-        });
-      }
       break;
     }
+
     case "shield": {
-      user.shieldTimer = 2.2 + ability.power * 0.06;
-      pushEffect(ctx, { kind: "ring", x: pos.x, y: pos.y, ttl: 0.4, color: user.color, radius: 60 });
+      user.shieldTimer = p.duration ?? 3;
+      user.shieldCoverage = p.coverage ?? 0.7;
+      motifEffect(ctx, rt, pos.x, pos.y - 20 * user.scale, { radius: 62, ttl: 0.7 });
       break;
     }
+
     case "aoe": {
-      const radius = 80 + ability.power * 3.5;
-      pushEffect(ctx, { kind: "ring", x: pos.x, y: pos.y, ttl: 0.5, color: user.color, radius });
-      const d = Matter.Vector.magnitude(
-        Matter.Vector.sub(opponent.root.position, pos),
-      );
+      const radius = p.radius ?? 120;
+      motifEffect(ctx, rt, pos.x, pos.y - 10 * user.scale, {
+        radius,
+        dir: user.facing,
+        ttl: 0.65,
+      });
+      const d = Matter.Vector.magnitude(Matter.Vector.sub(opponent.root.position, pos));
       if (d <= radius) {
         dealDamage(opponent, rawDamage(user, ability.power * 0.9), user.facing, ctx, {
           knockbackMul: 1.6,
@@ -66,32 +110,72 @@ export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): vo
       }
       break;
     }
+
     case "heal": {
-      const healed = Math.round(ability.power * 1.3);
-      user.hp = Math.min(user.maxHp, user.hp + healed);
+      const amount = p.amount ?? Math.round(ability.power * 1.3);
+      if (p.overTime) {
+        user.regenTimer = 3;
+        user.regenRate = amount / 3;
+      } else {
+        user.hp = Math.min(user.maxHp, user.hp + amount);
+      }
       pushEffect(ctx, {
         kind: "text",
         x: pos.x,
         y: pos.y - 70,
         ttl: 0.8,
         color: "#8fd18a",
-        text: `+${healed}`,
+        text: p.overTime ? `+${amount} over time` : `+${amount}`,
       });
+      motifEffect(ctx, rt, pos.x, pos.y - 24 * user.scale, { radius: 46, ttl: 0.9 });
       break;
     }
+
     case "projectile": {
-      spawnProjectile(user, ctx, {
-        damage: rawDamage(user, ability.power * 1.1),
-        speed: 12,
-        radius: 9,
-        arc: false,
-        source: "ability",
+      const count = Math.max(1, Math.min(5, Math.round(p.count ?? 1)));
+      // Total potential damage grows sub-linearly with count — a fan trades
+      // per-hit punch for coverage.
+      const per = rawDamage(user, ability.power * 1.1) / Math.sqrt(count);
+      const halfArc = (p.spread ?? 0) * 0.45;
+      for (let i = 0; i < count; i++) {
+        const t = count === 1 ? 0 : i / (count - 1) - 0.5;
+        spawnProjectile(user, ctx, {
+          damage: per,
+          speed: p.homing ? 10 : 12,
+          radius: count > 2 ? 6.5 : 9,
+          arc: false,
+          source: "ability",
+          angle: t * 2 * halfArc,
+          homing: p.homing ?? false,
+          glow: rt.glow,
+        });
+      }
+      motifEffect(ctx, rt, pos.x + user.facing * 24 * user.scale, pos.y - 24 * user.scale, {
+        radius: 30,
+        dir: user.facing,
+        ttl: 0.4,
       });
       break;
     }
+
     case "buff": {
-      user.buffTimer = 4;
-      user.buffs = { speedMul: 1.35, strengthMul: 1 + ability.power * 0.03 };
+      user.buffTimer = p.duration ?? 4;
+      const magnitude = p.magnitude ?? 1.35;
+      const stat = p.stat ?? "strength";
+      user.buffs = {
+        speedMul: stat === "speed" ? magnitude : 1,
+        strengthMul: stat === "strength" ? magnitude : 1,
+        defenseMul: stat === "defense" ? magnitude : 1,
+      };
+      pushEffect(ctx, {
+        kind: "text",
+        x: pos.x,
+        y: pos.y - 70,
+        ttl: 0.8,
+        color: rt.glow,
+        text: `${stat.toUpperCase()} UP`,
+      });
+      motifEffect(ctx, rt, pos.x, pos.y - 24 * user.scale, { radius: 50, ttl: 0.8 });
       break;
     }
   }

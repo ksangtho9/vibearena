@@ -1,4 +1,4 @@
-import type { CharacterSpec } from "../types/character";
+import type { AbilityParams, CharacterSpec } from "../types/character";
 
 /**
  * Deterministic balancing — no LLM involved. The LLM's numbers are treated as
@@ -24,6 +24,20 @@ export const BANDS = {
   abilityPower: { min: 8, max: 26 },
   abilityCooldown: { min: 3, max: 10 },
   height: { min: 0.8, max: 1.2 },
+  // Ability params: LLM 0–10 scales (or native units) → fair runtime bands.
+  aoeRadius: { min: 70, max: 170 }, // px
+  dashDistance: { min: 10, max: 22 }, // burst velocity
+  healAmount: { min: 10, max: 34 }, // hp
+  buffMagnitude: { min: 1.15, max: 1.6 }, // stat multiplier
+  shieldCoverage: { min: 0.4, max: 0.85 }, // fraction of damage blocked
+} as const;
+
+/** Hard limits for params the LLM supplies in native units. */
+const PARAM_LIMITS = {
+  count: { min: 1, max: 5 },
+  spread: { min: 0, max: 1 },
+  iframes: { min: 0, max: 0.5 }, // seconds
+  duration: { min: 1.5, max: 6 }, // seconds (shield/buff)
 } as const;
 
 const clamp = (v: number, min: number, max: number) =>
@@ -65,6 +79,26 @@ export function normalizeStats(stats: CharacterSpec["stats"]): CharacterSpec["st
   return { hp: values[0], speed: values[1], strength: values[2], defense: values[3] };
 }
 
+/**
+ * Clamp whatever ability params the LLM supplied into their fair bands.
+ * (Missing params get in-band defaults later, in enrich.) 0–10 scales map
+ * onto bands; native-unit params (seconds, fractions, counts) hard-clamp.
+ */
+function balanceAbilityParams(params: AbilityParams | undefined): AbilityParams | undefined {
+  if (!params) return undefined;
+  const out: AbilityParams = { ...params };
+  if (out.radius !== undefined) out.radius = Math.round(scaleToBand(out.radius, BANDS.aoeRadius));
+  if (out.distance !== undefined) out.distance = Math.round(scaleToBand(out.distance, BANDS.dashDistance) * 10) / 10;
+  if (out.amount !== undefined) out.amount = Math.round(scaleToBand(out.amount, BANDS.healAmount));
+  if (out.magnitude !== undefined) out.magnitude = Math.round(scaleToBand(out.magnitude, BANDS.buffMagnitude) * 100) / 100;
+  if (out.coverage !== undefined) out.coverage = Math.round(scaleToBand(out.coverage * 10, BANDS.shieldCoverage) * 100) / 100;
+  if (out.count !== undefined) out.count = Math.round(clamp(out.count, PARAM_LIMITS.count.min, PARAM_LIMITS.count.max));
+  if (out.spread !== undefined) out.spread = Math.round(clamp(out.spread, PARAM_LIMITS.spread.min, PARAM_LIMITS.spread.max) * 100) / 100;
+  if (out.iframes !== undefined) out.iframes = Math.round(clamp(out.iframes, PARAM_LIMITS.iframes.min, PARAM_LIMITS.iframes.max) * 100) / 100;
+  if (out.duration !== undefined) out.duration = Math.round(clamp(out.duration, PARAM_LIMITS.duration.min, PARAM_LIMITS.duration.max) * 10) / 10;
+  return out;
+}
+
 /** Produce the tournament-legal version of a proposed character. */
 export function balanceCharacter(spec: CharacterSpec): CharacterSpec {
   return {
@@ -83,6 +117,7 @@ export function balanceCharacter(spec: CharacterSpec): CharacterSpec {
       ...spec.ability,
       power: Math.round(scaleToBand(spec.ability.power, BANDS.abilityPower)),
       cooldown: Math.round(clampCooldown(spec.ability.cooldown) * 10) / 10,
+      params: balanceAbilityParams(spec.ability.params),
     },
     stats: normalizeStats(spec.stats),
   };

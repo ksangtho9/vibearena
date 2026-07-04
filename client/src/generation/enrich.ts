@@ -1,4 +1,6 @@
 import type {
+  AbilityMotif,
+  AbilityParams,
   CharacterSpec,
   ElementKind,
   WeaponForm,
@@ -14,7 +16,7 @@ import { hueShift, safeCssColor, shade } from "../render/color";
  * mechanical type/range/damage were already balanced by statBudget.
  */
 
-const ELEMENT_GLOW: Record<Exclude<ElementKind, "none">, string> = {
+export const ELEMENT_GLOW: Record<Exclude<ElementKind, "none">, string> = {
   fire: "#ff9a3c",
   ice: "#7cd7ff",
   lightning: "#ffe95e",
@@ -23,6 +25,11 @@ const ELEMENT_GLOW: Record<Exclude<ElementKind, "none">, string> = {
   holy: "#ffe6a3",
   arcane: "#ff6bd6",
 };
+
+/** Glow color for an element, with a fallback for "none". */
+export function elementGlow(element: ElementKind, fallback: string): string {
+  return element === "none" ? fallback : ELEMENT_GLOW[element];
+}
 
 /** Forms whose attacks read as a swing — these get the ribbon trail. */
 const TRAIL_FORMS: WeaponForm[] = [
@@ -83,6 +90,58 @@ export function resolveStyle(spec: CharacterSpec): ResolvedStyle {
   return { fill, outline, accent, glow, element, weapon, trail };
 }
 
+const DEFAULT_MOTIF: Record<CharacterSpec["ability"]["kind"], AbilityMotif> = {
+  aoe: "nova",
+  projectile: "orbs",
+  dash: "beam",
+  shield: "aura",
+  heal: "aura",
+  buff: "burst",
+};
+
+/**
+ * Fill any ability params the LLM omitted with in-band defaults derived from
+ * the already-balanced `power` — same feel as the old single-power scaling.
+ */
+function defaultAbilityParams(ability: CharacterSpec["ability"]): AbilityParams {
+  const p = ability.power; // balanced: 8–26
+  const given = ability.params ?? {};
+  const base: AbilityParams = {};
+  switch (ability.kind) {
+    case "aoe":
+      base.radius = Math.round(80 + p * 3.5);
+      break;
+    case "projectile":
+      base.count = 1;
+      base.spread = 0;
+      base.homing = false;
+      break;
+    case "dash":
+      base.distance = Math.round(Math.min(22, 14 + p * 0.35) * 10) / 10;
+      base.iframes = 0.25;
+      break;
+    case "shield":
+      base.duration = Math.round(Math.min(4, 2.2 + p * 0.06) * 10) / 10;
+      base.coverage = 0.7;
+      break;
+    case "heal":
+      base.amount = Math.round(Math.min(34, p * 1.3));
+      base.overTime = false;
+      break;
+    case "buff":
+      base.stat = "strength";
+      base.magnitude = Math.round(Math.min(1.6, 1 + p * 0.03) * 100) / 100;
+      base.duration = 4;
+      break;
+  }
+  // Projectiles with an explicit count > 1 default to a visible fan.
+  const merged = { ...base, ...given };
+  if (ability.kind === "projectile" && (merged.count ?? 1) > 1 && given.spread === undefined) {
+    merged.spread = 0.4;
+  }
+  return merged;
+}
+
 /** Write the resolved style back into the spec's optional derived fields. */
 export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
   // Resolve from a copy with fully-derived fields cleared, so enriching an
@@ -109,6 +168,15 @@ export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
       doubleEnded: style.weapon.doubleEnded,
       element: style.element,
       vfx: { glow: style.glow, element: style.element, trail: style.trail },
+    },
+    ability: {
+      ...spec.ability,
+      element:
+        (spec.ability.element && spec.ability.element !== "none"
+          ? spec.ability.element
+          : undefined) ?? detectElement(spec.ability.name),
+      motif: spec.ability.motif ?? DEFAULT_MOTIF[spec.ability.kind],
+      params: defaultAbilityParams(spec.ability),
     },
   };
 }

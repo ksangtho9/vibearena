@@ -9,6 +9,7 @@ import {
   type WeaponRenderStyle,
 } from "./weapons/archetypes";
 import {
+  attackStyleOf,
   bonesFor,
   createAnimator,
   type Animator,
@@ -37,6 +38,7 @@ export type Side = "player" | "bot";
 export interface FighterBuffs {
   speedMul: number;
   strengthMul: number;
+  defenseMul: number;
 }
 
 interface TrailPoint {
@@ -100,11 +102,18 @@ export interface Fighter {
   jumpCooldown: number;
   abilityCooldown: number;
   shieldTimer: number;
+  /** Fraction of damage the active shield blocks (from ability params). */
+  shieldCoverage: number;
   buffTimer: number;
   introTimer: number;
   hitstunTimer: number;
   launchedTimer: number;
   castTimer: number;
+  /** Dash i-frames: while > 0, incoming damage misses entirely. */
+  invulnTimer: number;
+  /** Heal-over-time: hp += regenRate per second while regenTimer > 0. */
+  regenTimer: number;
+  regenRate: number;
 
   buffs: FighterBuffs;
   trail: TrailPoint[];
@@ -138,6 +147,7 @@ export function createFighter(
   const bones = bonesFor(s);
   const animator = createAnimator(bones);
   const facing: 1 | -1 = side === "player" ? 1 : -1;
+  const style = resolveStyle(spec);
 
   // Pose once so the skeleton is valid before the first step.
   const frame = animator.update(0, {
@@ -150,15 +160,15 @@ export function createFighter(
     moving: false,
     alive: true,
     attackElapsed: -1,
-    missileWeapon: spec.weapon.type !== "melee",
+    weaponForm: style.weapon.form,
+    weaponSize: style.weapon.size,
+    weaponType: spec.weapon.type,
     castTimer: 0,
     hitstunTimer: 0,
     launchedTimer: 0,
     groundY,
     time: 0,
   });
-
-  const style = resolveStyle(spec);
 
   return {
     spec,
@@ -188,12 +198,16 @@ export function createFighter(
     jumpCooldown: 0,
     abilityCooldown: 0,
     shieldTimer: 0,
+    shieldCoverage: 0.7,
     buffTimer: 0,
     introTimer: 0,
     hitstunTimer: 0,
     launchedTimer: 0,
     castTimer: 0,
-    buffs: { speedMul: 1, strengthMul: 1 },
+    invulnTimer: 0,
+    regenTimer: 0,
+    regenRate: 0,
+    buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
   };
 }
@@ -438,6 +452,17 @@ function bendPoint(base: Vec, tip: Vec, frac: number): Vec {
   };
 }
 
+/**
+ * Push a joint slightly past its true position (away from the base→tip
+ * chord) so limbs draw with a fuller, more organic bow — animation-reference
+ * fluidity without touching the underlying IK.
+ */
+function flourish(base: Vec, via: Vec, tip: Vec, amt = 0.3): Vec {
+  const mx = (base.x + tip.x) / 2;
+  const my = (base.y + tip.y) / 2;
+  return { x: via.x + (via.x - mx) * amt, y: via.y + (via.y - my) * amt };
+}
+
 function luminance(color: string): number {
   const [r, g, b] = parseColor(color);
   return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
@@ -677,8 +702,8 @@ export function renderFighter(
   flatBody(
     ctx,
     [
-      taperedPath(sk.shoulderL, sk.elbowL, sk.handL, armR0, armR1),
-      taperedPath(sk.hipL, sk.kneeL, sk.footL, legR0, legR1),
+      taperedPath(sk.shoulderL, flourish(sk.shoulderL, sk.elbowL, sk.handL), sk.handL, armR0, armR1),
+      taperedPath(sk.hipL, flourish(sk.hipL, sk.kneeL, sk.footL), sk.footL, legR0, legR1),
       taperedPath(
         sk.neck,
         { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
@@ -686,10 +711,10 @@ export function renderFighter(
         2.8 * s,
         2 * s,
       ),
-      taperedPath(sk.hipR, sk.kneeR, sk.footR, legR0, legR1),
+      taperedPath(sk.hipR, flourish(sk.hipR, sk.kneeR, sk.footR), sk.footR, legR0, legR1),
       capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 1.5 * s, 1.5 * s),
       circlePath(sk.head.x, sk.head.y, 8.5 * s),
-      taperedPath(sk.shoulderR, sk.elbowR, sk.handR, armR0, armR1),
+      taperedPath(sk.shoulderR, flourish(sk.shoulderR, sk.elbowR, sk.handR), sk.handR, armR0, armR1),
     ],
     fill,
   );
@@ -699,6 +724,29 @@ export function renderFighter(
   // Swing trail + weapon attached to the hand joint.
   updateAndDrawTrail(ctx, fighter, sk.handR, weaponAngle, time);
   drawWeapon(ctx, fighter, sk.handR, weaponAngle, time);
+
+  // Casting weapons flare at the tip during the active frames.
+  if (
+    fighter.attackWindow > 0 &&
+    attackStyleOf(fighter.style.weapon.form, fighter.spec.weapon.type) === "cast"
+  ) {
+    const len = weaponTipLength(fighter.style.weapon.form, fighter.style.weapon.size) * s;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.shadowColor = fighter.style.glow;
+    ctx.shadowBlur = 18;
+    ctx.fillStyle = withAlpha(fighter.style.glow, 0.55 + 0.3 * Math.sin(time * 20));
+    ctx.beginPath();
+    ctx.arc(
+      sk.handR.x + Math.cos(weaponAngle) * len,
+      sk.handR.y + Math.sin(weaponAngle) * len,
+      6 * s,
+      0,
+      Math.PI * 2,
+    );
+    ctx.fill();
+    ctx.restore();
+  }
 
   // Shield bubble.
   if (fighter.shieldTimer > 0) {
