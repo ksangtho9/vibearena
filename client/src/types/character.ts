@@ -1,11 +1,19 @@
 import { z } from "zod";
 
-export const WEAPON_ARCHETYPES = [
-  "sword", "spear", "staff", "bow", "thrown", "shield", "gauntlet", "orb",
+/** Visual weapon shapes the parametric renderer can draw. */
+export const WEAPON_FORMS = [
+  "sword", "greatsword", "dagger", "axe", "hammer", "spear", "halberd",
+  "scythe", "whip", "flail", "staff", "bow", "gun", "orb", "shield", "claw",
+  "chakram", "bomb",
 ] as const;
-export type WeaponArchetypeId = (typeof WEAPON_ARCHETYPES)[number];
+export type WeaponForm = (typeof WEAPON_FORMS)[number];
 
-export const ELEMENTS = ["fire", "ice", "lightning", "poison", "none"] as const;
+export const WEAPON_SIZES = ["small", "medium", "large"] as const;
+export type WeaponSize = (typeof WEAPON_SIZES)[number];
+
+export const ELEMENTS = [
+  "fire", "ice", "lightning", "poison", "shadow", "holy", "arcane", "none",
+] as const;
 export type ElementKind = (typeof ELEMENTS)[number];
 
 export interface WeaponVfx {
@@ -19,9 +27,11 @@ export interface WeaponVfx {
  * loose 1–10 scales; balance/statBudget.ts then rebalances everything onto a
  * fixed budget so a prompt defines identity, never dominance.
  *
- * The optional fields (archetype, vfx, accentColor, outline) are DERIVED by
- * generation/enrich.ts after validation — they are stripped from raw LLM
- * output and always recomputed, never trusted from the model.
+ * The weapon's VISUAL descriptors (form/size/curve/spikes/doubleEnded/
+ * element) may come straight from the LLM — enrich.ts snaps them into range
+ * and derives anything missing. They never affect mechanics: hitboxes come
+ * from the mechanical `type` + balanced `range` only. `vfx`, `accentColor`
+ * and `outline` stay fully derived (stripped from raw output).
  */
 export interface CharacterSpec {
   name: string;
@@ -37,7 +47,13 @@ export interface CharacterSpec {
     name: string;
     range: number;
     damage: number;
-    archetype?: WeaponArchetypeId;
+    // LLM-emitted visual descriptors (snapped/derived in enrich).
+    form?: WeaponForm;
+    size?: WeaponSize;
+    curve?: number; // 0 straight → 1 curved
+    spikes?: number; // 0–4
+    doubleEnded?: boolean;
+    element?: ElementKind;
     vfx?: WeaponVfx;
   };
   ability: {
@@ -67,7 +83,12 @@ export const characterSpecSchema = z.object({
     name: z.string().min(1).max(48),
     range: z.coerce.number().finite(),
     damage: z.coerce.number().finite(),
-    archetype: z.enum(WEAPON_ARCHETYPES).optional(),
+    form: z.enum(WEAPON_FORMS).optional(),
+    size: z.enum(WEAPON_SIZES).optional(),
+    curve: z.coerce.number().finite().optional(),
+    spikes: z.coerce.number().finite().optional(),
+    doubleEnded: z.boolean().optional(),
+    element: z.enum(ELEMENTS).optional(),
     vfx: z
       .object({
         glow: z.string().max(48),
@@ -129,8 +150,32 @@ function normalizeRaw(raw: unknown): unknown {
       const key = weapon.type.toLowerCase().trim();
       weapon.type = WEAPON_ALIASES[key] ?? key;
     }
-    // Derived fields: recomputed by enrichCharacter, never taken from the model
-    // (and junk values here must not fail validation of an otherwise good spec).
+    // Visual descriptors: keep only values that will pass the enums — a junk
+    // form/size/element must not fail an otherwise good spec (enrich derives
+    // whatever is missing).
+    const keepEnum = (field: string, allowed: readonly string[]) => {
+      if (typeof weapon[field] === "string") {
+        const v = (weapon[field] as string).toLowerCase().trim();
+        if (allowed.includes(v)) weapon[field] = v;
+        else delete weapon[field];
+      } else if (weapon[field] !== undefined) {
+        delete weapon[field];
+      }
+    };
+    keepEnum("form", WEAPON_FORMS);
+    keepEnum("size", WEAPON_SIZES);
+    keepEnum("element", ELEMENTS);
+    if (typeof weapon.doubleEnded === "string") {
+      weapon.doubleEnded = weapon.doubleEnded === "true";
+    } else if (weapon.doubleEnded !== undefined && typeof weapon.doubleEnded !== "boolean") {
+      delete weapon.doubleEnded;
+    }
+    for (const numField of ["curve", "spikes"] as const) {
+      if (weapon[numField] !== undefined && !Number.isFinite(Number(weapon[numField]))) {
+        delete weapon[numField];
+      }
+    }
+    // Fully derived fields: recomputed by enrichCharacter, never taken raw.
     delete weapon.archetype;
     delete weapon.vfx;
   }

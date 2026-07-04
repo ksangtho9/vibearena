@@ -2,7 +2,12 @@ import Matter from "matter-js";
 import type { CharacterSpec } from "../types/character";
 import { resolveStyle, type ResolvedStyle } from "../generation/enrich";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
-import { ARCHETYPES, type WeaponStyle } from "./weapons/archetypes";
+import {
+  drawWeapon as drawParametricWeapon,
+  weaponIsFloating,
+  weaponTipLength,
+  type WeaponRenderStyle,
+} from "./weapons/archetypes";
 import {
   bonesFor,
   createAnimator,
@@ -77,6 +82,12 @@ export interface Fighter {
   maxHp: number;
   alive: boolean;
   grounded: boolean;
+  /** Grounded specifically on a one-way platform (enables drop-through). */
+  onPlatform: boolean;
+  /** While > 0, one-way platforms are pass-through for this fighter. */
+  dropThrough: number;
+  /** Capsule-bottom Y last step — detects crossing a platform surface. */
+  prevBottom: number;
 
   // Countdown timers, in seconds.
   attackCooldown: number;
@@ -113,7 +124,8 @@ export function createFighter(
 
   const root = Matter.Bodies.rectangle(x, groundY - 44 * s, 18 * s, 88 * s, {
     chamfer: { radius: 9 * s },
-    collisionFilter: { group },
+    // FIGHTER_CATEGORY: platforms mask this out (landings are kinematic).
+    collisionFilter: { group, category: 0x0002 },
     inertia: Infinity, // kinematic capsule: never tips over
     density: 0.004,
     friction: 0.05,
@@ -165,6 +177,9 @@ export function createFighter(
     maxHp: maxHpOf(spec),
     alive: true,
     grounded: false,
+    onPlatform: false,
+    dropThrough: 0,
+    prevBottom: groundY,
     attackCooldown: 0,
     attackAnim: 0,
     attackWindow: 0,
@@ -190,6 +205,11 @@ export function maxHpOf(spec: CharacterSpec): number {
 /** X position that stays meaningful after death (camera, distances). */
 export function fighterX(fighter: Fighter): number {
   return fighter.ragdoll ? fighter.ragdoll.torso.body.position.x : fighter.root.position.x;
+}
+
+/** Y position that stays meaningful after death (camera framing). */
+export function fighterY(fighter: Fighter): number {
+  return fighter.ragdoll ? fighter.ragdoll.torso.body.position.y : fighter.root.position.y;
 }
 
 // ---------------------------------------------------------------------------
@@ -485,8 +505,10 @@ export function drawContactShadow(
   ctx.restore();
 }
 
-function weaponStyle(style: ResolvedStyle): WeaponStyle {
+function weaponRenderStyle(style: ResolvedStyle): WeaponRenderStyle {
   return {
+    ...style.weapon,
+    element: style.element,
     fill: style.fill,
     accent: style.accent,
     glow: style.glow,
@@ -501,12 +523,11 @@ function drawWeapon(
   angle: number,
   time: number,
 ): void {
-  const def = ARCHETYPES[fighter.style.archetype];
   ctx.save();
   ctx.translate(hand.x, hand.y);
-  if (!def.floating) ctx.rotate(angle);
+  if (!weaponIsFloating(fighter.style.weapon.form)) ctx.rotate(angle);
   ctx.scale(fighter.scale * 0.95, fighter.scale * 0.95);
-  def.draw(ctx, weaponStyle(fighter.style), time);
+  drawParametricWeapon(ctx, weaponRenderStyle(fighter.style), time);
   ctx.restore();
 }
 
@@ -519,10 +540,12 @@ function updateAndDrawTrail(
   time: number,
 ): void {
   if (!fighter.style.trail) return;
-  const def = ARCHETYPES[fighter.style.archetype];
 
   if (fighter.attackWindow > 0 && fighter.alive) {
-    const len = def.tip * fighter.scale * 0.95;
+    const len =
+      weaponTipLength(fighter.style.weapon.form, fighter.style.weapon.size) *
+      fighter.scale *
+      0.95;
     fighter.trail.push({
       x: hand.x + Math.cos(angle) * len,
       y: hand.y + Math.sin(angle) * len,
@@ -787,15 +810,17 @@ export function drawStickmanPreview(
     flatPart(ctx, crown, style.accent);
   }
 
-  // Weapon in the raised hand.
-  const def = ARCHETYPES[style.archetype];
+  // Weapon in the raised hand. Long flexible forms point slightly down so
+  // they stay inside the portrait; everything else presents raised.
   ctx.save();
   ctx.translate(weaponHand.x, weaponHand.y);
-  if (!def.floating) ctx.rotate(-Math.PI / 5);
+  if (!weaponIsFloating(style.weapon.form)) {
+    ctx.rotate(style.weapon.form === "whip" ? Math.PI / 12 : -Math.PI / 5);
+  }
   ctx.scale(u * 1.05, u * 1.05);
-  def.draw(
+  drawParametricWeapon(
     ctx,
-    { fill: style.fill, accent: style.accent, glow: style.glow, outline: style.outline },
+    weaponRenderStyle(style),
     1.7, // frozen time: mid-pulse so glows read in a still image
   );
   ctx.restore();

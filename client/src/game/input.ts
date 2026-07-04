@@ -1,12 +1,18 @@
 /**
- * Keyboard mapping: A/D (or arrows) move, W/Space/Up jump, J attack, K ability.
- * The bot feeds the same InputState shape from its FSM, so player and bot go
- * through identical control code.
+ * Keyboard input. The bot feeds the same InputState shape from its FSM, so
+ * combat/animation never care whether a fighter is driven by a human or AI.
+ *
+ * INPUT_BINDINGS is the single place every key lives:
+ * - solo: 1-player mode — one human owns the whole keyboard.
+ * - p1 / p2: 2-player hotseat — non-overlapping clusters on opposite sides
+ *   of one shared keyboard (P1 left hand, P2 right hand).
  */
 export interface InputState {
   left: boolean;
   right: boolean;
   jump: boolean;
+  /** Held with jump while standing on a platform: drop through it. */
+  down: boolean;
   attack: boolean;
   ability: boolean;
 }
@@ -15,21 +21,57 @@ export const emptyInput = (): InputState => ({
   left: false,
   right: false,
   jump: false,
+  down: false,
   attack: false,
   ability: false,
 });
 
-const KEYMAP: Record<string, keyof InputState> = {
-  KeyA: "left",
-  ArrowLeft: "left",
-  KeyD: "right",
-  ArrowRight: "right",
-  KeyW: "jump",
-  ArrowUp: "jump",
-  Space: "jump",
-  KeyJ: "attack",
-  KeyK: "ability",
+/** KeyboardEvent.code values per action. */
+export interface Bindings {
+  left: string[];
+  right: string[];
+  jump: string[];
+  down: string[];
+  attack: string[];
+  ability: string[];
+}
+
+export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
+  solo: {
+    left: ["KeyA", "ArrowLeft"],
+    right: ["KeyD", "ArrowRight"],
+    jump: ["KeyW", "Space", "ArrowUp"],
+    down: ["KeyS", "ArrowDown"],
+    attack: ["KeyJ"],
+    ability: ["KeyK"],
+  },
+  p1: {
+    left: ["KeyA"],
+    right: ["KeyD"],
+    jump: ["KeyW"],
+    down: ["KeyS"],
+    attack: ["KeyF"],
+    ability: ["KeyG"],
+  },
+  p2: {
+    left: ["ArrowLeft"],
+    right: ["ArrowRight"],
+    jump: ["ArrowUp"],
+    down: ["ArrowDown"],
+    attack: ["Period"],
+    ability: ["Slash"],
+  },
 };
+
+/** Keys the browser would otherwise scroll / quick-find with. */
+const PREVENT_DEFAULT = new Set([
+  "Space",
+  "ArrowLeft",
+  "ArrowRight",
+  "ArrowUp",
+  "ArrowDown",
+  "Slash",
+]);
 
 export interface Keyboard {
   state: InputState;
@@ -37,13 +79,18 @@ export interface Keyboard {
   detach(): void;
 }
 
-export function createKeyboard(): Keyboard {
+export function createKeyboard(bindings: Bindings): Keyboard {
   const state = emptyInput();
 
+  const keymap = new Map<string, keyof InputState>();
+  for (const action of Object.keys(bindings) as (keyof Bindings)[]) {
+    for (const code of bindings[action]) keymap.set(code, action);
+  }
+
   const onKey = (down: boolean) => (e: KeyboardEvent) => {
-    const action = KEYMAP[e.code];
+    const action = keymap.get(e.code);
     if (!action) return;
-    if (e.code === "Space" || e.code.startsWith("Arrow")) e.preventDefault();
+    if (PREVENT_DEFAULT.has(e.code)) e.preventDefault();
     state[action] = down;
   };
   const onDown = onKey(true);

@@ -1,12 +1,17 @@
-import type { CharacterSpec, ElementKind, WeaponArchetypeId } from "../types/character";
-import { detectElement, mapWeaponArchetype } from "../game/weapons/mapWeapon";
+import type {
+  CharacterSpec,
+  ElementKind,
+  WeaponForm,
+  WeaponSize,
+} from "../types/character";
+import { detectElement, mapWeaponForm, snapFormToType } from "../game/weapons/mapWeapon";
 import { hueShift, safeCssColor, shade } from "../render/color";
 
 /**
- * Post-generation normalization: fills the DERIVED visual fields (weapon
- * archetype, VFX, accent/outline colors). Runs after zod validation and the
- * stat budget; the raw values from the model are never trusted (they're
- * stripped in normalizeRaw before validation anyway).
+ * Post-generation normalization: snaps the LLM's visual weapon descriptors
+ * into range (or derives them from the weapon name when missing) and fills
+ * the fully-derived fields (VFX colors, accent/outline). Visual only — the
+ * mechanical type/range/damage were already balanced by statBudget.
  */
 
 const ELEMENT_GLOW: Record<Exclude<ElementKind, "none">, string> = {
@@ -14,10 +19,27 @@ const ELEMENT_GLOW: Record<Exclude<ElementKind, "none">, string> = {
   ice: "#7cd7ff",
   lightning: "#ffe95e",
   poison: "#9dff57",
+  shadow: "#9257e8",
+  holy: "#ffe6a3",
+  arcane: "#ff6bd6",
 };
 
-/** Archetypes whose attacks read as a swing — these get the ribbon trail. */
-const TRAIL_ARCHETYPES: WeaponArchetypeId[] = ["sword", "spear", "staff", "gauntlet"];
+/** Forms whose attacks read as a swing — these get the ribbon trail. */
+const TRAIL_FORMS: WeaponForm[] = [
+  "sword", "greatsword", "dagger", "axe", "hammer", "spear", "halberd",
+  "scythe", "whip", "flail", "staff", "claw",
+];
+
+const clamp = (v: number, min: number, max: number) =>
+  Math.min(max, Math.max(min, Number.isFinite(v) ? v : min));
+
+export interface WeaponVisual {
+  form: WeaponForm;
+  size: WeaponSize;
+  curve: number;
+  spikes: number;
+  doubleEnded: boolean;
+}
 
 export interface ResolvedStyle {
   fill: string;
@@ -25,7 +47,7 @@ export interface ResolvedStyle {
   accent: string;
   glow: string;
   element: ElementKind;
-  archetype: WeaponArchetypeId;
+  weapon: WeaponVisual;
   trail: boolean;
 }
 
@@ -39,25 +61,36 @@ export function resolveStyle(spec: CharacterSpec): ResolvedStyle {
   const accent = spec.appearance.accentColor
     ? safeCssColor(spec.appearance.accentColor, hueShift(fill, 32, 1.1, 1.25))
     : hueShift(fill, 32, 1.1, 1.25);
-  const archetype = spec.weapon.archetype ?? mapWeaponArchetype(spec.weapon.name, spec.weapon.type);
+
+  const w = spec.weapon;
+  const form = snapFormToType(w.form ?? mapWeaponForm(w.name, w.type), w.type);
+  const weapon: WeaponVisual = {
+    form,
+    size: w.size ?? "medium",
+    curve: clamp(w.curve ?? (form === "scythe" ? 0.6 : 0), 0, 1),
+    spikes: Math.round(clamp(w.spikes ?? 0, 0, 4)),
+    doubleEnded: w.doubleEnded ?? false,
+  };
+
   const element =
-    spec.weapon.vfx?.element ??
-    detectElement(`${spec.weapon.name} ${spec.ability.name}`);
+    (w.element && w.element !== "none" ? w.element : undefined) ??
+    w.vfx?.element ??
+    detectElement(`${w.name} ${spec.ability.name}`);
   const glow =
-    spec.weapon.vfx?.glow ??
-    (element !== "none" ? ELEMENT_GLOW[element] : shade(accent, 1.35));
-  const trail = spec.weapon.vfx?.trail ?? TRAIL_ARCHETYPES.includes(archetype);
-  return { fill, outline, accent, glow, element, archetype, trail };
+    w.vfx?.glow ?? (element !== "none" ? ELEMENT_GLOW[element] : shade(accent, 1.35));
+  const trail = w.vfx?.trail ?? TRAIL_FORMS.includes(form);
+
+  return { fill, outline, accent, glow, element, weapon, trail };
 }
 
 /** Write the resolved style back into the spec's optional derived fields. */
 export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
-  // Resolve from a copy with derived fields cleared, so enriching an already
-  // enriched spec recomputes rather than echoes.
+  // Resolve from a copy with fully-derived fields cleared, so enriching an
+  // already enriched spec recomputes rather than echoes.
   const bare: CharacterSpec = {
     ...spec,
     appearance: { ...spec.appearance, accentColor: undefined, outline: undefined },
-    weapon: { ...spec.weapon, archetype: undefined, vfx: undefined },
+    weapon: { ...spec.weapon, vfx: undefined },
   };
   const style = resolveStyle(bare);
   return {
@@ -69,7 +102,12 @@ export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
     },
     weapon: {
       ...spec.weapon,
-      archetype: style.archetype,
+      form: style.weapon.form,
+      size: style.weapon.size,
+      curve: style.weapon.curve,
+      spikes: style.weapon.spikes,
+      doubleEnded: style.weapon.doubleEnded,
+      element: style.element,
       vfx: { glow: style.glow, element: style.element, trail: style.trail },
     },
   };

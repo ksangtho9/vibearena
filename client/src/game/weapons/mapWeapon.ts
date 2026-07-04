@@ -1,79 +1,117 @@
-import type { CharacterSpec, ElementKind, WeaponArchetypeId } from "../../types/character";
+import type { CharacterSpec, ElementKind, WeaponForm } from "../../types/character";
 
 /**
  * Deterministic keyword mapping from the LLM's free-text weapon name (plus
- * the coarse weapon type) onto one of the drawn archetypes. The archetype is
- * always DERIVED here — a raw LLM `archetype` value is never trusted.
+ * the coarse mechanical type) onto a drawable weapon FORM, and element
+ * detection for VFX. Used when the LLM didn't supply a valid `form`/`element`
+ * itself. Visual only — never affects hitboxes or balance.
  */
 
-const KEYWORDS: Record<WeaponArchetypeId, string[]> = {
+const FORM_KEYWORDS: Record<WeaponForm, string[]> = {
   sword: [
-    "sword", "katana", "blade", "saber", "sabre", "dagger", "knife", "cleaver",
-    "machete", "axe", "hatchet", "scythe", "sickle", "rapier", "cutlass", "claymore",
+    "sword", "katana", "blade", "saber", "sabre", "rapier", "cutlass",
+    "machete", "longsword", "falchion", "scimitar", "baguette",
   ],
-  spear: [
-    "spear", "lance", "pike", "trident", "halberd", "javelin", "polearm",
-    "naginata", "glaive", "harpoon", "fork", "skewer",
+  greatsword: ["greatsword", "claymore", "zweihander", "buster", "great sword"],
+  dagger: ["dagger", "knife", "kunai", "shiv", "stiletto", "dirk", "fang", "needle", "dart"],
+  axe: ["axe", "hatchet", "cleaver", "tomahawk", "chopper", "battleaxe"],
+  hammer: [
+    "hammer", "maul", "mallet", "warhammer", "sledge", "gavel", "club",
+    "mace", "bat", "cudgel", "bludgeon", "skillet", "pan", "wrench",
+    "rolling pin", "chair", "brick", "anvil",
   ],
+  spear: ["spear", "lance", "pike", "trident", "javelin", "harpoon", "skewer", "fork"],
+  halberd: ["halberd", "glaive", "polearm", "poleaxe", "naginata", "bardiche"],
+  scythe: ["scythe", "sickle", "reaper", "kama"],
+  whip: ["whip", "lash", "tendril", "vine", "rope", "ribbon", "tail"],
+  flail: ["flail", "morningstar", "chain", "ball and chain", "wrecking"],
   staff: [
     "staff", "stick", "wand", "rod", "cane", "scepter", "sceptre", "broom",
-    "pole", "baton", "mop", "umbrella", "pin",
+    "pole", "baton", "mop", "umbrella", "oar", "paddle",
   ],
-  bow: [
-    "bow", "crossbow", "slingshot", "sling", "gun", "cannon", "rifle", "pistol",
-    "launcher", "blaster", "railgun", "musket", "arrow",
-  ],
-  thrown: [
-    "bottle", "bomb", "grenade", "shuriken", "kunai", "rock", "stone", "sand",
-    "dart", "horseshoe", "baguette", "chakram", "ball", "brick", "flask", "vial",
-    "card", "coin", "egg", "tomato", "snowball", "boomerang",
-  ],
-  shield: ["shield", "buckler", "aegis", "wall", "door", "lid", "manhole"],
-  gauntlet: [
-    "fist", "gauntlet", "glove", "knuckle", "claw", "punch", "paw", "hand",
-    "slap", "mitt", "boxing",
+  bow: ["bow", "crossbow", "slingshot", "sling", "arrow", "longbow"],
+  gun: [
+    "gun", "cannon", "rifle", "pistol", "launcher", "blaster", "railgun",
+    "musket", "revolver", "shotgun", "laser", "turret",
   ],
   orb: [
-    "orb", "sphere", "crystal", "moonstone", "star", "soul", "spirit", "energy",
-    "plasma", "void", "rune", "pearl", "eye", "lantern",
+    "orb", "sphere", "crystal", "moonstone", "soul", "spirit", "energy",
+    "plasma", "rune", "pearl", "eye", "lantern", "tome",
+  ],
+  shield: ["shield", "buckler", "aegis", "wall", "door", "lid", "manhole"],
+  claw: [
+    "claw", "fist", "gauntlet", "glove", "knuckle", "punch", "paw", "talon",
+    "nail", "mitt", "boxing", "slap", "hand",
+  ],
+  chakram: [
+    "chakram", "ring", "disc", "disk", "discus", "frisbee", "boomerang",
+    "shuriken", "saw", "horseshoe", "record", "card", "coin",
+  ],
+  bomb: [
+    "bomb", "bottle", "grenade", "flask", "vial", "rock", "stone", "egg",
+    "tomato", "snowball", "sand", "potion", "mine", "orb of", "ball",
   ],
 };
 
-/** Which archetypes plausibly match each coarse weapon type. */
-const TYPE_COMPAT: Record<CharacterSpec["weapon"]["type"], WeaponArchetypeId[]> = {
-  melee: ["sword", "spear", "staff", "shield", "gauntlet"],
-  ranged: ["bow", "staff", "orb"],
-  thrown: ["thrown", "orb"],
+/** Which forms plausibly suit each mechanical type. */
+const TYPE_COMPAT: Record<CharacterSpec["weapon"]["type"], WeaponForm[]> = {
+  melee: [
+    "sword", "greatsword", "dagger", "axe", "hammer", "spear", "halberd",
+    "scythe", "whip", "flail", "staff", "shield", "claw",
+  ],
+  ranged: ["bow", "gun", "orb", "staff"],
+  thrown: ["chakram", "bomb", "dagger", "axe", "spear", "hammer", "orb"],
 };
 
-const TYPE_FALLBACK: Record<CharacterSpec["weapon"]["type"], WeaponArchetypeId> = {
+/** Where an incompatible form lands, per mechanical type. */
+const TYPE_SNAP: Record<CharacterSpec["weapon"]["type"], Partial<Record<WeaponForm, WeaponForm>>> = {
+  melee: { gun: "hammer", bow: "staff", orb: "staff", chakram: "sword", bomb: "flail" },
+  ranged: { orb: "orb", whip: "staff", sword: "gun" },
+  thrown: {
+    sword: "dagger", greatsword: "axe", scythe: "chakram", whip: "chakram",
+    flail: "bomb", halberd: "spear", shield: "chakram", claw: "dagger",
+    staff: "spear",
+  },
+};
+
+const TYPE_FALLBACK: Record<CharacterSpec["weapon"]["type"], WeaponForm> = {
   melee: "sword",
-  ranged: "bow",
-  thrown: "thrown",
+  ranged: "gun",
+  thrown: "bomb",
 };
 
-export function mapWeaponArchetype(
+/** Force a form to be compatible with the mechanical weapon type. */
+export function snapFormToType(
+  form: WeaponForm,
+  type: CharacterSpec["weapon"]["type"],
+): WeaponForm {
+  if (TYPE_COMPAT[type].includes(form)) return form;
+  return TYPE_SNAP[type][form] ?? TYPE_FALLBACK[type];
+}
+
+/** Derive the visual form from the weapon's name + mechanical type. */
+export function mapWeaponForm(
   name: string,
   type: CharacterSpec["weapon"]["type"],
-): WeaponArchetypeId {
+): WeaponForm {
   const text = name.toLowerCase();
-  let best: WeaponArchetypeId | null = null;
+  let best: WeaponForm | null = null;
   let bestScore = 0;
 
-  for (const archetype of Object.keys(KEYWORDS) as WeaponArchetypeId[]) {
-    // Score = summed length of matched keywords ("staff" beats "moon"),
-    // plus a bonus when the archetype suits the coarse weapon type.
+  for (const form of Object.keys(FORM_KEYWORDS) as WeaponForm[]) {
+    // Score = summed length of matched keywords ("scythe" beats "eye"),
+    // plus a bonus when the form suits the mechanical type.
     let score = 0;
-    for (const kw of KEYWORDS[archetype]) {
+    for (const kw of FORM_KEYWORDS[form]) {
       if (text.includes(kw)) score += kw.length;
     }
-    if (score > 0 && TYPE_COMPAT[type].includes(archetype)) score += 3;
+    if (score > 0 && TYPE_COMPAT[type].includes(form)) score += 3;
     if (score > bestScore) {
       bestScore = score;
-      best = archetype;
+      best = form;
     }
   }
-  return best ?? TYPE_FALLBACK[type];
+  return best ? snapFormToType(best, type) : TYPE_FALLBACK[type];
 }
 
 const ELEMENT_KEYWORDS: Record<Exclude<ElementKind, "none">, string[]> = {
@@ -81,6 +119,9 @@ const ELEMENT_KEYWORDS: Record<Exclude<ElementKind, "none">, string[]> = {
   ice: ["ice", "frost", "snow", "freez", "glacier", "chill", "winter", "arctic", "cryo"],
   lightning: ["lightning", "thunder", "volt", "storm", "shock", "electric", "spark", "zap", "plasma", "rail"],
   poison: ["poison", "venom", "toxic", "acid", "plague", "rot", "sludge", "bio"],
+  shadow: ["shadow", "dark", "night", "void", "umbral", "nether", "doom", "grave", "wraith", "soul", "ghost", "phantom"],
+  holy: ["holy", "divine", "sacred", "celestial", "angel", "radiant", "blessed", "sun", "dawn"],
+  arcane: ["arcane", "magic", "mystic", "rune", "astral", "eldritch", "mana", "cosmic", "moon", "star", "hex", "witch"],
 };
 
 export function detectElement(text: string): ElementKind {

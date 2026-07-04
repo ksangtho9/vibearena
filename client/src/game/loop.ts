@@ -1,7 +1,20 @@
 import Matter from "matter-js";
 import type { CharacterSpec } from "../types/character";
-import { ARENA_HEIGHT, ARENA_WIDTH, createArena, destroyArena } from "./arena";
-import { createFighter, fighterX, renderFighter, type Side } from "./stickman";
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  createArena,
+  destroyArena,
+  installOneWayPlatforms,
+} from "./arena";
+import {
+  createFighter,
+  fighterX,
+  fighterY,
+  renderFighter,
+  type Fighter,
+  type Side,
+} from "./stickman";
 import {
   checkWinner,
   pushEffect,
@@ -10,8 +23,8 @@ import {
   updateProjectiles,
   type CombatCtx,
 } from "./combat";
-import { createKeyboard, emptyInput } from "./input";
-import { createBotBrain } from "./bot";
+import { createKeyboard, emptyInput, INPUT_BINDINGS } from "./input";
+import { createBotBrain, type BotBrain } from "./bot";
 import { createTheme, type ThemeView } from "./arena/themes";
 import { withAlpha } from "../render/color";
 
@@ -27,8 +40,10 @@ export interface HudState {
   playerMaxHp: number;
   botHp: number;
   botMaxHp: number;
-  /** 0 = ready, 1 = just used. */
+  /** Player 1's ability cooldown: 0 = ready, 1 = just used. */
   abilityCdFrac: number;
+  /** Right-side fighter's ability cooldown (shown for P2 in hotseat). */
+  botAbilityCdFrac: number;
 }
 
 export interface GameCallbacks {
@@ -49,6 +64,7 @@ export function startGame(
   canvas: HTMLCanvasElement,
   playerSpec: CharacterSpec,
   botSpec: CharacterSpec,
+  mode: "1p" | "2p",
   cb: GameCallbacks,
 ): () => void {
   const arena = createArena();
@@ -68,14 +84,25 @@ export function startGame(
   player.introTimer = INTRO_SECONDS;
   bot.introTimer = INTRO_SECONDS;
 
+  // One-way platforms: ragdolls/projectiles land from above via the pair
+  // veto; fighter capsules land kinematically in combat.ts.
+  installOneWayPlatforms(arena);
+
   const combat: CombatCtx = { arena, projectiles: [], effects: [], hitstop: 0, time: 0 };
-  const keyboard = createKeyboard();
-  keyboard.attach();
-  const brain = createBotBrain();
+
+  // Input routing: in hotseat, the right-side fighter is PLAYER 2's key
+  // cluster instead of the bot FSM. Same InputState shape either way.
+  const kb1 = createKeyboard(mode === "2p" ? INPUT_BINDINGS.p1 : INPUT_BINDINGS.solo);
+  kb1.attach();
+  const kb2 = mode === "2p" ? createKeyboard(INPUT_BINDINGS.p2) : null;
+  kb2?.attach();
+  const brain: BotBrain | null = mode === "1p" ? createBotBrain() : null;
+
   const theme = createTheme();
 
-  // Follow camera: eases toward the fighters' midpoint, zooms with distance.
-  const cam = { x: ARENA_WIDTH / 2, zoom: 1.05 };
+  // Follow camera: eases toward the fighters' midpoint (x AND y, so platform
+  // fights stay framed), zooms with their separation.
+  const cam = { x: ARENA_WIDTH / 2, y: arena.groundY - 40, zoom: 1.05 };
 
   let time = 0;
   let fightAnnounced = false;
@@ -109,8 +136,14 @@ export function startGame(
       });
     }
 
-    const playerInput = winner ? emptyInput() : keyboard.state;
-    const botInput = winner ? emptyInput() : brain.think(bot, player, dt);
+    const playerInput = winner ? emptyInput() : kb1.state;
+    const botInput = winner
+      ? emptyInput()
+      : kb2
+        ? kb2.state
+        : brain
+          ? brain.think(bot, player, dt)
+          : emptyInput();
 
     updateFighter(player, bot, playerInput, combat, dt);
     updateFighter(bot, player, botInput, combat, dt);
@@ -143,10 +176,21 @@ export function startGame(
   function updateCamera(): void {
     const px = fighterX(player);
     const bx = fighterX(bot);
+    const py = fighterY(player);
+    const by = fighterY(bot);
+
     const midX = Math.max(280, Math.min(680, (px + bx) / 2));
-    const dist = Math.abs(px - bx);
-    const targetZoom = Math.max(0.95, Math.min(1.28, ARENA_WIDTH / (dist + 560)));
+    // Rise with the fight; when everyone is grounded this equals the old
+    // fixed anchor (roots sit 44px above the ground plane).
+    const midY = Math.max(arena.groundY - 190, Math.min(arena.groundY - 40, (py + by) / 2 + 4));
+
+    // Zoom out for horizontal AND vertical separation so a fighter up on a
+    // platform never leaves the frame.
+    const span = Math.max(Math.abs(px - bx), Math.abs(py - by) * 1.7);
+    const targetZoom = Math.max(0.95, Math.min(1.28, ARENA_WIDTH / (span + 560)));
+
     cam.x += (midX - cam.x) * 0.06;
+    cam.y += (midY - cam.y) * 0.06;
     cam.zoom += (targetZoom - cam.zoom) * 0.05;
   }
 
@@ -157,9 +201,32 @@ export function startGame(
    */
   function applyLayerTransform(factor: number): void {
     const layerCamX = ARENA_WIDTH / 2 + (cam.x - ARENA_WIDTH / 2) * factor;
+    const baseY = arena.groundY - 40;
+    const layerCamY = baseY + (cam.y - baseY) * factor;
     ctx2d.translate(ARENA_WIDTH / 2, ARENA_HEIGHT * SCREEN_ANCHOR_Y);
     ctx2d.scale(cam.zoom, cam.zoom);
-    ctx2d.translate(-layerCamX, -(arena.groundY - 40));
+    ctx2d.translate(-layerCamX, -layerCamY);
+  }
+
+  /**
+   * The surface directly under a fighter — the highest platform top below
+   * its feet, else the ground. Contact shadows land on this.
+   */
+  function supportYFor(f: Fighter): number {
+    const x = fighterX(f);
+    const bottom = f.ragdoll ? fighterY(f) + 20 : f.root.position.y + 44 * f.scale;
+    let support = arena.groundY;
+    for (const r of arena.platformRects) {
+      if (
+        x >= r.cx - r.w / 2 - 6 &&
+        x <= r.cx + r.w / 2 + 6 &&
+        r.top >= bottom - 12 &&
+        r.top < support
+      ) {
+        support = r.top;
+      }
+    }
+    return support;
   }
 
   function drawProjectiles(): void {
@@ -268,8 +335,9 @@ export function startGame(
     // 3. World pass: everything that lives on the fight plane.
     ctx2d.save();
     applyLayerTransform(1);
-    renderFighter(ctx2d, player, time, arena.groundY);
-    renderFighter(ctx2d, bot, time, arena.groundY);
+    for (const rect of arena.platformRects) theme.drawPlatform(ctx2d, rect);
+    renderFighter(ctx2d, player, time, supportYFor(player));
+    renderFighter(ctx2d, bot, time, supportYFor(bot));
     drawProjectiles();
     drawEffects();
     ctx2d.restore();
@@ -319,6 +387,10 @@ export function startGame(
           player.spec.ability.cooldown > 0
             ? player.abilityCooldown / player.spec.ability.cooldown
             : 0,
+        botAbilityCdFrac:
+          bot.spec.ability.cooldown > 0
+            ? bot.abilityCooldown / bot.spec.ability.cooldown
+            : 0,
       });
     }
   }
@@ -326,7 +398,8 @@ export function startGame(
 
   return () => {
     cancelAnimationFrame(rafId);
-    keyboard.detach();
+    kb1.detach();
+    kb2?.detach();
     destroyArena(arena);
   };
 }

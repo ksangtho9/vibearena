@@ -112,6 +112,47 @@ body {
   opacity: 0.8;
 }
 
+/* --- Mode select ----------------------------------------------------------- */
+
+.mode-screen {
+  gap: 16px;
+}
+
+.mode-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 22px;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.btn-mode {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  min-width: 240px;
+  padding: 18px 34px;
+}
+
+.btn-tape.btn-mode-alt {
+  background: var(--gold);
+  color: #2a2015;
+  transform: rotate(1.1deg);
+}
+
+.btn-tape.btn-mode-alt:hover:not(:disabled) {
+  transform: rotate(1.1deg) translateY(-2px);
+}
+
+.btn-mode-sub {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: none;
+  opacity: 0.85;
+}
+
 /* --- Prompt screen ------------------------------------------------------- */
 
 .prompt-screen {
@@ -453,6 +494,27 @@ body {
 
 .ability-ready kbd {
   border-color: var(--gold);
+}
+
+/* Hotseat: both players' key clusters, P1 left / P2 right. */
+.controls-hint-2p {
+  justify-content: space-between;
+  width: 100%;
+  gap: 12px;
+}
+
+.controls-cluster {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+.cluster-label {
+  font-family: var(--display);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: var(--chalk);
 }
 
 /* --- Motion --------------------------------------------------------------- */

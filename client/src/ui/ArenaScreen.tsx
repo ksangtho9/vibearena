@@ -34,6 +34,7 @@ function HpBar({
  * The ring: canvas + corner-tape HP bars + controls hint.
  */
 export function ArenaScreen() {
+  const mode = useVibeStore((s) => s.mode);
   const spec = useVibeStore((s) => s.spec);
   const botSpec = useVibeStore((s) => s.botSpec);
   const hud = useVibeStore((s) => s.hud);
@@ -44,11 +45,11 @@ export function ArenaScreen() {
     if (!canvas || !spec || !botSpec) return;
     // React 19 StrictMode double-invokes effects in dev; startGame returns a
     // full cleanup so the second mount gets a fresh world.
-    return startGame(canvas, spec, botSpec, {
+    return startGame(canvas, spec, botSpec, mode, {
       onHud: (h) => useVibeStore.getState().setHud(h),
       onEnd: (winner) => useVibeStore.getState().endFight(winner),
     });
-  }, [spec, botSpec]);
+  }, [spec, botSpec, mode]);
 
   if (!spec || !botSpec) return null;
 
@@ -79,15 +80,40 @@ export function ArenaScreen() {
         />
       </div>
 
-      <div className="controls-hint">
-        <span><kbd>A</kbd><kbd>D</kbd> move</span>
-        <span><kbd>W</kbd>/<kbd>Space</kbd> jump</span>
-        <span><kbd>J</kbd> attack</span>
-        <span className={hud && hud.abilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
-          <kbd>K</kbd> {spec.ability.name}
-          {hud && hud.abilityCdFrac > 0 ? ` (${Math.ceil(hud.abilityCdFrac * spec.ability.cooldown)}s)` : " — ready"}
-        </span>
-      </div>
+      {mode === "1p" ? (
+        <div className="controls-hint">
+          <span><kbd>A</kbd><kbd>D</kbd> move</span>
+          <span><kbd>W</kbd>/<kbd>Space</kbd> jump</span>
+          <span><kbd>J</kbd> attack</span>
+          <span className={hud && hud.abilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
+            <kbd>K</kbd> {spec.ability.name}
+            {hud && hud.abilityCdFrac > 0 ? ` (${Math.ceil(hud.abilityCdFrac * spec.ability.cooldown)}s)` : " — ready"}
+          </span>
+        </div>
+      ) : (
+        <div className="controls-hint controls-hint-2p">
+          <div className="controls-cluster">
+            <span className="cluster-label">P1</span>
+            <span><kbd>A</kbd><kbd>D</kbd> move</span>
+            <span><kbd>W</kbd> jump</span>
+            <span><kbd>F</kbd> attack</span>
+            <span className={hud && hud.abilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
+              <kbd>G</kbd> {spec.ability.name}
+              {hud && hud.abilityCdFrac > 0 ? ` (${Math.ceil(hud.abilityCdFrac * spec.ability.cooldown)}s)` : ""}
+            </span>
+          </div>
+          <div className="controls-cluster">
+            <span className="cluster-label">P2</span>
+            <span><kbd>←</kbd><kbd>→</kbd> move</span>
+            <span><kbd>↑</kbd> jump</span>
+            <span><kbd>.</kbd> attack</span>
+            <span className={hud && hud.botAbilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
+              <kbd>/</kbd> {botSpec.ability.name}
+              {hud && hud.botAbilityCdFrac > 0 ? ` (${Math.ceil(hud.botAbilityCdFrac * botSpec.ability.cooldown)}s)` : ""}
+            </span>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

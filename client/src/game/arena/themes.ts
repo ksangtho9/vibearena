@@ -1,4 +1,5 @@
 import { withAlpha } from "../../render/color";
+import type { PlatformRect } from "../arena";
 
 /**
  * Themed parallax backdrops, drawn procedurally (flat-color canvas polygons,
@@ -36,6 +37,11 @@ export interface ArenaTheme {
   layers: ThemeLayer[];
   /** World-space layers in front of the fighters (parallax > 1). */
   foreground: ThemeLayer[];
+  /**
+   * A one-way platform on the FIGHT PLANE (gameplay object, not parallaxed) —
+   * themed to match the flat painterly look.
+   */
+  drawPlatform(ctx: CanvasRenderingContext2D, rect: PlatformRect): void;
 }
 
 export const THEME_NAMES = ["meadow", "canyon"] as const;
@@ -281,6 +287,36 @@ function createMeadow(seed: number): ArenaTheme {
         },
       },
     ],
+    drawPlatform(ctx, rect) {
+      const x = rect.cx - rect.w / 2;
+      // Wooden ledge: plank slab with seams and a grassy lip.
+      ctx.beginPath();
+      ctx.roundRect(x, rect.top, rect.w, rect.h, 4);
+      ctx.fillStyle = "#8a6844";
+      ctx.fill();
+      ctx.strokeStyle = "rgba(74, 52, 30, 0.7)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      // Plank seams + end caps.
+      ctx.strokeStyle = "rgba(74, 52, 30, 0.5)";
+      ctx.lineWidth = 1.2;
+      for (let px = x + 26; px < x + rect.w - 12; px += 30) {
+        ctx.beginPath();
+        ctx.moveTo(px, rect.top + 3);
+        ctx.lineTo(px, rect.top + rect.h - 3);
+        ctx.stroke();
+      }
+      // Grass lip on the walkable top.
+      ctx.fillStyle = "#7ca157";
+      ctx.beginPath();
+      ctx.roundRect(x - 2, rect.top - 3, rect.w + 4, 6, 3);
+      ctx.fill();
+      const rr = mulberry32(Math.floor(rect.cx * 7919));
+      for (let i = 0; i < 5; i++) {
+        const gx = x + 8 + rr() * (rect.w - 16);
+        polygon(ctx, [[gx - 2, rect.top - 2], [gx + 2, rect.top - 2], [gx + (rr() - 0.5) * 5, rect.top - 8 - rr() * 4]], "#5b8342");
+      }
+    },
   };
 }
 
@@ -460,6 +496,33 @@ function createCanyon(seed: number): ArenaTheme {
         },
       },
     ],
+    drawPlatform(ctx, rect) {
+      const x = rect.cx - rect.w / 2;
+      // Rock shelf: uneven slab with a strata line and a sunlit top edge.
+      polygon(
+        ctx,
+        [
+          [x + 3, rect.top],
+          [x + rect.w - 5, rect.top],
+          [x + rect.w, rect.top + rect.h * 0.55],
+          [x + rect.w - 10, rect.top + rect.h],
+          [x + 8, rect.top + rect.h],
+          [x - 3, rect.top + rect.h * 0.5],
+        ],
+        "#b06a4a",
+      );
+      ctx.strokeStyle = "rgba(122, 62, 42, 0.55)";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x + 6, rect.top + rect.h * 0.62);
+      ctx.lineTo(x + rect.w - 8, rect.top + rect.h * 0.55);
+      ctx.stroke();
+      // Sunlit walkable top.
+      ctx.fillStyle = "rgba(240, 205, 160, 0.85)";
+      ctx.beginPath();
+      ctx.roundRect(x + 3, rect.top - 2, rect.w - 8, 4.5, 2);
+      ctx.fill();
+    },
   };
 }
 

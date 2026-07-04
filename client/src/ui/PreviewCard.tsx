@@ -11,7 +11,8 @@ const STAT_LABELS = [
 ] as const;
 
 const NOTE_TEXT = {
-  mocked: "No API key on the server yet — the house generator drew this one. Set .env to summon the real LLM.",
+  mocked:
+    "The house generator drew this one — no API key on the server, or the LLM was busy (rate limit). Re-roll to try the real LLM again.",
   fallback: "The LLM's answer didn't validate, so you got the house default. Re-roll to try again.",
 } as const;
 
@@ -19,12 +20,15 @@ const NOTE_TEXT = {
  * The fight card: chalk portrait on the left, tale of the tape on the right.
  */
 export function PreviewCard() {
-  const spec = useVibeStore((s) => s.spec);
+  const mode = useVibeStore((s) => s.mode);
+  const promptFor = useVibeStore((s) => s.promptFor);
+  const spec = useVibeStore((s) => (s.promptFor === 2 ? s.spec2 : s.spec));
   const note = useVibeStore((s) => s.note);
-  const enterFight = useVibeStore((s) => s.enterFight);
+  const confirmFighter = useVibeStore((s) => s.confirmFighter);
   const reroll = useVibeStore((s) => s.reroll);
   const newPrompt = useVibeStore((s) => s.newPrompt);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const hotseat = mode === "2p";
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -42,7 +46,9 @@ export function PreviewCard() {
 
   return (
     <main className="screen preview-screen">
-      <p className="eyebrow">TALE OF THE TAPE</p>
+      <p className="eyebrow">
+        {hotseat ? `PLAYER ${promptFor} — TALE OF THE TAPE` : "TALE OF THE TAPE"}
+      </p>
       <div className="fight-card">
         <div className="portrait">
           <canvas ref={canvasRef} style={{ width: 240, height: 260 }} aria-label={`Chalk drawing of ${spec.name}`} />
@@ -94,8 +100,8 @@ export function PreviewCard() {
       {note && <p className="gen-note">{NOTE_TEXT[note]}</p>}
 
       <div className="button-row">
-        <button type="button" className="btn-tape" onClick={enterFight}>
-          Enter the ring
+        <button type="button" className="btn-tape" onClick={confirmFighter}>
+          {hotseat && promptFor === 1 ? "Lock in — Player 2 is up" : "Enter the ring"}
         </button>
         <button type="button" className="btn-chalk" onClick={() => void reroll()}>
           Re-roll

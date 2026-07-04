@@ -59,7 +59,10 @@ export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): vo
         Matter.Vector.sub(opponent.root.position, pos),
       );
       if (d <= radius) {
-        dealDamage(opponent, rawDamage(user, ability.power * 0.9), user.facing, ctx, 1.6);
+        dealDamage(opponent, rawDamage(user, ability.power * 0.9), user.facing, ctx, {
+          knockbackMul: 1.6,
+          source: "ability",
+        });
       }
       break;
     }
@@ -82,6 +85,7 @@ export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): vo
         speed: 12,
         radius: 9,
         arc: false,
+        source: "ability",
       });
       break;
     }

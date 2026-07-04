@@ -4,7 +4,6 @@ import { collapse, type Fighter, type Side } from "./stickman";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
 import { ATTACK_TIMING } from "./animation";
-import { ARCHETYPES } from "./weapons/archetypes";
 
 /**
  * Damage, knockback, HP and projectiles. Weapons have NO physics bodies:
@@ -14,10 +13,14 @@ import { ARCHETYPES } from "./weapons/archetypes";
  * hitstun/launched reactions, VFX and a brief hit-stop.
  */
 
+/** What dealt the damage — decides the victim's stun tier and hit-stop. */
+export type DamageSource = "melee" | "ranged" | "thrown" | "ability";
+
 export interface Projectile {
   body: Matter.Body;
   ownerSide: Side;
   damage: number; // pre-mitigation damage (attacker strength already applied)
+  source: DamageSource;
   ttl: number;
   /** Thrown weapons arc under gravity and bounce; ranged shots fly flat. */
   arc: boolean;
@@ -52,11 +55,34 @@ const DAMAGE_SCALE = 2.2;
 const MELEE_ATTACK_COOLDOWN = 0.55;
 const MISSILE_ATTACK_COOLDOWN = 0.8;
 
-const HITSTUN_TIME = 0.26;
+/**
+ * Victim control-lockout per damage source. Knockback is untouched — these
+ * only govern how fast the victim regains control. Melee interrupts briefly;
+ * ranged/thrown are a flinch, never a lockdown; abilities stagger like melee
+ * (their launches are handled separately below).
+ */
+const HITSTUN_BY_SOURCE: Record<DamageSource, number> = {
+  melee: 0.13,
+  ranged: 0.025,
+  thrown: 0.025,
+  ability: 0.13,
+};
+
 const LAUNCH_TIME = 0.5;
-/** Mitigated damage at or above this sends the target flying. */
-const LAUNCH_DAMAGE = 15;
-const HITSTOP_TIME = 0.07;
+/**
+ * Weapon-hit launch threshold: high enough that normal melee trades stagger
+ * instead of launching. Ranged/thrown weapon hits NEVER launch; abilities
+ * launch via their knockback multiplier regardless of this number.
+ */
+const LAUNCH_DAMAGE = 26;
+
+/** Hit-stop per source: melee/ability hits punch; projectiles read "light". */
+const HITSTOP_BY_SOURCE: Record<DamageSource, number> = {
+  melee: 0.07,
+  ranged: 0.035,
+  thrown: 0.035,
+  ability: 0.07,
+};
 
 const speedOf = (f: Fighter) => (3 + f.spec.stats.speed * 0.035) * f.buffs.speedMul;
 const jumpVelOf = (f: Fighter) => 11 + f.spec.stats.speed * 0.015;
@@ -73,18 +99,27 @@ export function pushEffect(ctx: CombatCtx, effect: Omit<Effect, "maxTtl">): void
   ctx.effects.push({ ...effect, maxTtl: effect.ttl });
 }
 
+export interface DamageOpts {
+  knockbackMul?: number;
+  source?: DamageSource;
+}
+
 /**
- * Apply mitigated damage + knockback + hit reaction. Normal hits cause
- * hitstun; heavy hits launch; lethal hits hand the body to the ragdoll.
+ * Apply mitigated damage + knockback + hit reaction. The knockback impulse
+ * is the same for every source; only the CONTROL LOCKOUT is tiered — melee
+ * staggers briefly, projectiles barely flinch, and launching is reserved for
+ * abilities and genuinely heavy melee hits.
  */
 export function dealDamage(
   target: Fighter,
   amount: number,
   dir: number,
   ctx: CombatCtx,
-  knockbackMul = 1,
+  opts: DamageOpts = {},
 ): void {
   if (!target.alive) return;
+  const knockbackMul = opts.knockbackMul ?? 1;
+  const source = opts.source ?? "ability";
 
   let dmg = amount * (130 / (130 + target.spec.stats.defense)) * DAMAGE_SCALE;
   if (target.shieldTimer > 0) dmg *= 0.3;
@@ -102,17 +137,28 @@ export function dealDamage(
     y: Math.min(target.root.velocity.y, -kb * 0.4),
   });
 
-  // Hit reaction: interrupted, staggered, or sent flying.
-  if (dmg >= LAUNCH_DAMAGE || knockbackMul > 1.3) {
+  // Hit reaction: ranged/thrown never launch; abilities launch on their
+  // knockback multiplier; melee only on a genuinely heavy hit.
+  const launches =
+    source === "ability"
+      ? knockbackMul > 1.3 || dmg >= LAUNCH_DAMAGE
+      : source === "melee" && dmg >= LAUNCH_DAMAGE;
+
+  if (launches) {
     target.launchedTimer = LAUNCH_TIME;
     target.hitstunTimer = 0;
+    target.attackAnim = 0;
+    target.attackWindow = 0;
   } else if (target.shieldTimer <= 0) {
-    target.hitstunTimer = HITSTUN_TIME;
+    target.hitstunTimer = Math.max(target.hitstunTimer, HITSTUN_BY_SOURCE[source]);
+    // Only a real stagger (melee-tier) interrupts an attack in progress.
+    if (HITSTUN_BY_SOURCE[source] >= HITSTUN_BY_SOURCE.melee) {
+      target.attackAnim = 0;
+      target.attackWindow = 0;
+    }
   }
-  target.attackAnim = 0;
-  target.attackWindow = 0;
 
-  ctx.hitstop = Math.max(ctx.hitstop, HITSTOP_TIME);
+  ctx.hitstop = Math.max(ctx.hitstop, HITSTOP_BY_SOURCE[source]);
 
   if (target.hp <= 0) collapse(target, ctx.arena.world);
 }
@@ -120,7 +166,7 @@ export function dealDamage(
 export function spawnProjectile(
   owner: Fighter,
   ctx: CombatCtx,
-  opts: { damage: number; speed: number; radius: number; arc: boolean },
+  opts: { damage: number; speed: number; radius: number; arc: boolean; source: DamageSource },
 ): void {
   // Launch from the weapon hand joint.
   const hand = owner.skeleton.handR;
@@ -145,6 +191,7 @@ export function spawnProjectile(
     body,
     ownerSide: owner.side,
     damage: opts.damage,
+    source: opts.source,
     ttl: opts.arc ? 2.6 : 1.8,
     arc: opts.arc,
     color: owner.color,
@@ -163,13 +210,13 @@ function startAttack(f: Fighter): void {
 
 /**
  * The weapon's world-space segment: from the hand joint out along the
- * animated weapon angle, as far as the archetype's drawn length or the
- * balanced gameplay range, whichever is longer.
+ * animated weapon angle. Reach comes from the BALANCED weapon.range (with a
+ * small floor), never from the visual form/size — cosmetics don't change
+ * hitboxes.
  */
 function weaponSegment(f: Fighter): { from: Matter.Vector; to: Matter.Vector } {
   const hand = f.skeleton.handR;
-  const tip = ARCHETYPES[f.style.archetype].tip * f.scale * 0.95;
-  const reach = Math.max(tip, f.spec.weapon.range * 0.6);
+  const reach = Math.max(28 * f.scale, f.spec.weapon.range * 0.6);
   return {
     from: { x: hand.x, y: hand.y },
     to: {
@@ -201,6 +248,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
         speed: weapon.type === "ranged" ? 13 : 10,
         radius: weapon.type === "ranged" ? 5 : 7,
         arc: weapon.type === "thrown",
+        source: weapon.type === "thrown" ? "thrown" : "ranged",
       });
     }
     return;
@@ -212,7 +260,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
     const hits = Matter.Query.ray([opponent.root], seg.from, seg.to, 10 * f.scale);
     if (hits.length > 0) {
       f.hasHitThisSwing = true;
-      dealDamage(opponent, rawDamage(f, f.spec.weapon.damage), f.facing, ctx);
+      dealDamage(opponent, rawDamage(f, f.spec.weapon.damage), f.facing, ctx, { source: "melee" });
       pushEffect(ctx, {
         kind: "ring",
         x: seg.to.x,
@@ -225,6 +273,36 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   }
 }
 
+/**
+ * Kinematic one-way platform landing for fighters: the root capsule never
+ * physically collides with platforms (edge normals would eject it sideways);
+ * instead, a falling capsule whose bottom crossed a platform's top surface
+ * this step snaps onto it. Jumping up (vy < 0) and drop-through skip it.
+ */
+function platformLanding(f: Fighter, ctx: CombatCtx): void {
+  const half = 44 * f.scale;
+  const x = f.root.position.x;
+  const bottom = f.root.position.y + half;
+  const prevBottom = f.prevBottom;
+  f.prevBottom = bottom;
+
+  if (f.root.velocity.y < -0.5 || f.dropThrough > 0) return;
+  for (const p of ctx.arena.platforms) {
+    const top = p.bounds.min.y;
+    if (
+      prevBottom <= top + 1 &&
+      bottom >= top - 1 &&
+      x > p.bounds.min.x - 4 &&
+      x < p.bounds.max.x + 4
+    ) {
+      Matter.Body.setPosition(f.root, { x, y: top - half });
+      Matter.Body.setVelocity(f.root, { x: f.root.velocity.x, y: 0 });
+      f.prevBottom = top;
+      break;
+    }
+  }
+}
+
 function updateGrounded(f: Fighter, ctx: CombatCtx): void {
   const { x, y } = f.root.position;
   const half = 44 * f.scale;
@@ -232,7 +310,27 @@ function updateGrounded(f: Fighter, ctx: CombatCtx): void {
     min: { x: x - 14 * f.scale, y: y + half - 4 },
     max: { x: x + 14 * f.scale, y: y + half + 14 },
   };
-  f.grounded = Matter.Query.region([ctx.arena.ground], bounds).length > 0;
+  const onGround = Matter.Query.region([ctx.arena.ground], bounds).length > 0;
+
+  // One-way platforms only count as footing when the feet are AT the top
+  // surface and the fighter isn't rising through or dropping through it.
+  let onPlatform = false;
+  if (!onGround && f.root.velocity.y >= -0.5 && f.dropThrough <= 0) {
+    const bottom = y + half;
+    for (const p of ctx.arena.platforms) {
+      if (
+        bottom >= p.bounds.min.y - 6 &&
+        bottom <= p.bounds.min.y + 14 &&
+        x > p.bounds.min.x - 8 &&
+        x < p.bounds.max.x + 8
+      ) {
+        onPlatform = true;
+        break;
+      }
+    }
+  }
+  f.grounded = onGround || onPlatform;
+  f.onPlatform = onPlatform;
 }
 
 function tickTimers(f: Fighter, dt: number): void {
@@ -245,6 +343,7 @@ function tickTimers(f: Fighter, dt: number): void {
   f.hitstunTimer = Math.max(0, f.hitstunTimer - dt);
   f.launchedTimer = Math.max(0, f.launchedTimer - dt);
   f.castTimer = Math.max(0, f.castTimer - dt);
+  f.dropThrough = Math.max(0, f.dropThrough - dt);
   if (f.buffTimer > 0) {
     f.buffTimer = Math.max(0, f.buffTimer - dt);
     if (f.buffTimer === 0) f.buffs = { speedMul: 1, strengthMul: 1 };
@@ -265,6 +364,7 @@ export function updateFighter(
   tickTimers(f, dt);
   if (!f.alive) return; // the KO ragdoll belongs to the physics engine now
 
+  platformLanding(f, ctx);
   updateGrounded(f, ctx);
 
   // Fighters always square up to their opponent.
@@ -282,7 +382,12 @@ export function updateFighter(
     }
 
     if (input.jump && f.grounded && f.jumpCooldown <= 0) {
-      Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
+      if (input.down && f.onPlatform) {
+        // Drop through the one-way platform instead of jumping.
+        f.dropThrough = 0.25;
+      } else {
+        Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
+      }
       f.jumpCooldown = 0.3;
     }
 
@@ -315,7 +420,8 @@ export function updateFighter(
     castTimer: f.castTimer,
     hitstunTimer: f.hitstunTimer,
     launchedTimer: f.launchedTimer,
-    groundY: ctx.arena.groundY,
+    // Feet plant on whatever the fighter is standing on (platform or ground).
+    groundY: f.grounded ? f.root.position.y + 44 * f.scale : ctx.arena.groundY,
     time: ctx.time,
   });
   f.skeleton = frame.skeleton;
@@ -352,7 +458,7 @@ export function updateProjectiles(
       p.body.position.x > arena.width + 60;
 
     if (hit) {
-      dealDamage(target, p.damage, Math.sign(p.body.velocity.x) || 1, ctx);
+      dealDamage(target, p.damage, Math.sign(p.body.velocity.x) || 1, ctx, { source: p.source });
       pushEffect(ctx, {
         kind: "ring",
         x: p.body.position.x,
