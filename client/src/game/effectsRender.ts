@@ -628,3 +628,98 @@ export function drawProjectile(
 
   ctx.restore();
 }
+
+/**
+ * SINGLE SOURCE OF TRUTH for drawing one combat Effect — used by the game
+ * loop, the fighter preview, and any future render surface. New effect kinds
+ * belong here, nowhere else.
+ */
+export function drawEffect(g: CanvasRenderingContext2D, e: Effect, time: number): void {
+  if (e.kind === "motif") {
+    drawMotifEffect(g, e, time);
+    return;
+  }
+  const life = e.ttl / e.maxTtl; // 1 → 0
+  g.save();
+  g.globalAlpha = Math.max(0, life) * 0.9;
+  g.strokeStyle = e.color;
+  g.fillStyle = e.color;
+  if (e.kind === "ring") {
+    const age = e.maxTtl - e.ttl;
+    // expand (px/s) lets behaviors design their own ring motion.
+    const r =
+      e.expand !== undefined
+        ? Math.max(1, (e.radius ?? 20) + e.expand * age)
+        : (e.radius ?? 20) * (1.6 - life * 0.6);
+    g.lineWidth = e.width ?? 3;
+    g.shadowColor = e.color;
+    g.shadowBlur = 10;
+    g.beginPath();
+    g.arc(e.x, e.y, r, 0, Math.PI * 2);
+    g.stroke();
+  } else if (e.kind === "particle") {
+    // Behavior-authored free-flying particle.
+    const size = (e.size ?? 4) * (0.4 + life * 0.6);
+    g.shadowColor = e.color;
+    g.shadowBlur = 7;
+    if (e.particleShape === "square") {
+      g.fillRect(e.x - size / 2, e.y - size / 2, size, size);
+    } else if (e.particleShape === "spark") {
+      const v = Math.hypot(e.vx ?? 0, e.vy ?? 1) || 1;
+      g.lineWidth = Math.max(1, size * 0.4);
+      g.beginPath();
+      g.moveTo(e.x, e.y);
+      g.lineTo(e.x - ((e.vx ?? 0) / v) * size * 2, e.y - ((e.vy ?? 0) / v) * size * 2);
+      g.stroke();
+    } else if (e.particleShape === "star") {
+      g.beginPath();
+      for (let k = 0; k < 8; k++) {
+        const a = (k / 8) * Math.PI * 2;
+        const rr = k % 2 === 0 ? size : size * 0.4;
+        g[k === 0 ? "moveTo" : "lineTo"](e.x + Math.cos(a) * rr, e.y + Math.sin(a) * rr);
+      }
+      g.closePath();
+      g.fill();
+    } else {
+      g.beginPath();
+      g.arc(e.x, e.y, size, 0, Math.PI * 2);
+      g.fill();
+    }
+  } else if (e.kind === "shape") {
+    // Behavior-engine draw verb: bare glowing strokes.
+    g.lineWidth = e.width ?? 2.5;
+    g.shadowColor = e.color;
+    g.shadowBlur = 9;
+    g.beginPath();
+    if (e.shape === "line") {
+      g.moveTo(e.x, e.y);
+      g.lineTo(e.x2 ?? e.x, e.y2 ?? e.y);
+    } else if (e.shape === "arc") {
+      g.arc(e.x, e.y, e.radius ?? 20, e.a0 ?? 0, e.a1 ?? Math.PI);
+    } else {
+      g.arc(e.x, e.y, e.radius ?? 20, 0, Math.PI * 2);
+    }
+    g.stroke();
+  } else if (e.kind === "spark") {
+    g.lineWidth = 2.5;
+    g.shadowColor = e.color;
+    g.shadowBlur = 8;
+    const r = e.radius ?? 12;
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2 + e.maxTtl;
+      g.beginPath();
+      g.moveTo(e.x + Math.cos(a) * r * 0.4, e.y + Math.sin(a) * r * 0.4);
+      g.lineTo(e.x + Math.cos(a) * r * (1.5 - life), e.y + Math.sin(a) * r * (1.5 - life));
+      g.stroke();
+    }
+  } else {
+    const big = e.text === "FIGHT!" || e.text === "K.O." || e.text === "FLATTENED";
+    g.font = big ? "48px Anton, Impact, sans-serif" : "20px Anton, Impact, sans-serif";
+    g.textAlign = "center";
+    g.shadowColor = "rgba(0, 0, 0, 0.45)";
+    g.shadowBlur = 6;
+    g.shadowOffsetY = 2;
+    g.fillText(e.text ?? "", e.x, e.y - (1 - life) * 26);
+  }
+  g.restore();
+}

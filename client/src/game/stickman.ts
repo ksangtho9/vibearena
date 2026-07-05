@@ -115,6 +115,22 @@ export interface Fighter {
   hitstunTimer: number;
   launchedTimer: number;
   castTimer: number;
+  // Block + parry (shared mechanic; see dealDamage in combat.ts).
+  /** Guard meter: frontal blocked hits drain it; broken at 0. */
+  guard: number;
+  guardMax: number;
+  /** Shield-carriers drain slower (harder to guard-break). */
+  guardDrainMul: number;
+  /** Seconds until guard starts refilling after blocking/being hit. */
+  guardRegenDelay: number;
+  /** Guard stance is up this frame (negates frontal hits at guard cost). */
+  blocking: boolean;
+  /** Previous frame's block input — press edges arm the parry window. */
+  blockHeld: boolean;
+  /** While > 0, a frontal hit is PARRIED (free, staggers the attacker). */
+  parryTimer: number;
+  /** This fighter's parry window in seconds (from parrySkill/speed). */
+  parryWindow: number;
   /** Dash i-frames: while > 0, incoming damage misses entirely. */
   invulnTimer: number;
   /** Heal-over-time: hp += regenRate per second while regenTimer > 0. */
@@ -144,6 +160,8 @@ export interface Fighter {
   scriptState: Record<string, Record<string, unknown>>;
   /** Persistent weapon-behavior runtime (set by equipWeaponBehavior). */
   weaponRuntime: BehaviorRuntime | null;
+  /** LLM-drawn weapon look runtime (onRenderWeapon at ~30Hz); null = parametric. */
+  weaponRenderRuntime: BehaviorRuntime | null;
   /** Last ability this fighter cast — scripts can sense the OPPONENT's. */
   lastAbility: { name: string; kind: string } | null;
   /** Damage-over-time (bleed / elemental) from weapon properties. */
@@ -186,6 +204,18 @@ export function createFighter(
   const facing: 1 | -1 = side === "player" ? 1 : -1;
   const style = resolveStyle(spec);
 
+  // Block/parry tuning: MODEST per-fighter variation. blockPower/parrySkill
+  // (0–10, clamped by balance) win; otherwise derive from defense/speed.
+  // Shield-carriers get Kal's bonus: tankier guard, slower drain.
+  const cl = (v: number) => Math.max(0, Math.min(10, v));
+  const blockPower = spec.blockPower ?? cl(spec.stats.defense / 20);
+  const parrySkill = spec.parrySkill ?? cl(spec.stats.speed / 20);
+  const hasShield =
+    style.weapon.form === "shield" ||
+    /shield|buckler|aegis/.test(spec.weapon.name.toLowerCase());
+  const guardMax = Math.round((40 + blockPower * 6) * (hasShield ? 1.5 : 1));
+  const parryWindow = 0.1 + (parrySkill / 10) * 0.12; // 100–220ms
+
   // Pose once so the skeleton is valid before the first step.
   const frame = animator.update(0, {
     rootX: x,
@@ -195,6 +225,7 @@ export function createFighter(
     grounded: true,
     facing,
     moving: false,
+    blocking: false,
     alive: true,
     attackElapsed: -1,
     weaponForm: style.weapon.form,
@@ -242,6 +273,14 @@ export function createFighter(
     hitstunTimer: 0,
     launchedTimer: 0,
     castTimer: 0,
+    guard: guardMax,
+    guardMax,
+    guardDrainMul: hasShield ? 0.65 : 1,
+    guardRegenDelay: 0,
+    blocking: false,
+    blockHeld: false,
+    parryTimer: 0,
+    parryWindow,
     invulnTimer: 0,
     regenTimer: 0,
     regenRate: 0,
@@ -259,6 +298,7 @@ export function createFighter(
     recallTimer: 0,
     scriptState: {},
     weaponRuntime: null,
+    weaponRenderRuntime: null,
     weaponAttackFired: false,
     lastAbility: null,
     dotTimer: 0,
@@ -599,6 +639,33 @@ export function weaponRenderStyle(style: ResolvedStyle): WeaponRenderStyle {
   };
 }
 
+/**
+ * Where the weapon lives: the render anchor AND the attack/projectile
+ * origin. "floating" orbits the fighter; combat imports this so a head
+ * laser actually fires from the head.
+ */
+export function weaponMountAnchor(fighter: Fighter, time: number): Vec {
+  const sk = fighter.skeleton;
+  switch (fighter.spec.weapon.mount ?? "hand") {
+    case "head":
+      return { x: sk.head.x, y: sk.head.y };
+    case "body":
+      return { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 };
+    case "floating": {
+      const a = time * 1.6;
+      return {
+        x: fighter.root.position.x + Math.cos(a) * 44 * fighter.scale,
+        y: fighter.root.position.y - 26 * fighter.scale + Math.sin(a) * 22 * fighter.scale,
+      };
+    }
+    case "none":
+    case "hand":
+    case "dual":
+    default:
+      return { x: sk.handR.x, y: sk.handR.y };
+  }
+}
+
 function drawWeapon(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
@@ -606,12 +673,41 @@ function drawWeapon(
   angle: number,
   time: number,
 ): void {
-  ctx.save();
-  ctx.translate(hand.x, hand.y);
-  if (!weaponIsFloating(fighter.style.weapon.form)) ctx.rotate(angle);
-  ctx.scale(fighter.scale * 0.95, fighter.scale * 0.95);
-  drawParametricWeapon(ctx, weaponRenderStyle(fighter.style), time);
-  ctx.restore();
+  // An LLM-authored renderProgram owns the weapon's look entirely (it paints
+  // via the draw verbs each tick); the parametric drawer stays out of the way
+  // unless the program died (rt.done → permanent fallback for the match).
+  const rt = fighter.weaponRenderRuntime;
+  if (rt && !rt.done) return;
+
+  const mount = fighter.spec.weapon.mount ?? "hand";
+  if (mount === "none") return; // unarmed / pure emitter
+
+  const paint = (at: Vec, rot: number, mirror = false) => {
+    ctx.save();
+    ctx.translate(at.x, at.y);
+    if (mirror) ctx.scale(-1, 1);
+    if (!weaponIsFloating(fighter.style.weapon.form)) ctx.rotate(rot);
+    ctx.scale(fighter.scale * 0.95, fighter.scale * 0.95);
+    drawParametricWeapon(ctx, weaponRenderStyle(fighter.style), time);
+    ctx.restore();
+  };
+
+  if (mount === "hand" || mount === "dual") {
+    paint(hand, angle);
+    if (mount === "dual") {
+      // Mirror of the main weapon in the off hand, idle-angled.
+      paint({ x: fighter.skeleton.handL.x, y: fighter.skeleton.handL.y }, -angle, true);
+    }
+    return;
+  }
+
+  // head / body / floating without a renderProgram: hover the parametric
+  // weapon at the mount with a gentle bob instead of tying it to the swing.
+  const anchor = weaponMountAnchor(fighter, time);
+  paint(
+    { x: anchor.x, y: anchor.y - 6 * fighter.scale + Math.sin(time * 2.4) * 2 },
+    Math.sin(time * 1.8) * 0.15 - fighter.facing * 0.35,
+  );
 }
 
 /** Fading ribbon behind the weapon tip during a swing's active frames. */
@@ -1131,6 +1227,13 @@ export function drawOutfitHead(
   ctx.restore();
 }
 
+/**
+ * THE fighter renderer — the single source of truth for drawing any fighter
+ * on any surface (game, preview card, clones, future UIs). It owns body,
+ * outfit, transforms (scale/phase/tint) and — via drawWeapon below — the
+ * mount- and renderProgram-aware weapon. Do not add parallel render paths;
+ * build a Fighter (createFighter) and call this.
+ */
 export function renderFighter(
   ctx: CanvasRenderingContext2D,
   fighter: Fighter,
@@ -1285,108 +1388,5 @@ export function renderFighter(
     ctx.restore();
   }
 
-  ctx.restore();
-}
-
-/**
- * Static solid-fill portrait for the preview card — no physics, just a posed
- * figure with its mapped weapon, spotlight and contact shadow.
- */
-export function drawStickmanPreview(
-  ctx: CanvasRenderingContext2D,
-  spec: CharacterSpec,
-  w: number,
-  h: number,
-): void {
-  const style = resolveStyle(spec);
-  const s = spec.appearance.height;
-  const cx = w / 2;
-  const groundY = h * 0.88;
-  const u = (h / 180) * s; // unit scale fitted to the canvas
-  const fill = style.fill;
-
-  ctx.clearRect(0, 0, w, h);
-
-  // Soft spotlight behind the figure.
-  const spot = ctx.createRadialGradient(cx, h * 0.5, 0, cx, h * 0.5, h * 0.55);
-  spot.addColorStop(0, withAlpha(style.glow, 0.12));
-  spot.addColorStop(1, "rgba(0, 0, 0, 0)");
-  ctx.fillStyle = spot;
-  ctx.fillRect(0, 0, w, h);
-
-  const hipY = groundY - 48 * u;
-  const shoulderY = hipY - 40 * u;
-  const headR = 8.5 * u;
-  const headY = shoulderY - 11.5 * u;
-
-  const armR0 = 1.9 * u, armR1 = 1.1 * u;
-  const legR0 = 2.4 * u, legR1 = 1.4 * u;
-  const hip = { x: cx, y: hipY };
-  const shoulder = { x: cx, y: shoulderY + 4 * u };
-
-  drawContactShadow(ctx, cx, groundY, groundY, u);
-
-  const previewAnchors: OutfitAnchors = {
-    facing: 1,
-    s: u,
-    time: 1.7, // frozen mid-sway
-    head: { x: cx, y: headY, angle: 0, r: headR },
-    neck: { x: cx, y: shoulderY },
-    hips: hip,
-    arms: [], // filled below once hand targets exist
-    legs: [],
-  };
-  const outfitColors: OutfitColors = {
-    main: materialColor(style.outfit.material, style.accent),
-    trim: style.accent,
-    glow: style.glow,
-  };
-  drawOutfitBack(ctx, style.outfit, outfitColors, previewAnchors);
-
-  // Whole body in one batch: legs in a slight stance (knees bent), slim
-  // spine, off arm down with a relaxed elbow, thin neck, small round head.
-  const lFoot = { x: cx - 14 * u, y: groundY };
-  const rFoot = { x: cx + 14 * u, y: groundY };
-  const offHand = { x: cx - 20 * u, y: shoulderY + 26 * u };
-  const weaponHand = { x: cx + 23 * u, y: shoulderY - 8 * u };
-  flatBody(
-    ctx,
-    [
-      taperedPath(hip, bendPoint(hip, lFoot, -0.1), lFoot, legR0, legR1),
-      taperedPath(hip, bendPoint(hip, rFoot, 0.1), rFoot, legR0, legR1),
-      taperedPath({ x: cx, y: shoulderY }, { x: cx, y: (shoulderY + hipY) / 2 }, hip, 2.8 * u, 2 * u),
-      taperedPath(shoulder, bendPoint(shoulder, offHand, -0.16), offHand, armR0, armR1),
-      capsulePath(cx, shoulderY, cx, headY, 1.5 * u, 1.5 * u),
-      circlePath(cx, headY, headR),
-      taperedPath(shoulder, bendPoint(shoulder, weaponHand, 0.12), weaponHand, armR0, armR1),
-    ],
-    fill,
-  );
-
-  // Outfit over the body: armor slots, then head/face on top.
-  previewAnchors.arms = [
-    { elbow: bendPoint(shoulder, offHand, -0.16), hand: offHand },
-    { elbow: bendPoint(shoulder, weaponHand, 0.12), hand: weaponHand },
-  ];
-  previewAnchors.legs = [
-    { knee: bendPoint(hip, lFoot, -0.1), foot: lFoot },
-    { knee: bendPoint(hip, rFoot, 0.1), foot: rFoot },
-  ];
-  drawOutfitBody(ctx, style.outfit, outfitColors, previewAnchors, style.bulk);
-  drawOutfitHead(ctx, style.outfit, outfitColors, previewAnchors);
-
-  // Weapon in the raised hand. Long flexible forms point slightly down so
-  // they stay inside the portrait; everything else presents raised.
-  ctx.save();
-  ctx.translate(weaponHand.x, weaponHand.y);
-  if (!weaponIsFloating(style.weapon.form)) {
-    ctx.rotate(style.weapon.form === "whip" ? Math.PI / 12 : -Math.PI / 5);
-  }
-  ctx.scale(u * 1.05, u * 1.05);
-  drawParametricWeapon(
-    ctx,
-    weaponRenderStyle(style),
-    1.7, // frozen time: mid-pulse so glows read in a still image
-  );
   ctx.restore();
 }

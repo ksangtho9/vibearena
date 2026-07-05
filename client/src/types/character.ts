@@ -89,8 +89,15 @@ export const BEHAVIOR_HANDLERS = [
   // Weapon triggers (weapon.behavior): equip at fight start, active-frame
   // swing moment, and weapon connects. onTick is shared.
   "onEquip", "onAttack", "onHitTarget",
+  // Weapon LOOK (weapon.renderProgram): dispatched ~30x/s in the draw pass;
+  // draw verbs default to the weapon mount anchor.
+  "onRenderWeapon",
 ] as const;
 export type BehaviorHandler = (typeof BEHAVIOR_HANDLERS)[number];
+
+/** Where the weapon lives — render anchor AND attack origin. */
+export const WEAPON_MOUNTS = ["hand", "head", "body", "floating", "dual", "none"] as const;
+export type WeaponMount = (typeof WEAPON_MOUNTS)[number];
 
 export interface BehaviorProgram {
   /** Seconds the behavior stays live for onTick/onHit/onLand (capped). */
@@ -331,6 +338,15 @@ export interface CharacterSpec {
     behavior?: BehaviorProgram;
     /** Raw-JS variant, run at the onAttack moment (sandboxed + vetted). */
     customScript?: string;
+    /** Where the weapon is anchored (drawn + attacks originate). */
+    mount?: WeaponMount;
+    /**
+     * LLM-DRAWN weapon look: a behavior program whose onRenderWeapon handler
+     * paints the weapon each frame with the draw verbs (eye lasers, glowing
+     * fists, floating shards…). Vetted like any behavior; on absence/failure
+     * the parametric form drawer takes over.
+     */
+    renderProgram?: BehaviorProgram;
     vfx?: WeaponVfx;
   };
   /** ATTACK ability (kind aoe|projectile after enrich) — its own key + cooldown. */
@@ -338,6 +354,10 @@ export interface CharacterSpec {
   /** UTILITY ability (kind dash|shield|heal|buff after enrich) — second key. */
   utility?: AbilitySpec;
   stats: { hp: number; speed: number; strength: number; defense: number };
+  /** Optional block/parry tuning, 0–10 (clamped; defaults derive from stats).
+   * MODEST variation only — every fighter shares the same guard system. */
+  blockPower?: number;
+  parrySkill?: number;
   flavor: string;
 }
 
@@ -461,6 +481,8 @@ export const characterSpecSchema = z.object({
     // Weapon behaviors: structure scrubbed in normalizeRaw, guarded at runtime.
     behavior: z.unknown().optional(),
     customScript: z.string().min(1).max(4000).optional(),
+    mount: z.enum(WEAPON_MOUNTS).optional(),
+    renderProgram: z.unknown().optional(),
     vfx: z
       .object({
         glow: z.string().max(48),
@@ -477,6 +499,8 @@ export const characterSpecSchema = z.object({
     strength: z.coerce.number().finite(),
     defense: z.coerce.number().finite(),
   }),
+  blockPower: z.coerce.number().finite().optional(),
+  parrySkill: z.coerce.number().finite().optional(),
   flavor: z.string().max(400).default(""),
 });
 
@@ -508,6 +532,7 @@ const ABILITY_ALIASES: Record<string, CharacterSpec["ability"]["kind"]> = {
   beam: "projectile", laser: "projectile", boomerang: "projectile",
   buff: "buff", rage: "buff", boost: "buff", frenzy: "buff",
   summon: "buff", clone: "buff", transform: "buff",
+  spawnentity: "buff", spawn: "buff", minion: "buff", "summon clone": "buff",
 };
 
 /**
@@ -525,6 +550,14 @@ function normalizeRaw(raw: unknown): unknown {
   trim(clone, "name", 48);
   trim(clone, "flavor", 400);
   trim(clone.weapon as Record<string, unknown> | undefined, "name", 48);
+  // Unarmed concepts often come back with an empty weapon name — give the
+  // fists a name instead of failing the whole spec.
+  {
+    const w = clone.weapon as Record<string, unknown> | undefined;
+    if (w && (typeof w.name !== "string" || w.name.trim().length === 0)) {
+      w.name = "Bare Hands";
+    }
+  }
   trim(clone.ability as Record<string, unknown> | undefined, "name", 48);
   trim(clone.utility as Record<string, unknown> | undefined, "name", 48);
   const app = clone.appearance as Record<string, unknown> | undefined;
@@ -571,6 +604,18 @@ function normalizeRaw(raw: unknown): unknown {
       const cleaned = sanitizeBehaviorShape(weapon.behavior);
       if (cleaned) weapon.behavior = cleaned;
       else delete weapon.behavior;
+    }
+    if (weapon.renderProgram !== undefined) {
+      const cleaned = sanitizeBehaviorShape(weapon.renderProgram);
+      if (cleaned) weapon.renderProgram = cleaned;
+      else delete weapon.renderProgram;
+    }
+    if (typeof weapon.mount === "string") {
+      const m = weapon.mount.toLowerCase().trim();
+      if ((WEAPON_MOUNTS as readonly string[]).includes(m)) weapon.mount = m;
+      else delete weapon.mount;
+    } else if (weapon.mount !== undefined) {
+      delete weapon.mount;
     }
     if (typeof weapon.customScript === "string") {
       const script = weapon.customScript.trim().slice(0, 4000);

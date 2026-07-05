@@ -11,7 +11,7 @@ import { runWeaponScript } from "./engine/customScript";
 import type { EngineEntity } from "./engine/api";
 import { elementGlow } from "../generation/enrich";
 import type { Arena } from "./arena";
-import { collapse, type Fighter, type Side } from "./stickman";
+import { collapse, weaponMountAnchor, type Fighter, type Side } from "./stickman";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
 import { attackTimingOf } from "./animation";
@@ -191,6 +191,9 @@ export function rawDamage(attacker: Fighter, base: number): number {
 }
 
 export function pushEffect(ctx: CombatCtx, effect: Omit<Effect, "maxTtl">): void {
+  // Anti-crash cap: render programs push every frame — drop the oldest
+  // rather than let the effects array grow without bound.
+  if (ctx.effects.length >= 450) ctx.effects.shift();
   ctx.effects.push({ ...effect, maxTtl: effect.ttl });
 }
 
@@ -221,6 +224,67 @@ export function dealDamage(
     pushEffect(ctx, { kind: "text", x, y: y - 70, ttl: 0.5, color: "#9ba69e", text: "MISS" });
     return;
   }
+  // --- Block + parry: the ONE central hook, so guarding works against
+  // melee, projectiles AND AI-authored engine damage alike. Frontal only —
+  // `dir` is the push direction, so the attack comes from the -dir side and
+  // is frontal when the target faces that way.
+  const frontal = target.facing === -(Math.sign(dir) || 1);
+
+  // PARRY: block tapped within the window just before the hit lands.
+  // Free (no guard cost), no damage, and the attacker is staggered open.
+  if (frontal && target.parryTimer > 0 && target.introTimer <= 0) {
+    target.parryTimer = 0; // consumed
+    const { x, y } = target.root.position;
+    pushEffect(ctx, { kind: "text", x, y: y - 84, ttl: 0.8, color: "#ffe95e", text: "PARRY!" });
+    pushEffect(ctx, { kind: "spark", x: x + target.facing * 18, y: y - 22, ttl: 0.3, color: "#ffe95e", radius: 18 });
+    pushEffect(ctx, { kind: "ring", x: x + target.facing * 18, y: y - 22, ttl: 0.25, color: "#ffffff", radius: 22 });
+    if (opts.attacker?.alive) {
+      // Riposte opening: stagger + interrupt whatever they were doing.
+      opts.attacker.hitstunTimer = Math.max(opts.attacker.hitstunTimer, 0.5);
+      opts.attacker.attackAnim = 0;
+      opts.attacker.attackWindow = 0;
+    }
+    ctx.hitstop = Math.max(ctx.hitstop, 0.09);
+    return;
+  }
+
+  // BLOCK: guard stance negates the frontal hit at the cost of guard meter.
+  if (frontal && target.blocking) {
+    const preMitigation = amount * DAMAGE_SCALE * 0.45; // drain ~ hit weight
+    target.guard -= preMitigation * target.guardDrainMul;
+    target.guardRegenDelay = 0.8;
+    const { x, y } = target.root.position;
+    if (target.guard > 0) {
+      // Held: spark + a nudge of pushback, zero damage (no chip).
+      pushEffect(ctx, { kind: "spark", x: x + target.facing * 16, y: y - 20, ttl: 0.2, color: "#c9ced9", radius: 12 });
+      Matter.Body.setVelocity(target.root, {
+        x: dir * 3,
+        y: target.root.velocity.y,
+      });
+      ctx.hitstop = Math.max(ctx.hitstop, 0.03);
+      return;
+    }
+    // GUARD BREAK: block shatters, long stun, guard refills from zero.
+    target.guard = 0;
+    target.blocking = false;
+    target.hitstunTimer = Math.max(target.hitstunTimer, 0.6);
+    target.attackAnim = 0;
+    target.attackWindow = 0;
+    target.guardRegenDelay = 0.35; // then ~2s to refill
+    pushEffect(ctx, { kind: "text", x, y: y - 92, ttl: 1, color: "#e0483e", text: "GUARD BREAK" });
+    pushEffect(ctx, { kind: "ring", x, y: y - 20, ttl: 0.4, color: "#e0483e", radius: 34 });
+    for (let i = 0; i < 5; i++) {
+      pushEffect(ctx, {
+        kind: "particle", x, y: y - 40, ttl: 0.7, color: "#ffe95e",
+        vx: (Math.random() - 0.5) * 160, vy: -80 - Math.random() * 80,
+        gravity: 300, size: 4, particleShape: "star",
+      });
+    }
+    ctx.hitstop = Math.max(ctx.hitstop, 0.1);
+    // The breaking hit itself is spent shattering the guard.
+    return;
+  }
+
   // reflect(): the parry window turns the damage back on the attacker.
   // (The reflected call carries no attacker, so mirrors can't ping-pong.)
   if (target.reflectTimer > 0) {
@@ -398,8 +462,13 @@ function startAttack(f: Fighter): void {
  * small floor), never from the visual form/size — cosmetics don't change
  * hitboxes.
  */
-function weaponSegment(f: Fighter): { from: Matter.Vector; to: Matter.Vector } {
-  const hand = f.skeleton.handR;
+function weaponSegment(f: Fighter, time = 0): { from: Matter.Vector; to: Matter.Vector } {
+  // Attacks originate at the weapon MOUNT (head lasers strike from the head,
+  // unarmed strikes from the hand); reach itself is unchanged.
+  const hand =
+    (f.spec.weapon.mount ?? "hand") === "hand" || f.spec.weapon.mount === "dual"
+      ? f.skeleton.handR
+      : weaponMountAnchor(f, time);
   // setScale() grows/shrinks reach with the fighter (visual + mechanical).
   const reach =
     (Math.max(28 * f.scale, f.spec.weapon.range * 0.6) + weaponPropMag(f, "reach") * 3) *
@@ -459,6 +528,10 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
         visual,
         form,
         element: f.style.element,
+        origin:
+          (f.spec.weapon.mount ?? "hand") !== "hand" && f.spec.weapon.mount !== "dual"
+            ? weaponMountAnchor(f, ctx.time)
+            : undefined,
         onHit:
           f.weaponRuntime?.program.handlers.onHitTarget && f.weaponRuntime
             ? () => dispatchHandler(f.weaponRuntime!, ctx, "onHitTarget")
@@ -470,7 +543,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
 
   // Melee swings also connect with enemy ENTITIES (clones body-block).
   if (f.attackWindow > 0) {
-    const seg = weaponSegment(f);
+    const seg = weaponSegment(f, ctx.time);
     for (const e of ctx.entities) {
       if (e.side === f.side || e.dead || e.hurtCd > 0) continue;
       if (e.kind !== "clone" && e.kind !== "minion" && e.kind !== "turret") continue;
@@ -488,7 +561,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   // Melee: raycast the weapon segment against the opponent's hurtbox.
   // The cleave property widens the swept arc.
   if (f.attackWindow > 0 && !f.hasHitThisSwing && opponent.alive) {
-    const seg = weaponSegment(f);
+    const seg = weaponSegment(f, ctx.time);
     const rayWidth = (10 * f.scale + weaponPropMag(f, "cleave") * 2.2) * f.displayScale;
     const hits = Matter.Query.ray([opponent.root], seg.from, seg.to, rayWidth);
     if (hits.length > 0) {
@@ -707,15 +780,37 @@ export function updateFighter(
   const stunned = f.hitstunTimer > 0 || f.launchedTimer > 0;
   const v = f.root.velocity;
 
+  // --- Block + parry input. A press EDGE arms the parry window; holding
+  // (past the window) is the guard stance. Guard at 0 = can't block.
+  f.parryTimer = Math.max(0, f.parryTimer - dt);
+  if (input.block && !f.blockHeld && !stunned && f.introTimer <= 0) {
+    f.parryTimer = f.parryWindow;
+  }
+  f.blockHeld = input.block;
+  f.blocking =
+    input.block && !stunned && f.introTimer <= 0 && f.attackAnim <= 0 && f.guard > 0;
+
+  // Guard regen: pauses while blocking / shortly after guard activity.
+  if (f.blocking) {
+    f.guardRegenDelay = Math.max(f.guardRegenDelay, 0.6);
+  } else {
+    f.guardRegenDelay = Math.max(0, f.guardRegenDelay - dt);
+    if (f.guardRegenDelay <= 0 && f.guard < f.guardMax) {
+      f.guard = Math.min(f.guardMax, f.guard + (f.guardMax / 2) * dt); // ~2s refill
+    }
+  }
+
   if (f.introTimer <= 0 && !stunned) {
     const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    // Guard stance: rooted to a slow shuffle, no attacks or casts.
+    const speedScale = f.blocking ? 0.25 : 1;
     if (dir !== 0) {
-      Matter.Body.setVelocity(f.root, { x: dir * speedOf(f) * f.timeFactor, y: v.y });
+      Matter.Body.setVelocity(f.root, { x: dir * speedOf(f) * f.timeFactor * speedScale, y: v.y });
     } else if (f.grounded) {
       Matter.Body.setVelocity(f.root, { x: v.x * 0.8, y: v.y });
     }
 
-    if (input.jump && f.grounded && f.jumpCooldown <= 0) {
+    if (input.jump && f.grounded && f.jumpCooldown <= 0 && !f.blocking) {
       if (input.down && f.onPlatform) {
         // Drop through the one-way platform instead of jumping.
         f.dropThrough = 0.25;
@@ -725,20 +820,23 @@ export function updateFighter(
       f.jumpCooldown = 0.3;
     }
 
-    if (input.attack && f.attackCooldown <= 0 && f.attackAnim <= 0) startAttack(f);
+    if (input.attack && f.attackCooldown <= 0 && f.attackAnim <= 0 && !f.blocking) startAttack(f);
 
-    if (input.ability && f.abilityCooldown <= 0) {
+    if (input.ability && f.abilityCooldown <= 0 && !f.blocking) {
       f.abilityCooldown = f.spec.ability.cooldown;
       useAbility(f, opponent, ctx, f.spec.ability);
     }
 
-    if (input.utility && f.utilityCooldown <= 0 && f.spec.utility) {
+    if (input.utility && f.utilityCooldown <= 0 && f.spec.utility && !f.blocking) {
       f.utilityCooldown = f.spec.utility.cooldown;
       useAbility(f, opponent, ctx, f.spec.utility);
     }
-  } else if (stunned && f.grounded) {
-    // Staggered: skid to a stop, no control.
-    Matter.Body.setVelocity(f.root, { x: v.x * 0.85, y: v.y });
+  } else {
+    f.blocking = false;
+    if (stunned && f.grounded) {
+      // Staggered: skid to a stop, no control.
+      Matter.Body.setVelocity(f.root, { x: v.x * 0.85, y: v.y });
+    }
   }
 
   progressAttack(f, opponent, ctx);
@@ -756,6 +854,7 @@ export function updateFighter(
     grounded: f.grounded,
     facing: f.facing,
     moving: Math.abs(f.root.velocity.x) > 0.6 && f.grounded,
+    blocking: f.blocking,
     alive: f.alive,
     attackElapsed: f.attackAnim > 0 ? (timing.total - f.attackAnim) / ts : -1,
     weaponForm: f.style.weapon.form,

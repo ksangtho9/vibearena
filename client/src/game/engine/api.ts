@@ -2,15 +2,19 @@ import Matter from "matter-js";
 import type { ElementKind } from "../../types/character";
 import { ABILITY_MOTIFS, ELEMENTS } from "../../types/character";
 import type { Fighter } from "../stickman";
-import { weaponRenderStyle, drawOutfitBack, drawOutfitHead, materialColor } from "../stickman";
-import type { OutfitAnchors, OutfitColors } from "../stickman";
-import { drawWeapon } from "../weapons/archetypes";
+import { createFighter, renderFighter } from "../stickman";
 import { createBotBrain, type BotBrain } from "../bot";
 import type { CombatCtx } from "../combat";
 import { dealDamage, pushEffect, rawDamage, spawnProjectile } from "../combat";
+import { attackTimingOf } from "../animation";
 import { ARENA_HEIGHT, ARENA_WIDTH } from "../arena";
 import { mix, withAlpha } from "../../render/color";
-import { dispatchBehaviorHit, resolveValue, type BehaviorRuntime } from "./interpreter";
+import {
+  dispatchBehaviorHit,
+  equipWeaponRender,
+  resolveValue,
+  type BehaviorRuntime,
+} from "./interpreter";
 
 /**
  * EngineApi — the frozen whitelist of verbs a behavior program may call.
@@ -68,8 +72,16 @@ export interface EngineEntity {
   hazardKind?: HazardKind;
   /** beam: sustained laser — direction (rad), length, damage/s. */
   beam?: { dir: number; length: number; dps: number; tickAcc: number };
-  /** clone: bot brain + mini attack state (fights with the caster's weapon). */
-  clone?: { brain: BotBrain; attackCd: number; attackAnim: number };
+  /** clone: bot brain + a REAL ghost Fighter rendered through the unified
+   * fighter pipeline (animated, mount- and renderProgram-aware). */
+  clone?: {
+    brain: BotBrain;
+    attackCd: number;
+    /** Remaining attack animation (counts down from attackTotal). */
+    attackAnim: number;
+    attackTotal: number;
+    fighter: Fighter;
+  };
   /** Owning behavior — entity hits dispatch its onHit handler. */
   rt: BehaviorRuntime;
   dead: boolean;
@@ -87,7 +99,8 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
   /** Resolve + clamp a numeric arg. */
   const N = (v: unknown, dflt: number, min: number, max: number) =>
     clamp(resolveValue(rt, ctx, v, dflt), min, max);
-  const pos = () => caster.root.position;
+  // Render runtimes anchor draw-verb defaults to the weapon mount.
+  const pos = () => rt.anchor?.() ?? caster.root.position;
   const setVel = (f: Fighter, vx: number, vy: number) =>
     Matter.Body.setVelocity(f.root, {
       x: clamp(vx, -MAX_SPEED, MAX_SPEED),
@@ -236,6 +249,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
         dealDamage(f, damage, Math.sign(f.root.position.x - x) || caster.facing, ctx, {
           source: "ability",
           knockbackMul: N(a.knockback, 1, 0, 3),
+          attacker: caster,
         });
         if (rt.program.handlers.onHit) dispatchBehaviorHit(rt, ctx);
         return true;
@@ -256,7 +270,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
         radius: 12,
       });
       if (dx > -10 && dx < N(a.range, 55, 10, 150) && dy < 70 && f.alive) {
-        dealDamage(f, N(a.damage, 12, 0, MAX_DAMAGE_PER_ACTION), caster.facing, ctx, { source: "ability" });
+        dealDamage(f, N(a.damage, 12, 0, MAX_DAMAGE_PER_ACTION), caster.facing, ctx, { source: "ability", attacker: caster });
         if (rt.program.handlers.onHit) dispatchBehaviorHit(rt, ctx);
         return true;
       }
@@ -310,7 +324,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const f = foe();
       const damage = N(a.damage, 8, 0, 120);
       if (!f.alive) return;
-      dealDamage(f, damage, caster.facing, ctx, { source: "ability" });
+      dealDamage(f, damage, caster.facing, ctx, { source: "ability", attacker: caster });
       const healed = Math.max(1, Math.round(damage * N(a.percent, 0.5, 0, 1)));
       caster.hp = Math.min(caster.maxHp, caster.hp + healed);
       pushEffect(ctx, { kind: "text", x: pos().x, y: pos().y - 76, ttl: 0.6, color: "#8fd18a", text: `+${healed}` });
@@ -624,6 +638,10 @@ function pushEntity(ctx: CombatCtx, entity: EngineEntity): void {
   if (ctx.entities.length >= 24) {
     const oldest = ctx.entities.shift();
     if (oldest?.wallBody) Matter.World.remove(ctx.arena.world, oldest.wallBody);
+    if (oldest?.clone) {
+      if (oldest.clone.fighter.weaponRenderRuntime) oldest.clone.fighter.weaponRenderRuntime.done = true;
+      Matter.Composite.remove(CLONE_WORLD, oldest.clone.fighter.root);
+    }
   }
   ctx.entities.push(entity);
   pushEffect(ctx, { kind: "spark", x: entity.x, y: entity.y - 14, ttl: 0.3, color: entity.glow, radius: 14 });
@@ -669,11 +687,35 @@ function spawnEntityImpl(
 
   if (kind === "clone") {
     // Clones are resembling BOT copies with hard caps: weak HP, short life,
-    // limited headcount, no ability casting (and so no recursion).
+    // limited headcount, no ability casting (and so no recursion). The clone
+    // body is a REAL Fighter in a dummy world — same renderer, same animator,
+    // same mount/renderProgram weapon path as everyone else, ghost-tinted.
     entity.hp = Math.min(entity.hp, Math.max(8, caster.maxHp * CLONE_HP_FRACTION));
     entity.ttl = entity.maxTtl = Math.min(entity.ttl, CLONE_MAX_TTL);
     entity.radius = 12;
-    entity.clone = { brain: createBotBrain(), attackCd: 0.6, attackAnim: 0 };
+    const ghost = createFighter(
+      CLONE_WORLD as unknown as Matter.World,
+      caster.spec,
+      entity.x,
+      groundY,
+      caster.side,
+    );
+    ghost.tintColor = rt.glow;
+    ghost.tintTimer = Number.MAX_SAFE_INTEGER; // clones aren't combat-ticked
+    ghost.phaseTimer = Number.MAX_SAFE_INTEGER; // → renderFighter ghosts them
+    ghost.displayScale = 0.92;
+    // Same already-vetted renderProgram as the caster (no re-vetting) —
+    // anchored to the CLONE's own mount so eye-lasers glow on the clone's head.
+    if (caster.weaponRenderRuntime && !caster.weaponRenderRuntime.done) {
+      equipWeaponRender(ghost, ctx);
+    }
+    entity.clone = {
+      brain: createBotBrain(),
+      attackCd: 0.6,
+      attackAnim: 0,
+      attackTotal: attackTimingOf(caster.style.weapon.form, caster.spec.weapon.type).total,
+      fighter: ghost,
+    };
     const alive = ctx.entities.filter((o) => o.kind === "clone" && o.side === entity.side && !o.dead);
     while (alive.length >= CLONE_MAX_ALIVE) {
       const oldest = alive.shift()!;
@@ -693,20 +735,11 @@ function spawnEntityImpl(
   pushEntity(ctx, entity);
 }
 
-/** Minimal Fighter facade so the bot FSM can drive a clone. */
-function cloneStub(e: EngineEntity, caster: Fighter): Fighter {
-  return {
-    alive: e.hp > 0 && !e.dead,
-    hp: e.hp,
-    maxHp: Math.max(1, caster.maxHp * CLONE_HP_FRACTION),
-    root: { position: { x: e.x, y: e.y - 30 }, velocity: { x: e.vx, y: 0 } },
-    spec: caster.spec,
-    attackWindow: 0,
-    abilityCooldown: 999, // clones never cast abilities
-    utilityCooldown: 999,
-    grounded: true,
-  } as unknown as Fighter;
-}
+/**
+ * Dummy composite for clone Fighter bodies — never stepped by the engine,
+ * never added to the arena, so clone capsules exert zero real physics.
+ */
+const CLONE_WORLD = Matter.Composite.create();
 
 /** Fixed-step entity update: motion, simple AI, contact damage, expiry. */
 export function tickEntities(ctx: CombatCtx, dt: number): void {
@@ -729,7 +762,9 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
         const c = e.clone!;
         c.attackCd = Math.max(0, c.attackCd - dt);
         c.attackAnim = Math.max(0, c.attackAnim - dt);
-        const input = c.brain.think(cloneStub(e, caster), foe, dt);
+        const ghost = c.fighter;
+        ghost.hp = e.hp; // brain retreats when the clone is hurt
+        const input = c.brain.think(ghost, foe, dt);
         const pxPerSec = (3 + caster.spec.stats.speed * 0.035) * 42;
         const dir = (input.right ? 1 : 0) - (input.left ? 1 : 0);
         e.vx = dir * pxPerSec;
@@ -739,13 +774,13 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
 
         if (input.attack && c.attackCd <= 0 && foe.alive) {
           c.attackCd = 1.0;
-          c.attackAnim = 0.3;
+          c.attackAnim = c.attackTotal; // real swing timing -> real animation
           const w = caster.spec.weapon;
           const damage = rawDamage(caster, w.damage) * CLONE_DAMAGE_FRACTION;
           if (w.type === "melee") {
             const reach = Math.max(28, w.range * 0.6) + 14;
             if (Math.abs(fp.x - e.x) < reach && Math.abs(fp.y - (e.y - 30)) < 70) {
-              dealDamage(foe, damage, e.facing, ctx, { source: "ability" });
+              dealDamage(foe, damage, e.facing, ctx, { source: "ability", attacker: e.rt.caster });
               if (e.rt.program.handlers.onHit) dispatchBehaviorHit(e.rt, ctx);
             }
           } else {
@@ -763,6 +798,38 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
             });
           }
         }
+
+        // Drive the ghost Fighter through THE animator (same as bots and
+        // players) so clones idle/run/swing; renderEntities just calls
+        // renderFighter on it.
+        Matter.Body.setPosition(ghost.root, { x: e.x, y: e.y - 44 * ghost.scale });
+        ghost.facing = e.facing;
+        const elapsed = c.attackAnim > 0 ? c.attackTotal - c.attackAnim : -1;
+        const timing = attackTimingOf(caster.style.weapon.form, caster.spec.weapon.type);
+        ghost.attackWindow =
+          elapsed >= timing.windup && elapsed < timing.windup + timing.active ? 0.05 : 0;
+        const frame = ghost.animator.update(dt, {
+          rootX: e.x,
+          rootY: e.y - 44 * ghost.scale,
+          vx: e.vx / 60,
+          vy: 0,
+          grounded: true,
+          facing: e.facing,
+          moving: Math.abs(e.vx) > 20,
+          alive: true,
+          blocking: false,
+          attackElapsed: elapsed,
+          weaponForm: caster.style.weapon.form,
+          weaponSize: caster.style.weapon.size,
+          weaponType: caster.spec.weapon.type,
+          castTimer: 0,
+          hitstunTimer: 0,
+          launchedTimer: 0,
+          groundY: e.groundY,
+          time: ctx.time,
+        });
+        ghost.skeleton = frame.skeleton;
+        ghost.weaponAngle = frame.weaponAngle;
         break;
       }
       case "minion": {
@@ -838,7 +905,7 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
           const cx = e.x + (endX - e.x) * t;
           const cy = e.y + (endY - e.y) * t;
           if (Math.hypot(px - cx, py - cy) < 22) {
-            dealDamage(foe, b.dps * 0.15, e.facing, ctx, { source: "ability" });
+            dealDamage(foe, b.dps * 0.15, e.facing, ctx, { source: "ability", attacker: e.rt.caster });
             if (e.rt.program.handlers.onHit) dispatchBehaviorHit(e.rt, ctx);
           }
         }
@@ -901,6 +968,11 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
   }
   for (let i = ctx.entities.length - 1; i >= 0; i--) {
     if (ctx.entities[i].dead) {
+      const c = ctx.entities[i].clone;
+      if (c) {
+        if (c.fighter.weaponRenderRuntime) c.fighter.weaponRenderRuntime.done = true;
+        Matter.Composite.remove(CLONE_WORLD, c.fighter.root);
+      }
       pushEffect(ctx, {
         kind: "spark",
         x: ctx.entities[i].x,
@@ -922,7 +994,10 @@ export function renderEntities(g: CanvasRenderingContext2D, ctx: CombatCtx, time
     g.globalAlpha = fade;
     switch (e.kind) {
       case "clone": {
-        renderClone(g, e, time, fade);
+        // THE fighter renderer — the ghost look comes from the clone
+        // fighter's phase/tint fields, the weapon from the same
+        // mount/renderProgram-aware path as everyone else.
+        if (e.clone) renderFighter(g, e.clone.fighter, time, e.groundY);
         break;
       }
       case "hazard": {
@@ -1026,120 +1101,6 @@ export function renderEntities(g: CanvasRenderingContext2D, ctx: CombatCtx, time
     }
     g.restore();
   }
-}
-
-/**
- * A clone renders as the CASTER: same body color, scale, head outfit, cape
- * and weapon (compositional parts) — tinted toward its glow and translucent
- * so it reads as a copy, never the real fighter. Simplified limbs: this is
- * a ghost, not a second skeleton.
- */
-function renderClone(
-  g: CanvasRenderingContext2D,
-  e: EngineEntity,
-  time: number,
-  fade: number,
-): void {
-  const caster = e.rt.caster;
-  const style = caster.style;
-  const s = caster.scale * 0.92;
-  const ghost = (c: string) => mix(c, e.glow, 0.25);
-  const moving = Math.abs(e.vx) > 10;
-  const run = moving ? Math.sin(time * 11 + e.angle) : 0;
-  const bob = Math.sin(time * 5 + e.angle) * 1.3;
-
-  const hipsY = e.y - 44 * s + bob;
-  const neck = { x: e.x, y: hipsY - 27 * s };
-  const headY = neck.y - 11 * s;
-
-  g.save();
-  g.globalAlpha = 0.55 * fade;
-
-  // Cape/back item first (behind), then body, then head outfit — the same
-  // stack as a real fighter, through the exported outfit helpers.
-  const anchors: OutfitAnchors = {
-    facing: e.facing,
-    s,
-    time,
-    head: { x: e.x, y: headY, angle: 0, r: 8.5 * s },
-    neck,
-    hips: { x: e.x, y: hipsY },
-    arms: [],
-    legs: [],
-  };
-  const outfitColors: OutfitColors = {
-    main: ghost(materialColor(style.outfit.material, style.accent)),
-    trim: ghost(style.accent),
-    glow: e.glow,
-  };
-  drawOutfitBack(g, style.outfit, outfitColors, anchors);
-
-  const fill = ghost(style.fill);
-  g.strokeStyle = fill;
-  g.fillStyle = fill;
-  g.lineCap = "round";
-
-  // Legs scissor while running.
-  g.lineWidth = 4.4 * s;
-  g.beginPath();
-  g.moveTo(e.x, hipsY);
-  g.lineTo(e.x + (8 * run + 4) * s, e.y);
-  g.moveTo(e.x, hipsY);
-  g.lineTo(e.x + (-8 * run - 4) * s, e.y);
-  g.stroke();
-
-  // Spine.
-  g.lineWidth = 5 * s;
-  g.beginPath();
-  g.moveTo(e.x, hipsY);
-  g.lineTo(neck.x, neck.y);
-  g.stroke();
-
-  // Off arm counter-swings.
-  g.lineWidth = 3.4 * s;
-  g.beginPath();
-  g.moveTo(neck.x, neck.y + 2 * s);
-  g.lineTo(neck.x - e.facing * (7 + 4 * run) * s, neck.y + 14 * s);
-  g.stroke();
-
-  // Head.
-  g.beginPath();
-  g.arc(e.x, headY, 7.6 * s, 0, Math.PI * 2);
-  g.fill();
-
-  // Weapon arm + the caster's actual weapon, swinging during attacks.
-  const c = e.clone;
-  const swing = c && c.attackAnim > 0 ? (0.3 - c.attackAnim) / 0.3 : 0;
-  const armAngle = swing > 0 ? -1.4 + swing * 2.1 : -0.35;
-  const handX = neck.x + Math.cos(armAngle * 0.4) * 12 * s * e.facing;
-  const handY = neck.y + 8 * s + Math.sin(armAngle * 0.4) * 6 * s;
-  g.lineWidth = 3.4 * s;
-  g.beginPath();
-  g.moveTo(neck.x, neck.y + 2 * s);
-  g.lineTo(handX, handY);
-  g.stroke();
-
-  g.save();
-  g.translate(handX, handY);
-  g.scale(e.facing * s * 0.9, s * 0.9);
-  g.rotate(swing > 0 ? -1.2 + swing * 1.9 : -0.5);
-  const wStyle = weaponRenderStyle(style);
-  drawWeapon(g, { ...wStyle, fill: ghost(wStyle.fill), accent: ghost(wStyle.accent) }, time);
-  g.restore();
-
-  // Head outfit on top (hat/helmet reads the identity instantly).
-  drawOutfitHead(g, style.outfit, outfitColors, anchors);
-
-  // Ghost shimmer ring.
-  g.shadowColor = e.glow;
-  g.shadowBlur = 10;
-  g.globalAlpha = 0.16 * fade;
-  g.strokeStyle = e.glow;
-  g.lineWidth = 2;
-  g.beginPath();
-  g.arc(e.x, hipsY - 8 * s, 26 * s, 0, Math.PI * 2);
-  g.stroke();
-  g.restore();
 }
 
 /** Ground hazard zones — each kind gets its own look. */

@@ -18,6 +18,8 @@ export function createBotBrain(): BotBrain {
   let state: BotState = "approach";
   let timer = 0;
   let dodgeDir: 1 | -1 = 1;
+  /** While > 0 the bot holds block (short = an attempted parry tap). */
+  let blockTimer = 0;
 
   const enter = (next: BotState, duration: number) => {
     state = next;
@@ -77,6 +79,17 @@ export function createBotBrain(): BotBrain {
           break;
         }
       }
+
+      // Defense: sometimes raise the guard against an incoming swing, and
+      // occasionally attempt a parry-timed tap. Deliberately imperfect.
+      blockTimer = Math.max(0, blockTimer - dt);
+      const incoming = player.attackAnim > 0 && dist < 190;
+      if (incoming && blockTimer <= 0 && state !== "strike") {
+        const roll = Math.random();
+        if (roll < 0.012) blockTimer = 0.12; // parry attempt (tap)
+        else if (roll < 0.05) blockTimer = 0.45; // hold the guard
+      }
+      input.block = blockTimer > 0;
 
       // Attack ability (aoe close in, projectiles at range).
       if (bot.abilityCooldown <= 0) {

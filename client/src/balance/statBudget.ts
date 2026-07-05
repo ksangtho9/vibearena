@@ -181,5 +181,10 @@ export function balanceCharacter(spec: CharacterSpec): CharacterSpec {
     ability: balanceAbility(spec.ability),
     utility: spec.utility ? balanceAbility(spec.utility) : undefined,
     stats: normalizeStats(spec.stats),
+    // Block/parry tuning stays a MODEST 0–10 band (defaults derive in-game).
+    blockPower:
+      spec.blockPower !== undefined ? clamp(spec.blockPower, 0, 10) : undefined,
+    parrySkill:
+      spec.parrySkill !== undefined ? clamp(spec.parrySkill, 0, 10) : undefined,
   };
 }

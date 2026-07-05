@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useVibeStore } from "../store";
-import { drawStickmanPreview } from "../game/stickman";
+import { startFighterPreview } from "../game/preview";
 import { TOTAL_STAT_BUDGET } from "../balance/statBudget";
 
 const STAT_LABELS = [
@@ -52,7 +52,9 @@ export function PreviewCard() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
     ctx.scale(dpr, dpr);
-    drawStickmanPreview(ctx, spec, 240, 260);
+    // Live preview through THE fighter render pipeline (same as in-game):
+    // animated idle + mounts + LLM-drawn weapon looks, no separate drawer.
+    return startFighterPreview(ctx, spec, 240, 260);
   }, [spec]);
 
   if (!spec) return null;

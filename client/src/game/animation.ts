@@ -24,6 +24,7 @@ export type AnimState =
   | "fall"
   | "attack"
   | "cast"
+  | "block"
   | "hitstun"
   | "launched"
   | "ko";
@@ -207,6 +208,8 @@ export interface AnimInputs {
   facing: 1 | -1;
   moving: boolean;
   alive: boolean;
+  /** Guard stance is up (block key held). */
+  blocking: boolean;
   /** Seconds since the current attack started; -1 when not attacking. */
   attackElapsed: number;
   weaponForm: WeaponForm;
@@ -506,6 +509,7 @@ export function createAnimator(bones: Bones): Animator {
     if (inp.hitstunTimer > 0) return "hitstun";
     if (inp.attackElapsed >= 0) return "attack";
     if (inp.castTimer > 0) return "cast";
+    if (inp.blocking && inp.grounded) return "block";
     if (!inp.grounded) return inp.vy < -0.5 ? "jump" : "fall";
     if (inp.moving) return "run";
     return "idle";
@@ -552,6 +556,7 @@ export function createAnimator(bones: Bones): Animator {
       // --- Hips: track the physics root, plus per-state bob/weight. ---
       let bob = 0;
       if (state === "idle") bob = Math.sin(t * 2.2) * 1.2 * s + 2.2 * s; // crouched guard
+      if (state === "block") bob = 3.4 * s; // sunk into the guard
       if (state === "run") bob = Math.sin(runPhase * 2) * 1.6 * s + 1 * s;
       if (atk) bob = atk.hipsDy * s + 1.5 * s;
       let hipsX = inp.rootX;
@@ -568,6 +573,7 @@ export function createAnimator(bones: Bones): Animator {
       if (state === "hitstun") lean = -0.32;
       if (state === "launched") lean = -0.6;
       if (state === "cast") lean = 0.1;
+      if (state === "block") lean = -0.05; // weight back behind the guard
       if (atk) lean = atk.lean;
 
       const theta = f * lean;
@@ -667,6 +673,13 @@ export function createAnimator(bones: Bones): Animator {
         handTargetL = { x: neck.x - nvx * 10 * s, y: neck.y + 2 * s };
         handTargetR = { x: neck.x - nvx * 7 * s, y: neck.y - 5 * s };
         dirRel = null;
+      } else if (state === "block") {
+        // Guard: weapon raised steeply across the body, off-hand braced
+        // behind it, slight tremble under pressure.
+        const tremble = Math.sin(t * 18) * 0.5 * s;
+        handTargetR = { x: neck.x + f * 8 * s, y: neck.y + 1 * s + tremble };
+        handTargetL = { x: neck.x + f * 4 * s, y: neck.y + 7 * s };
+        dirRel = -1.15; // blade/haft held up like a wall
       } else if (state === "cast") {
         const k = easeOut(1 - inp.castTimer / CAST_TIME);
         handTargetL = { x: neck.x + f * (6 + 6 * k) * s, y: neck.y + 6 * s };

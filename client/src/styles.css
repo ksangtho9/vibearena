@@ -468,6 +468,41 @@ body {
   background: var(--gold);
 }
 
+/* Guard meter: a thin chalk sliver under the HP bar. */
+.guard-track {
+  width: 62%;
+  height: 5px;
+  margin-top: 3px;
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(242, 240, 228, 0.35);
+  transform: skewX(-8deg);
+  overflow: hidden;
+}
+
+.hp-right .guard-track {
+  transform: skewX(8deg);
+  direction: rtl;
+}
+
+.guard-fill {
+  height: 100%;
+  background: #9bd0e0;
+  transition: width 0.15s ease-out;
+}
+
+.guard-broken {
+  border-color: var(--tape-red);
+  animation: guard-flash 0.5s steps(2) infinite;
+}
+
+@keyframes guard-flash {
+  50% { background: rgba(224, 72, 62, 0.55); }
+}
+
+.hint-sub {
+  opacity: 0.65;
+}
+
 .canvas-wrap {
   width: 100%;
   border: 2px solid rgba(242, 240, 228, 0.3);

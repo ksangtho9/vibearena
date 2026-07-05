@@ -7,6 +7,7 @@ import type {
 } from "../../types/character";
 import { BEHAVIOR_HANDLERS } from "../../types/character";
 import type { Fighter } from "../stickman";
+import { weaponMountAnchor } from "../stickman";
 import type { CombatCtx } from "../combat";
 import { createEngineApi } from "./api";
 
@@ -49,6 +50,10 @@ export interface BehaviorRuntime {
   entityBudget: number;
   /** Weapon runtimes live for the whole match (no duration expiry). */
   persistent: boolean;
+  /** Render runtimes: draw-verb default position (the weapon mount). */
+  anchor?: () => { x: number; y: number };
+  /** onRenderWeapon cadence accumulator (~30Hz). */
+  renderAcc: number;
   done: boolean;
 }
 
@@ -100,6 +105,8 @@ export function resolveValue(
     case "distance":
       return Math.abs(foe.root.position.x - caster.root.position.x);
     case "age": return rt.age;
+    case "mount.x": return (rt.anchor?.() ?? caster.root.position).x;
+    case "mount.y": return (rt.anchor?.() ?? caster.root.position).y;
     case "now":
     case "match.time": return ctx.time;
     case "myEntities":
@@ -241,6 +248,7 @@ function makeRuntime(
     projectileBudget: 0,
     entityBudget: 0,
     persistent,
+    renderAcc: 0,
     done: false,
   };
 }
@@ -277,6 +285,26 @@ export function equipWeaponBehavior(caster: Fighter, ctx: CombatCtx): void {
   dispatchHandler(rt, ctx, "onEquip");
 }
 
+/**
+ * Attach the LLM-drawn weapon look: a persistent runtime whose
+ * onRenderWeapon handler paints via the draw verbs ~30x/s, with the verbs'
+ * default position anchored to the weapon MOUNT. If a dispatch ever fails
+ * catastrophically the runtime dies and the parametric drawer takes over.
+ */
+export function equipWeaponRender(caster: Fighter, ctx: CombatCtx): void {
+  const program = caster.spec.weapon.renderProgram;
+  if (!program?.handlers.onRenderWeapon) return;
+  const rt = makeRuntime(
+    caster,
+    program,
+    { element: caster.style.element, motif: "burst", glow: caster.style.glow },
+    true,
+  );
+  rt.anchor = () => weaponMountAnchor(caster, ctx.time);
+  caster.weaponRenderRuntime = rt;
+  ctx.behaviors.push(rt);
+}
+
 /** Called from the fixed-step loop: waits, onTick (10 Hz), onLand, expiry. */
 export function tickBehaviors(ctx: CombatCtx, dt: number): void {
   for (const rt of ctx.behaviors) {
@@ -305,6 +333,23 @@ export function tickBehaviors(ctx: CombatCtx, dt: number): void {
     if (rt.tickAccum >= 0.1) {
       rt.tickAccum = 0;
       dispatchHandler(rt, ctx, "onTick");
+    }
+
+    // onRenderWeapon: the LLM-drawn weapon look, ~30Hz with a tight draw
+    // budget. A catastrophic failure kills the runtime → parametric fallback.
+    if (rt.program.handlers.onRenderWeapon) {
+      rt.renderAcc += dt;
+      if (rt.renderAcc >= 1 / 30) {
+        rt.renderAcc = 0;
+        try {
+          beginInvocation(rt);
+          rt.actionBudget = 40; // per-frame draw budget
+          runActions(rt, ctx, rt.program.handlers.onRenderWeapon, 0);
+        } catch (err) {
+          console.warn("[vibearena] weapon renderProgram died (parametric fallback):", err);
+          rt.done = true;
+        }
+      }
     }
 
     // onLand: airborne → grounded edge.
@@ -376,6 +421,7 @@ export function smokeTestBehavior(program: BehaviorProgram): boolean {
     projectileBudget: 0,
     entityBudget: 0,
     persistent: false,
+    renderAcc: 0,
     done: false,
   };
 

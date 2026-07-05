@@ -516,6 +516,7 @@ export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
       },
       element: style.element,
       behavior: vetProgram(spec.weapon.behavior, spec.weapon.name),
+      renderProgram: vetProgram(spec.weapon.renderProgram, `${spec.weapon.name} (render)`),
       vfx: { glow: style.glow, element: style.element, trail: style.trail },
     },
     ability: enrichAbility(slots.attack),

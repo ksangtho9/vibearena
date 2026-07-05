@@ -8,16 +8,19 @@ function HpBar({
   name,
   hp,
   maxHp,
+  guardFrac,
   color,
   side,
 }: {
   name: string;
   hp: number;
   maxHp: number;
+  guardFrac: number;
   color: string;
   side: "left" | "right";
 }) {
   const pct = maxHp > 0 ? (hp / maxHp) * 100 : 0;
+  const broken = guardFrac <= 0.02;
   return (
     <div className={`hp-corner hp-${side}`}>
       <span className="hp-name" style={{ color }}>
@@ -25,6 +28,16 @@ function HpBar({
       </span>
       <div className="hp-track" role="meter" aria-label={`${name} health`} aria-valuenow={hp} aria-valuemin={0} aria-valuemax={maxHp}>
         <div className="hp-fill" style={{ width: `${pct}%` }} />
+      </div>
+      <div
+        className={`guard-track${broken ? " guard-broken" : ""}`}
+        role="meter"
+        aria-label={`${name} guard`}
+        aria-valuenow={Math.round(guardFrac * 100)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      >
+        <div className="guard-fill" style={{ width: `${Math.max(0, guardFrac) * 100}%` }} />
       </div>
     </div>
   );
@@ -79,6 +92,7 @@ export function ArenaScreen() {
           name={spec.name}
           hp={hud?.playerHp ?? 0}
           maxHp={hud?.playerMaxHp ?? 1}
+          guardFrac={hud?.playerGuardFrac ?? 1}
           color={safeCssColor(spec.appearance.color)}
           side="left"
         />
@@ -87,6 +101,7 @@ export function ArenaScreen() {
           name={botSpec.name}
           hp={hud?.botHp ?? 0}
           maxHp={hud?.botMaxHp ?? 1}
+          guardFrac={hud?.botGuardFrac ?? 1}
           color={safeCssColor(botSpec.appearance.color)}
           side="right"
         />
@@ -108,6 +123,7 @@ export function ArenaScreen() {
           {spec.utility && (
             <AbilityHint keyLabel="L" ability={spec.utility} cdFrac={hud?.utilityCdFrac ?? 0} showReady />
           )}
+          <span><kbd>;</kbd> block <span className="hint-sub">(tap = parry)</span></span>
         </div>
       ) : (
         <div className="controls-hint controls-hint-2p">
@@ -120,6 +136,7 @@ export function ArenaScreen() {
             {spec.utility && (
               <AbilityHint keyLabel="H" ability={spec.utility} cdFrac={hud?.utilityCdFrac ?? 0} />
             )}
+            <span><kbd>V</kbd> block</span>
           </div>
           <div className="controls-cluster">
             <span className="cluster-label">P2</span>
@@ -130,6 +147,7 @@ export function ArenaScreen() {
             {botSpec.utility && (
               <AbilityHint keyLabel="'" ability={botSpec.utility} cdFrac={hud?.botUtilityCdFrac ?? 0} />
             )}
+            <span><kbd>⇧R</kbd> block</span>
           </div>
         </div>
       )}

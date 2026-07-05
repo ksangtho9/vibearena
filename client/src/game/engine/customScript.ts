@@ -232,6 +232,7 @@ function runScript(
     projectileBudget: 14,
     entityBudget: 8,
     persistent: false,
+    renderAcc: 0,
     done: false,
   };
 

@@ -78,6 +78,13 @@ The JSON must match this exact shape:
     "customScript": "...",             // OPTIONAL raw-JS variant, runs at the onAttack
                                        // moment (same api as ability customScript;
                                        // api.state persists across swings).
+    "mount": "hand"|"head"|"body"|"floating"|"dual"|"none",  // where it lives: drawn + attacks
+                                       // originate there. "none" = unarmed. Default "hand".
+    "renderProgram": {"handlers":{"onRenderWeapon":[Action]}},
+                                       // OPTIONAL: DRAW the weapon yourself ~30x/s (draw verbs
+                                       // default to the mount; senses "mount.x"/"mount.y"; use
+                                       // ttl ~0.06). ONLY for exotic weapons (eye lasers, energy
+                                       // fists, floating blades) — held weapons just use form+parts.
     "range": number,                   // 1-10, how far it reaches for its type
     "damage": number                   // 1-10
   },
@@ -154,6 +161,11 @@ CUSTOM SCRIPT — for exotic mechanics the DSL above CANNOT express, an ability 
     grows stronger each miss: "const dmg = 12 + (api.state.misses||0)*6; if (api.dealMelee({damage: dmg, range: 60})) { api.state.misses = 0; } else { api.state.misses = (api.state.misses||0)+1; api.text({text:'FURY '+api.state.misses}); }"
     copies the opponent's last move: "const last = api.opponent().lastAbility; if (!last) { api.text({text:'NOTHING TO COPY'}); } else if (last.kind==='projectile') { api.spawnProjectile({damage:14,homing:true}); api.text({text:'COPIED '+last.name}); } else { api.dealAoe({damage:16,radius:90}); api.text({text:'COPIED '+last.name}); }"
 
+  Exotic weapon-look examples (mount + renderProgram; form still sets mechanics):
+    laser eyes: "form":"gun","type":"ranged","mount":"head","renderProgram":{"handlers":{"onRenderWeapon":[{"do":"drawShape","shape":"circle","x":{"op":"+","a":"mount.x","b":4},"y":"mount.y","radius":3,"color":"#ff2d2d","ttl":0.06},{"do":"drawShape","shape":"circle","x":{"op":"-","a":"mount.x","b":4},"y":"mount.y","radius":3,"color":"#ff2d2d","ttl":0.06}]}}
+    floating soul blades: "form":"sword","mount":"floating","renderProgram":{"handlers":{"onRenderWeapon":[{"do":"drawLine","x":"mount.x","y":{"op":"-","a":"mount.y","b":14},"x2":"mount.x","y2":{"op":"+","a":"mount.y","b":14},"color":"#9be8ff","width":4,"ttl":0.07},{"do":"spawnParticles","count":1,"x":"mount.x","y":"mount.y","color":"#9be8ff","speed":20,"lifetime":0.3}]}}
+    glowing fists: "form":"claw","mount":"none","renderProgram":{"handlers":{"onRenderWeapon":[{"do":"drawShape","shape":"circle","x":"mount.x","y":"mount.y","radius":7,"color":"#ffd75e","ttl":0.06}]}}
+
   Weapon-behavior examples:
     shockwave hammer: "behavior": {"handlers":{"onAttack":[{"do":"dealAoe","damage":8,"radius":90,"knockback":1.5},{"do":"draw","shape":"circle","radius":90,"ttl":0.3},{"do":"particles","count":6}]}}
     every-third-hit-teleport katana: "behavior": {"state":{"hits":0},"handlers":{"onHitTarget":[{"do":"set","var":"hits","to":{"op":"+","a":"state.hits","b":1}},{"do":"if","cond":{"lhs":"state.hits","op":">=","rhs":3},"then":[{"do":"set","var":"hits","to":0},{"do":"teleport","behindOpponent":true},{"do":"particles","count":8}]}]}}
@@ -174,6 +186,8 @@ CUSTOM SCRIPT — for exotic mechanics the DSL above CANNOT express, an ability 
     "strength": number,                // the fighter's shape, not raw power
     "defense": number
   },
+  "blockPower": number,                // optional 0-10: guard meter size (shield fighters block more)
+  "parrySkill": number,                // optional 0-10: parry timing window — tune LIGHTLY to concept
   "flavor": string                     // one dry, memorable sentence about the fighter
 }
 

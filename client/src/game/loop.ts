@@ -26,8 +26,9 @@ import {
 import { createKeyboard, emptyInput, INPUT_BINDINGS } from "./input";
 import { createBotBrain, type BotBrain } from "./bot";
 import { createTheme, type ThemeView } from "./arena/themes";
-import { drawMotifEffect, drawProjectile } from "./effectsRender";
-import { equipWeaponBehavior, tickBehaviors } from "./engine/interpreter";
+import { drawEffect, drawProjectile } from "./effectsRender";
+import { equipWeaponBehavior, equipWeaponRender, tickBehaviors } from "./engine/interpreter";
+import { ALLOW_CUSTOM_SCRIPT } from "./engine/customScript";
 import { renderEntities, tickEntities } from "./engine/api";
 
 /**
@@ -49,6 +50,9 @@ export interface HudState {
   /** Right-side fighter's cooldowns (shown for P2 in hotseat). */
   botAbilityCdFrac: number;
   botUtilityCdFrac: number;
+  /** Guard meters, 0–1 (block system). */
+  playerGuardFrac: number;
+  botGuardFrac: number;
 }
 
 export interface GameCallbacks {
@@ -112,6 +116,12 @@ export function startGame(
   // Weapon behaviors are match-long passives: attach + fire onEquip now.
   equipWeaponBehavior(player, combat);
   equipWeaponBehavior(bot, combat);
+  // LLM-drawn weapon looks (parametric drawer is the fallback). The kill
+  // switch for model-authored content also parks these.
+  if (ALLOW_CUSTOM_SCRIPT) {
+    equipWeaponRender(player, combat);
+    equipWeaponRender(bot, combat);
+  }
 
   // Input routing: in hotseat, the right-side fighter is PLAYER 2's key
   // cluster instead of the bot FSM. Same InputState shape either way.
@@ -264,100 +274,7 @@ export function startGame(
   }
 
   function drawEffects(): void {
-    for (const e of combat.effects) {
-      if (e.kind === "motif") {
-        drawMotifEffect(ctx2d, e, time);
-        continue;
-      }
-      const life = e.ttl / e.maxTtl; // 1 → 0
-      ctx2d.save();
-      ctx2d.globalAlpha = Math.max(0, life) * 0.9;
-      ctx2d.strokeStyle = e.color;
-      ctx2d.fillStyle = e.color;
-      if (e.kind === "ring") {
-        const age = e.maxTtl - e.ttl;
-        // expand (px/s) lets behaviors design their own ring motion.
-        const r =
-          e.expand !== undefined
-            ? Math.max(1, (e.radius ?? 20) + e.expand * age)
-            : (e.radius ?? 20) * (1.6 - life * 0.6);
-        ctx2d.lineWidth = e.width ?? 3;
-        ctx2d.shadowColor = e.color;
-        ctx2d.shadowBlur = 10;
-        ctx2d.beginPath();
-        ctx2d.arc(e.x, e.y, r, 0, Math.PI * 2);
-        ctx2d.stroke();
-      } else if (e.kind === "particle") {
-        // Behavior-authored free-flying particle.
-        const size = (e.size ?? 4) * (0.4 + life * 0.6);
-        ctx2d.shadowColor = e.color;
-        ctx2d.shadowBlur = 7;
-        if (e.particleShape === "square") {
-          ctx2d.fillRect(e.x - size / 2, e.y - size / 2, size, size);
-        } else if (e.particleShape === "spark") {
-          const v = Math.hypot(e.vx ?? 0, e.vy ?? 1) || 1;
-          ctx2d.lineWidth = Math.max(1, size * 0.4);
-          ctx2d.beginPath();
-          ctx2d.moveTo(e.x, e.y);
-          ctx2d.lineTo(e.x - ((e.vx ?? 0) / v) * size * 2, e.y - ((e.vy ?? 0) / v) * size * 2);
-          ctx2d.stroke();
-        } else if (e.particleShape === "star") {
-          ctx2d.beginPath();
-          for (let k = 0; k < 8; k++) {
-            const a = (k / 8) * Math.PI * 2;
-            const rr = k % 2 === 0 ? size : size * 0.4;
-            ctx2d[k === 0 ? "moveTo" : "lineTo"](e.x + Math.cos(a) * rr, e.y + Math.sin(a) * rr);
-          }
-          ctx2d.closePath();
-          ctx2d.fill();
-        } else {
-          ctx2d.beginPath();
-          ctx2d.arc(e.x, e.y, size, 0, Math.PI * 2);
-          ctx2d.fill();
-        }
-      } else if (e.kind === "shape") {
-        // Behavior-engine draw verb: bare glowing strokes.
-        ctx2d.lineWidth = e.width ?? 2.5;
-        ctx2d.shadowColor = e.color;
-        ctx2d.shadowBlur = 9;
-        ctx2d.beginPath();
-        if (e.shape === "line") {
-          ctx2d.moveTo(e.x, e.y);
-          ctx2d.lineTo(e.x2 ?? e.x, e.y2 ?? e.y);
-        } else if (e.shape === "arc") {
-          ctx2d.arc(e.x, e.y, e.radius ?? 20, e.a0 ?? 0, e.a1 ?? Math.PI);
-        } else {
-          ctx2d.arc(e.x, e.y, e.radius ?? 20, 0, Math.PI * 2);
-        }
-        ctx2d.stroke();
-      } else if (e.kind === "spark") {
-        ctx2d.lineWidth = 2.5;
-        ctx2d.shadowColor = e.color;
-        ctx2d.shadowBlur = 8;
-        const r = e.radius ?? 12;
-        for (let i = 0; i < 5; i++) {
-          const a = (i / 5) * Math.PI * 2 + e.maxTtl;
-          ctx2d.beginPath();
-          ctx2d.moveTo(e.x + Math.cos(a) * r * 0.4, e.y + Math.sin(a) * r * 0.4);
-          ctx2d.lineTo(
-            e.x + Math.cos(a) * r * (1.5 - life),
-            e.y + Math.sin(a) * r * (1.5 - life),
-          );
-          ctx2d.stroke();
-        }
-      } else {
-        const big = e.text === "FIGHT!" || e.text === "K.O." || e.text === "FLATTENED";
-        ctx2d.font = big
-          ? "48px Anton, Impact, sans-serif"
-          : "20px Anton, Impact, sans-serif";
-        ctx2d.textAlign = "center";
-        ctx2d.shadowColor = "rgba(0, 0, 0, 0.45)";
-        ctx2d.shadowBlur = 6;
-        ctx2d.shadowOffsetY = 2;
-        ctx2d.fillText(e.text ?? "", e.x, e.y - (1 - life) * 26);
-      }
-      ctx2d.restore();
-    }
+    for (const e of combat.effects) drawEffect(ctx2d, e, time);
   }
 
   function render(): void {
@@ -457,6 +374,8 @@ export function startGame(
         utilityCdFrac: cdFrac(player.utilityCooldown, player.spec.utility?.cooldown),
         botAbilityCdFrac: cdFrac(bot.abilityCooldown, bot.spec.ability.cooldown),
         botUtilityCdFrac: cdFrac(bot.utilityCooldown, bot.spec.utility?.cooldown),
+        playerGuardFrac: player.guardMax > 0 ? player.guard / player.guardMax : 1,
+        botGuardFrac: bot.guardMax > 0 ? bot.guard / bot.guardMax : 1,
       });
     }
   }

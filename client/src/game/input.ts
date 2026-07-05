@@ -18,6 +18,8 @@ export interface InputState {
   ability: boolean;
   /** UTILITY ability (dash / shield / heal / buff). */
   utility: boolean;
+  /** Hold to BLOCK; a well-timed tap just before a hit lands = PARRY. */
+  block: boolean;
 }
 
 export const emptyInput = (): InputState => ({
@@ -28,6 +30,7 @@ export const emptyInput = (): InputState => ({
   attack: false,
   ability: false,
   utility: false,
+  block: false,
 });
 
 /** KeyboardEvent.code values per action. */
@@ -39,6 +42,7 @@ export interface Bindings {
   attack: string[];
   ability: string[];
   utility: string[];
+  block: string[];
 }
 
 export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
@@ -50,6 +54,7 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     attack: ["KeyJ"],
     ability: ["KeyK"],
     utility: ["KeyL"],
+    block: ["Semicolon"], // completes the J/K/L home row
   },
   p1: {
     left: ["KeyA"],
@@ -59,6 +64,7 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     attack: ["KeyF"],
     ability: ["KeyG"],
     utility: ["KeyH"],
+    block: ["KeyV"],
   },
   p2: {
     left: ["ArrowLeft"],
@@ -67,7 +73,8 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     down: ["ArrowDown"],
     attack: ["Period"],
     ability: ["Slash"],
-    utility: ["ShiftRight", "Quote"],
+    utility: ["Quote"],
+    block: ["ShiftRight"],
   },
 };
 
