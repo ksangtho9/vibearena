@@ -1,4 +1,6 @@
+import { useEffect } from "react";
 import { useVibeStore } from "../store";
+import { playSfx } from "../audio/sfx";
 
 /**
  * Win/lose card. Rematch keeps your fighter; new prompt wipes the board.
@@ -12,6 +14,11 @@ export function ResultScreen() {
   const newPrompt = useVibeStore((s) => s.newPrompt);
 
   const won = result === "player";
+
+  useEffect(() => {
+    // In hotseat, somebody in the room won — play the fanfare either way.
+    playSfx(won || mode === "2p" ? "win" : "lose");
+  }, [won, mode]);
   const hotseat = mode === "2p";
   const winnerName = (won ? spec?.name : botSpec?.name) ?? "The winner";
   const loserName = (won ? botSpec?.name : spec?.name) ?? "the loser";

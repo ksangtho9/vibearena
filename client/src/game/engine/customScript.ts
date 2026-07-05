@@ -349,7 +349,7 @@ const SCRIPT_VERBS = [
   "dealAoe", "dealMelee", "heal", "shield", "applyStatus", "knockback",
   "pull", "lifesteal",
   "draw", "drawShape", "drawLine", "drawArc", "drawRing", "spawnParticles",
-  "particles", "text", "spawnText", "screenShake", "flash", "myEntities",
+  "particles", "text", "spawnText", "screenShake", "flash", "playSound", "myEntities",
 ];
 
 /** Worker-less fallback (node tests): one guarded run, no hang protection. */

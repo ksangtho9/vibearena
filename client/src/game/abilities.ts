@@ -1,6 +1,7 @@
 import Matter from "matter-js";
 import { castBehavior } from "./engine/interpreter";
 import { runCustomScript } from "./engine/customScript";
+import { playSfx } from "../audio/sfx";
 import type { AbilityMotif, AbilityParams, AbilitySpec, ElementKind } from "../types/character";
 import type { Fighter } from "./stickman";
 import { CAST_TIME } from "./animation";
@@ -72,6 +73,10 @@ export function useAbility(
   const p = rt.params;
   user.castTimer = CAST_TIME; // cast pose for the animator
   user.lastAbility = { name: ability.name, kind: ability.kind }; // scripts sense this
+
+  // Default cast audio from element + kind; behaviors can layer their own
+  // via the playSound verb.
+  playSfx(ability.kind === "heal" ? "heal" : "cast", { element: rt.element });
 
   // Dispatch order: customScript (raw-JS escape hatch) → interpreted
   // behavior → legacy kind. Each tier falls through on failure/absence.

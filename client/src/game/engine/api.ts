@@ -7,6 +7,7 @@ import { createBotBrain, type BotBrain } from "../bot";
 import type { CombatCtx } from "../combat";
 import { dealDamage, pushEffect, rawDamage, spawnProjectile } from "../combat";
 import { attackTimingOf } from "../animation";
+import { playSfx, SFX_KINDS, type SfxKind } from "../../audio/sfx";
 import { ARENA_HEIGHT, ARENA_WIDTH } from "../arena";
 import { mix, withAlpha } from "../../render/color";
 import {
@@ -89,6 +90,9 @@ export interface EngineEntity {
 
 const foeOf = (side: Fighter["side"], ctx: CombatCtx): Fighter =>
   side === "player" ? ctx.fighters.bot : ctx.fighters.player;
+
+/** playSound verb: per-fighter retrigger throttle (anti audio spam). */
+const lastVerbSound = new WeakMap<Fighter, number>();
 
 /** Verbs may return a value (dealAoe/dealMelee report whether they hit). */
 export type EngineApi = Record<string, (a: Record<string, unknown>) => unknown>;
@@ -504,6 +508,23 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       ctx.flashColor = colorOf(a.color, "#ffffff");
       ctx.flashMax = dur(a.duration, 0.15, 0.4);
       ctx.flashTimer = ctx.flashMax;
+    },
+    /** playSound {kind, pitch?, volume?, element?} — procedural SFX. Per-
+     * fighter throttled so behaviors can't machine-gun the mixer (the sfx
+     * engine adds its own voice cap + per-kind throttle on top). */
+    playSound(a) {
+      const now = performance.now();
+      if (now - (lastVerbSound.get(caster) ?? -1e9) < 90) return;
+      lastVerbSound.set(caster, now);
+      const kind =
+        typeof a.kind === "string" && (SFX_KINDS as string[]).includes(a.kind)
+          ? (a.kind as SfxKind)
+          : "cast";
+      playSfx(kind, {
+        pitch: N(a.pitch, 1, 0.5, 2),
+        volume: N(a.volume, 1, 0, 1),
+        element: element(a.element),
+      });
     },
     /** spawnText {text, x?, y?, color?} — floating words ("BONK!"). */
     spawnText(a) {

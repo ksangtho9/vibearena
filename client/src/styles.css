@@ -571,3 +571,34 @@ body {
     transition: none;
   }
 }
+
+/* --- Sound ------------------------------------------------------------- */
+
+.btn-mute {
+  font-size: 15px;
+  line-height: 1;
+  background: none;
+  border: 1px solid rgba(155, 166, 158, 0.5);
+  border-radius: 999px;
+  padding: 5px 7px;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 0.15s, border-color 0.15s;
+}
+
+.btn-mute:hover {
+  opacity: 1;
+  border-color: var(--chalk);
+}
+
+.corner-controls {
+  align-self: flex-end;
+  margin-bottom: -10px;
+}
+
+.vs-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}

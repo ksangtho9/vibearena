@@ -3,6 +3,7 @@ import type { CharacterSpec } from "../types/character";
 import { resolveStyle, type ResolvedOutfit, type ResolvedStyle } from "../generation/enrich";
 import type { BehaviorRuntime } from "./engine/interpreter";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
+import { playSfx } from "../audio/sfx";
 import {
   drawWeapon as drawParametricWeapon,
   weaponIsFloating,
@@ -357,6 +358,7 @@ function limbBody(
 export function collapse(fighter: Fighter, world: Matter.World): void {
   if (!fighter.alive) return;
   fighter.alive = false;
+  playSfx("ko");
 
   const sk = fighter.skeleton;
   const s = fighter.scale;

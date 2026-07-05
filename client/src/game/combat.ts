@@ -15,6 +15,7 @@ import { collapse, weaponMountAnchor, type Fighter, type Side } from "./stickman
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
 import { attackTimingOf } from "./animation";
+import { playSfx } from "../audio/sfx";
 
 /**
  * Damage, knockback, HP and projectiles. Weapons have NO physics bodies:
@@ -235,6 +236,7 @@ export function dealDamage(
   if (frontal && target.parryTimer > 0 && target.introTimer <= 0) {
     target.parryTimer = 0; // consumed
     const { x, y } = target.root.position;
+    playSfx("parry");
     pushEffect(ctx, { kind: "text", x, y: y - 84, ttl: 0.8, color: "#ffe95e", text: "PARRY!" });
     pushEffect(ctx, { kind: "spark", x: x + target.facing * 18, y: y - 22, ttl: 0.3, color: "#ffe95e", radius: 18 });
     pushEffect(ctx, { kind: "ring", x: x + target.facing * 18, y: y - 22, ttl: 0.25, color: "#ffffff", radius: 22 });
@@ -256,6 +258,7 @@ export function dealDamage(
     const { x, y } = target.root.position;
     if (target.guard > 0) {
       // Held: spark + a nudge of pushback, zero damage (no chip).
+      playSfx("block");
       pushEffect(ctx, { kind: "spark", x: x + target.facing * 16, y: y - 20, ttl: 0.2, color: "#c9ced9", radius: 12 });
       Matter.Body.setVelocity(target.root, {
         x: dir * 3,
@@ -271,6 +274,7 @@ export function dealDamage(
     target.attackAnim = 0;
     target.attackWindow = 0;
     target.guardRegenDelay = 0.35; // then ~2s to refill
+    playSfx("guardBreak");
     pushEffect(ctx, { kind: "text", x, y: y - 92, ttl: 1, color: "#e0483e", text: "GUARD BREAK" });
     pushEffect(ctx, { kind: "ring", x, y: y - 20, ttl: 0.4, color: "#e0483e", radius: 34 });
     for (let i = 0; i < 5; i++) {
@@ -315,6 +319,10 @@ export function dealDamage(
   target.hp = Math.max(0, target.hp - dmg);
 
   const { x, y } = target.root.position;
+  playSfx(dmg >= 18 ? "hitHeavy" : "hit", {
+    element: opts.attacker?.style.element,
+    pitch: 1.15 - Math.min(0.4, dmg * 0.012),
+  });
   pushEffect(ctx, { kind: "text", x, y: y - 70, ttl: 0.7, color: "#e8b33c", text: `${dmg}` });
   pushEffect(ctx, { kind: "spark", x, y: y - 20, ttl: 0.25, color: target.color, radius: 14 });
 
@@ -444,6 +452,7 @@ export function spawnProjectile(
     onHit: opts.onHit,
     boomerang: opts.boomerang,
   });
+  playSfx("projectile", { pitch: 1.4 - opts.radius * 0.06, volume: 0.7 });
 }
 
 function startAttack(f: Fighter): void {
@@ -500,6 +509,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   // mean no extra — the plain hit below is untouched.
   if (elapsed >= timing.windup && !f.weaponAttackFired) {
     f.weaponAttackFired = true;
+    if (!isMissile(f)) playSfx("swing", { pitch: 0.85 + Math.random() * 0.3, volume: 0.8 });
     if (f.spec.weapon.customScript) runWeaponScript(f, ctx);
     if (f.weaponRuntime) dispatchHandler(f.weaponRuntime, ctx, "onAttack");
   }
@@ -816,6 +826,7 @@ export function updateFighter(
         f.dropThrough = 0.25;
       } else {
         Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
+        playSfx("jump", { volume: 0.45 });
       }
       f.jumpCooldown = 0.3;
     }

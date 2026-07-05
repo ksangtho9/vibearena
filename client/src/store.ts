@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { CharacterSpec } from "./types/character";
 import { generateCharacter } from "./generation/groqAdapter";
+import { playSfx } from "./audio/sfx";
 import { enrichCharacter } from "./generation/enrich";
 import { balanceCharacter } from "./balance/statBudget";
 import { pickBotSpec } from "./game/bot";
@@ -69,6 +70,7 @@ export const useVibeStore = create<VibeStore>((set, get) => ({
     set({ phase: "generating", prompt });
     const { spec, fallback, mocked } = await generateCharacter(prompt);
     const note: GenerationNote = fallback ? "fallback" : mocked ? "mocked" : "";
+    playSfx("generate");
     if (get().promptFor === 2) set({ spec2: spec, note, phase: "preview" });
     else set({ spec, note, phase: "preview" });
   },

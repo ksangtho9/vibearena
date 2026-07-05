@@ -1,4 +1,5 @@
 import { useVibeStore } from "../store";
+import { MuteButton } from "./MuteButton";
 
 /**
  * First screen: pick the fight. One human vs the house bot, or two humans
@@ -9,6 +10,9 @@ export function ModeScreen() {
 
   return (
     <main className="screen mode-screen">
+      <div className="corner-controls">
+        <MuteButton />
+      </div>
       <p className="eyebrow">TONIGHT, ON THE BOARD</p>
       <h1 className="poster-title">
         VIBE<span className="title-mark">✕</span>ARENA

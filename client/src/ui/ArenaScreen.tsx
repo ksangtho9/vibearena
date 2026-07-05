@@ -3,6 +3,7 @@ import { useVibeStore } from "../store";
 import { startGame } from "../game/loop";
 import { ARENA_HEIGHT, ARENA_WIDTH } from "../game/arena";
 import { safeCssColor } from "../game/stickman";
+import { MuteButton } from "./MuteButton";
 
 function HpBar({
   name,
@@ -96,7 +97,10 @@ export function ArenaScreen() {
           color={safeCssColor(spec.appearance.color)}
           side="left"
         />
-        <span className="vs-mark">VS</span>
+        <div className="vs-stack">
+          <span className="vs-mark">VS</span>
+          <MuteButton />
+        </div>
         <HpBar
           name={botSpec.name}
           hp={hud?.botHp ?? 0}

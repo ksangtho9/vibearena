@@ -1,16 +1,32 @@
+import { buildSystemPrompt, type PromptTier } from "../../client/src/generation/prompt";
+
 /**
- * Groq chat-completions provider with MODEL ROTATION. Groq free-tier rate
- * limits are per-model (each model has its own tokens/min bucket), so on a
- * 429 we simply try the next model in the pool instead of giving up —
- * multiplying effective throughput. Returns the model's raw JSON string;
- * parsing and validation happen on the client against the zod schema.
+ * Groq chat-completions provider with MODEL ROTATION and MODEL-AWARE
+ * PROMPTS. Groq free-tier rate limits are per-model (each model has its own
+ * tokens/min bucket), so on a 429 we simply try the next model in the pool
+ * instead of giving up — multiplying effective throughput. Each model gets
+ * the system-prompt tier its token window can afford (see promptTierFor).
+ * Returns the model's raw JSON string; parsing and validation happen on the
+ * client against the zod schema.
  */
 
-// NOTE: llama-3.1-8b-instant is deliberately absent — its 6k-token/min
-// window is smaller than one behavior-era request (~7k tokens), so it 413s
-// every call. llama-4-scout has a 30k window and makes a real last resort.
+// llama-3.1-8b-instant (6k window) is back as the final fallback: the LEAN
+// prompt (~2.8k + 2.2k completion ≈ 5k) fits where the old prompt 413'd.
 const DEFAULT_MODELS =
-  "llama-3.3-70b-versatile,openai/gpt-oss-120b,openai/gpt-oss-20b,meta-llama/llama-4-scout-17b-16e-instruct";
+  "llama-3.3-70b-versatile,openai/gpt-oss-120b,openai/gpt-oss-20b,meta-llama/llama-4-scout-17b-16e-instruct,llama-3.1-8b-instant";
+
+/**
+ * Which models can afford the FULL prompt (~6k tokens + 2.2k completion).
+ * The binding limit on the free tier is the per-minute token window, checked
+ * live (v3.5): llama-3.3-70b ≈ 12k, llama-4-scout ≈ 30k — both fit `full`;
+ * gpt-oss models ≈ 8k — they get `lean` (~2.8k + completion ≈ 5k, real
+ * headroom). Unknown models default to `lean`: never 413 a stranger.
+ */
+const FULL_PROMPT_MODELS = ["llama-3.3-70b", "llama-4-scout"];
+
+export function promptTierFor(model: string): PromptTier {
+  return FULL_PROMPT_MODELS.some((m) => model.includes(m)) ? "full" : "lean";
+}
 
 /** How long a rate-limited/5xx model sits out before we re-try its bucket. */
 const COOLDOWN_MS = 60_000;
@@ -46,7 +62,7 @@ export class AllModelsBusyError extends Error {
   }
 }
 
-export async function generateWithGroq(system: string, userPrompt: string): Promise<string> {
+export async function generateWithGroq(_system: string, userPrompt: string): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error("GROQ_API_KEY is not set");
 
@@ -59,6 +75,11 @@ export async function generateWithGroq(system: string, userPrompt: string): Prom
       sawRateLimit = true;
       continue;
     }
+
+    // Model-aware prompt: rich reference for big windows, trimmed core for
+    // small ones (keeps gpt-oss in the rotation instead of 413ing).
+    const tier = promptTierFor(model);
+    const system = buildSystemPrompt(tier);
 
     try {
       const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -103,7 +124,7 @@ export async function generateWithGroq(system: string, userPrompt: string): Prom
         lastError = new Error(`Groq returned an empty completion on ${model}`);
         continue;
       }
-      console.log(`[vibearena] groq answered via ${model}`);
+      console.log(`[vibearena] groq answered via ${model} (${tier} prompt)`);
       return content;
     } catch (err) {
       // Network-level failure: transient, no cooldown, next model.
