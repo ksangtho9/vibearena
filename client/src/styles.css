@@ -333,6 +333,15 @@ body {
   margin-left: 6px;
 }
 
+.weapon-props {
+  display: block;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  color: var(--gold);
+  margin-top: 2px;
+}
+
 .stats {
   display: flex;
   flex-direction: column;

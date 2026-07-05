@@ -14,7 +14,10 @@ export interface InputState {
   /** Held with jump while standing on a platform: drop through it. */
   down: boolean;
   attack: boolean;
+  /** ATTACK ability (aoe / projectile). */
   ability: boolean;
+  /** UTILITY ability (dash / shield / heal / buff). */
+  utility: boolean;
 }
 
 export const emptyInput = (): InputState => ({
@@ -24,6 +27,7 @@ export const emptyInput = (): InputState => ({
   down: false,
   attack: false,
   ability: false,
+  utility: false,
 });
 
 /** KeyboardEvent.code values per action. */
@@ -34,6 +38,7 @@ export interface Bindings {
   down: string[];
   attack: string[];
   ability: string[];
+  utility: string[];
 }
 
 export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
@@ -44,6 +49,7 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     down: ["KeyS", "ArrowDown"],
     attack: ["KeyJ"],
     ability: ["KeyK"],
+    utility: ["KeyL"],
   },
   p1: {
     left: ["KeyA"],
@@ -52,6 +58,7 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     down: ["KeyS"],
     attack: ["KeyF"],
     ability: ["KeyG"],
+    utility: ["KeyH"],
   },
   p2: {
     left: ["ArrowLeft"],
@@ -60,6 +67,7 @@ export const INPUT_BINDINGS: { solo: Bindings; p1: Bindings; p2: Bindings } = {
     down: ["ArrowDown"],
     attack: ["Period"],
     ability: ["Slash"],
+    utility: ["ShiftRight", "Quote"],
   },
 };
 
@@ -71,6 +79,7 @@ const PREVENT_DEFAULT = new Set([
   "ArrowUp",
   "ArrowDown",
   "Slash",
+  "Quote",
 ]);
 
 export interface Keyboard {

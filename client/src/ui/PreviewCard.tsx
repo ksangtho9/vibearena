@@ -10,6 +10,19 @@ const STAT_LABELS = [
   ["defense", "Defense"],
 ] as const;
 
+const PROPERTY_LABELS: Record<string, string> = {
+  bleed: "Bleed",
+  knockback: "Knockback",
+  lifesteal: "Lifesteal",
+  armorPierce: "Piercing",
+  reach: "Long Reach",
+  attackSpeed: "Fast",
+  crit: "Deadly Crits",
+  stagger: "Staggering",
+  cleave: "Cleave",
+  elementalDot: "Elemental Burn",
+};
+
 const NOTE_TEXT = {
   mocked:
     "The house generator drew this one — no API key on the server, or the LLM was busy (rate limit). Re-roll to try the real LLM again.",
@@ -63,14 +76,29 @@ export function PreviewCard() {
               <dt>Weapon</dt>
               <dd>
                 {spec.weapon.name} <span className="gear-meta">{spec.weapon.type} · dmg {spec.weapon.damage} · reach {spec.weapon.range}</span>
+                {(spec.weapon.properties?.length ?? 0) > 0 && (
+                  <span className="weapon-props">
+                    {spec.weapon.properties!
+                      .map((p) => PROPERTY_LABELS[p.kind] ?? p.kind)
+                      .join(" · ")}
+                  </span>
+                )}
               </dd>
             </div>
             <div>
-              <dt>Ability</dt>
+              <dt>Attack Ability</dt>
               <dd>
                 {spec.ability.name} <span className="gear-meta">{spec.ability.kind} · power {spec.ability.power} · {spec.ability.cooldown}s cooldown</span>
               </dd>
             </div>
+            {spec.utility && (
+              <div>
+                <dt>Utility</dt>
+                <dd>
+                  {spec.utility.name} <span className="gear-meta">{spec.utility.kind} · power {spec.utility.power} · {spec.utility.cooldown}s cooldown</span>
+                </dd>
+              </div>
+            )}
             {spec.appearance.accessories.length > 0 && (
               <div>
                 <dt>Carrying</dt>

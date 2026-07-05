@@ -1,5 +1,5 @@
-import type { Effect } from "./combat";
-import { withAlpha } from "../render/color";
+import type { Effect, Projectile } from "./combat";
+import { mix, shade, withAlpha } from "../render/color";
 
 /**
  * Ability VFX: renders "motif" effects — the MOTIF picks the shape (nova,
@@ -275,5 +275,356 @@ export function drawMotifEffect(
   }
 
   elementGarnish(ctx, e, R * 0.8, life, time);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Projectile rendering: the LOOK comes from the source (visual only — the
+// hitbox is still the physics body). Arrows fly point-first, bullets streak,
+// thrown weapons spin, ability bolts wear their element.
+// ---------------------------------------------------------------------------
+
+/** Ghosted afterimages along the flight path. */
+function motionTrail(
+  ctx: CanvasRenderingContext2D,
+  p: Projectile,
+  length: number,
+  width: number,
+  alpha: number,
+): void {
+  const { x, y } = p.body.position;
+  const v = p.body.velocity;
+  ctx.strokeStyle = withAlpha(p.glow, alpha);
+  ctx.lineWidth = width;
+  ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(x, y);
+  ctx.lineTo(x - v.x * length, y - v.y * length);
+  ctx.stroke();
+}
+
+export function drawProjectile(
+  ctx: CanvasRenderingContext2D,
+  p: Projectile,
+  time: number,
+): void {
+  const { x, y } = p.body.position;
+  const v = p.body.velocity;
+  const angle = Math.atan2(v.y, v.x);
+  const age = p.maxTtl - p.ttl;
+
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter";
+
+  switch (p.visual) {
+    case "arrow": {
+      motionTrail(ctx, p, 1.6, 2.5, 0.3);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(angle);
+      // Shaft.
+      ctx.strokeStyle = mix("#7a5a3c", p.color, 0.3);
+      ctx.lineWidth = 2.2;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(-11, 0);
+      ctx.lineTo(7, 0);
+      ctx.stroke();
+      // Head.
+      ctx.fillStyle = "#ccd3de";
+      ctx.beginPath();
+      ctx.moveTo(12, 0);
+      ctx.lineTo(6, -3);
+      ctx.lineTo(6, 3);
+      ctx.closePath();
+      ctx.fill();
+      // Fletching.
+      ctx.strokeStyle = p.glow;
+      ctx.lineWidth = 1.8;
+      ctx.beginPath();
+      ctx.moveTo(-11, 0);
+      ctx.lineTo(-15, -3.5);
+      ctx.moveTo(-8, 0);
+      ctx.lineTo(-12, -3.5);
+      ctx.moveTo(-11, 0);
+      ctx.lineTo(-15, 3.5);
+      ctx.moveTo(-8, 0);
+      ctx.lineTo(-12, 3.5);
+      ctx.stroke();
+      ctx.restore();
+      break;
+    }
+
+    case "bullet": {
+      // Long hot tracer + tiny slug.
+      motionTrail(ctx, p, 3.6, 3, 0.45);
+      motionTrail(ctx, p, 1.4, 1.4, 0.8);
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(angle);
+      ctx.shadowColor = p.glow;
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = mix("#ffe9b0", p.glow, 0.4);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 4, 1.8, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      break;
+    }
+
+    case "thrown": {
+      motionTrail(ctx, p, 1.2, 2.5, 0.25);
+      ctx.globalCompositeOperation = "source-over";
+      ctx.save();
+      ctx.translate(x, y);
+      const spin = age * (p.form === "chakram" ? 20 : 12) * Math.sign(v.x || 1);
+      switch (p.form) {
+        case "dagger": {
+          ctx.rotate(spin);
+          ctx.fillStyle = "#ccd3de";
+          ctx.beginPath();
+          ctx.moveTo(9, 0);
+          ctx.lineTo(1, -2.6);
+          ctx.lineTo(-3, -1.6);
+          ctx.lineTo(-3, 1.6);
+          ctx.lineTo(1, 2.6);
+          ctx.closePath();
+          ctx.fill();
+          ctx.strokeStyle = shade(p.color, 0.6);
+          ctx.lineWidth = 2.2;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(-3, 0);
+          ctx.lineTo(-8, 0);
+          ctx.stroke();
+          break;
+        }
+        case "chakram": {
+          ctx.rotate(spin);
+          ctx.shadowColor = p.glow;
+          ctx.shadowBlur = 8;
+          ctx.strokeStyle = mix("#ccd3de", p.glow, 0.3);
+          ctx.lineWidth = 3.2;
+          ctx.beginPath();
+          ctx.arc(0, 0, 7, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.shadowBlur = 0;
+          ctx.lineWidth = 1.4;
+          ctx.beginPath();
+          ctx.moveTo(-7, 0);
+          ctx.lineTo(7, 0);
+          ctx.moveTo(0, -7);
+          ctx.lineTo(0, 7);
+          ctx.stroke();
+          break;
+        }
+        case "axe": {
+          ctx.rotate(spin);
+          ctx.strokeStyle = mix("#7a5a3c", p.color, 0.3);
+          ctx.lineWidth = 2.4;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(-8, 0);
+          ctx.lineTo(5, 0);
+          ctx.stroke();
+          ctx.fillStyle = "#ccd3de";
+          ctx.beginPath();
+          ctx.moveTo(4, -2);
+          ctx.quadraticCurveTo(8, -8, 12, -6);
+          ctx.quadraticCurveTo(10, -1, 10, 2);
+          ctx.closePath();
+          ctx.fill();
+          break;
+        }
+        case "spear": {
+          ctx.rotate(angle); // javelins fly point-first, no spin
+          ctx.strokeStyle = mix("#7a5a3c", p.color, 0.3);
+          ctx.lineWidth = 2.6;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(-13, 0);
+          ctx.lineTo(8, 0);
+          ctx.stroke();
+          ctx.fillStyle = "#ccd3de";
+          ctx.beginPath();
+          ctx.moveTo(14, 0);
+          ctx.lineTo(7, -3);
+          ctx.lineTo(7, 3);
+          ctx.closePath();
+          ctx.fill();
+          break;
+        }
+        case "hammer": {
+          ctx.rotate(spin);
+          ctx.strokeStyle = mix("#7a5a3c", p.color, 0.3);
+          ctx.lineWidth = 2.4;
+          ctx.lineCap = "round";
+          ctx.beginPath();
+          ctx.moveTo(-8, 0);
+          ctx.lineTo(4, 0);
+          ctx.stroke();
+          ctx.fillStyle = "#ccd3de";
+          ctx.beginPath();
+          ctx.roundRect(3, -5.5, 6, 11, 1.5);
+          ctx.fill();
+          break;
+        }
+        case "orb": {
+          ctx.shadowColor = p.glow;
+          ctx.shadowBlur = 12;
+          ctx.fillStyle = mix(p.glow, "#ffffff", 0.25);
+          ctx.beginPath();
+          ctx.arc(0, 0, 6, 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+        default: {
+          // bomb & friends: round body, cap, flickering fuse spark.
+          const wob = Math.sin(age * 10) * 0.3;
+          ctx.rotate(wob);
+          ctx.fillStyle = mix("#3a3f4a", p.color, 0.35);
+          ctx.beginPath();
+          ctx.arc(0, 0, 6.5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = withAlpha("#ffffff", 0.35);
+          ctx.beginPath();
+          ctx.arc(-2, -2, 1.8, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = p.color;
+          ctx.fillRect(-1.6, -9, 3.2, 3);
+          const spark = 0.6 + 0.4 * Math.sin(time * 14);
+          ctx.shadowColor = p.glow;
+          ctx.shadowBlur = 8;
+          ctx.fillStyle = withAlpha(p.glow, spark);
+          ctx.beginPath();
+          ctx.arc(0, -11, 1.6 * spark + 0.8, 0, Math.PI * 2);
+          ctx.fill();
+          break;
+        }
+      }
+      ctx.restore();
+      break;
+    }
+
+    case "bolt":
+    default: {
+      const el = p.element ?? "none";
+      ctx.shadowColor = p.glow;
+      ctx.shadowBlur = 12;
+
+      if (el === "lightning") {
+        // A jagged dart re-rolled every few frames, crackle behind it.
+        const frame = Math.floor(time * 14);
+        ctx.strokeStyle = withAlpha(p.glow, 0.95);
+        ctx.lineWidth = 2;
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(angle);
+        ctx.beginPath();
+        ctx.moveTo(9, 0);
+        for (let i = 1; i <= 4; i++) {
+          ctx.lineTo(9 - i * 6, (hash(frame * 5 + i) - 0.5) * 9);
+        }
+        ctx.stroke();
+        ctx.restore();
+      } else if (el === "ice") {
+        // Sharp shard flying point-first + glints.
+        ctx.save();
+        ctx.translate(x, y);
+        ctx.rotate(angle);
+        ctx.fillStyle = mix(p.glow, "#ffffff", 0.3);
+        ctx.beginPath();
+        ctx.moveTo(10, 0);
+        ctx.lineTo(0, -4);
+        ctx.lineTo(-7, 0);
+        ctx.lineTo(0, 4);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+        motionTrail(ctx, p, 1.6, 1.5, 0.4);
+      } else if (el === "arcane") {
+        // Rune orb: core + orbiting glyph.
+        ctx.fillStyle = mix(p.glow, "#ffffff", 0.2);
+        ctx.beginPath();
+        ctx.arc(x, y, p.radius * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+        const a = time * 6;
+        const gx = x + Math.cos(a) * p.radius * 1.4;
+        const gy = y + Math.sin(a) * p.radius * 1.4;
+        ctx.fillStyle = withAlpha(p.glow, 0.9);
+        ctx.beginPath();
+        ctx.moveTo(gx, gy - 3);
+        ctx.lineTo(gx + 2.4, gy);
+        ctx.lineTo(gx, gy + 3);
+        ctx.lineTo(gx - 2.4, gy);
+        ctx.closePath();
+        ctx.fill();
+        motionTrail(ctx, p, 2, 2, 0.3);
+      } else if (el === "fire") {
+        // Flaming orb: trailing flame lobes + embers.
+        for (let i = 1; i <= 3; i++) {
+          ctx.fillStyle = withAlpha(p.glow, 0.4 - i * 0.1);
+          ctx.beginPath();
+          ctx.arc(x - v.x * i * 0.9, y - v.y * i * 0.9, p.radius * (0.85 - i * 0.15), 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = mix(p.glow, "#ffffff", 0.35);
+        ctx.beginPath();
+        ctx.arc(x, y, p.radius * 0.75, 0, Math.PI * 2);
+        ctx.fill();
+        const ph = (time * 3) % 1;
+        ctx.fillStyle = withAlpha(p.glow, 1 - ph);
+        ctx.beginPath();
+        ctx.arc(x - v.x * 1.5, y - v.y * 1.5 - ph * 7, 1.4, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (el === "poison") {
+        ctx.fillStyle = mix(p.glow, "#3a3f4a", 0.2);
+        ctx.beginPath();
+        ctx.arc(x, y, p.radius * 0.75, 0, Math.PI * 2);
+        ctx.fill();
+        const ph = (time * 2.2) % 1;
+        ctx.fillStyle = withAlpha(p.glow, 0.8 * (1 - ph));
+        ctx.beginPath();
+        ctx.arc(x - v.x * 1.2, y - v.y * 1.2 + ph * 8, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (el === "shadow") {
+        for (let i = 0; i <= 2; i++) {
+          ctx.fillStyle = withAlpha(p.glow, 0.35 - i * 0.11);
+          ctx.beginPath();
+          ctx.arc(x - v.x * i * 1.6, y - v.y * i * 1.6, p.radius * (0.8 - i * 0.12), 0, Math.PI * 2);
+          ctx.fill();
+        }
+      } else if (el === "holy") {
+        motionTrail(ctx, p, 3, 2.5, 0.4);
+        ctx.fillStyle = mix(p.glow, "#ffffff", 0.5);
+        ctx.beginPath();
+        ctx.arc(x, y, p.radius * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+        const r = p.radius * 1.5 * (0.8 + 0.2 * Math.sin(time * 10));
+        ctx.strokeStyle = withAlpha("#ffffff", 0.85);
+        ctx.lineWidth = 1.3;
+        ctx.beginPath();
+        ctx.moveTo(x - r, y);
+        ctx.lineTo(x + r, y);
+        ctx.moveTo(x, y - r);
+        ctx.lineTo(x, y + r);
+        ctx.stroke();
+      } else {
+        // Unaligned bolt: the classic glowing orb + streak.
+        motionTrail(ctx, p, 2.4, p.radius * 1.2, 0.4);
+        ctx.fillStyle = p.color;
+        ctx.beginPath();
+        ctx.arc(x, y, p.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = withAlpha("#ffffff", 0.5);
+        ctx.beginPath();
+        ctx.arc(x - p.radius * 0.3, y - p.radius * 0.3, p.radius * 0.35, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      break;
+    }
+  }
+
   ctx.restore();
 }

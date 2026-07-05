@@ -99,17 +99,20 @@ export function attackStyleOf(form: WeaponForm, type: MechType): AttackStyle {
   if (type === "thrown") return "throw";
   if (type === "ranged") {
     if (form === "bow") return "draw";
-    if (form === "gun") return "shoot";
+    if (form === "gun" || form === "cannon") return "shoot";
     return "cast"; // staff, orb
   }
   switch (form) {
     case "greatsword":
     case "axe":
     case "hammer":
+    case "warhammer":
+    case "mace":
     case "flail":
       return "chop";
     case "spear":
     case "halberd":
+    case "rapier":
       return "thrust";
     case "scythe":
       return "reap";
@@ -253,12 +256,17 @@ interface AttackContribution {
 
 /**
  * Pose curves per attack style and phase. All units are in fighter-scale `s`;
- * `k` is progress 0→1 within the phase.
+ * `k` is progress 0→1 within the phase. `form`/`size`/`twoHanded` let a style
+ * flavor its arc per weapon (dagger flick vs sword sweep) without touching
+ * the shared phase timing.
  */
 function attackContribution(
   style: AttackStyle,
   phase: AttackPhase,
   k: number,
+  form: WeaponForm,
+  size: WeaponSize,
+  twoHanded: boolean,
 ): AttackContribution {
   const out: AttackContribution = {
     hand: { fwd: 10, up: -14 },
@@ -271,19 +279,54 @@ function attackContribution(
 
   switch (style) {
     case "slash": {
+      // One-handed diagonal cut with real weight: coil the weapon back+up
+      // over the shoulder, whip it through the diagonal as the torso rotates
+      // into the cut, then carry PAST the target before easing back to guard.
+      // The hand rides an arc around the chest instead of a straight lerp.
+      const flick = form === "dagger" || form === "claw"; // short snappy cut
+      const arc = flick ? 0.72 : size === "large" ? 1.12 : 1;
+      const rF = 21 * arc; // hand-orbit radii (fwd / up) around the chest
+      const rU = 16 * arc;
+      const upBase = flick ? -7 : -5;
+      const cock = flick ? -1.95 : -2.35; // wind-up angle, past vertical
+      const followEnd = flick ? 0.38 : 0.55; // cut exits low-forward
+      const coil = flick ? -0.05 : -0.11; // torso wind-back
+      const drive = flick ? 0.2 : 0.3; // torso rotation into the cut
+      const sink = flick ? 1.5 : 3; // weight transfer through the hips
+      const handAt = (phi: number) => ({
+        fwd: Math.cos(phi) * rF,
+        up: Math.sin(phi) * rU + upBase,
+      });
+
       if (phase === "windup") {
-        out.hand = { fwd: lerp(6, -6, K), up: lerp(-14, -20, K) };
-        out.dirRel = lerp(-0.55, -1.9, K);
-        out.lean = lerp(0.08, -0.04, K);
+        const phi = lerp(-0.75, cock, K);
+        out.hand = handAt(phi);
+        out.dirRel = lerp(-0.55, cock + 0.1, K);
+        out.lean = lerp(0.08, coil, K); // shoulder/hip coil
+        out.hipsDy = (flick ? -0.5 : -1.5) * K; // load the back leg
+        // Free hand aims down the line of the coming cut.
+        if (!twoHanded) out.offHand = { fwd: lerp(3, 10, K), up: lerp(-8, -11, K) };
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(-6, 24, K), up: lerp(-20, 4, K) };
-        out.dirRel = lerp(-1.9, 0.45, K);
-        out.lean = lerp(-0.04, 0.24, K);
-        out.hipsDy = 1.5 * K;
+        const D = easeIn(k); // accelerate — the whip
+        const phi = lerp(cock, followEnd, D);
+        out.hand = handAt(phi);
+        out.dirRel = lerp(cock + 0.1, followEnd + 0.15, D);
+        out.lean = lerp(coil, drive, D); // lead shoulder drives through
+        out.hipsDy = lerp(flick ? -0.5 : -1.5, sink, D);
+        // Counter-balance: the free arm swings back across the body.
+        if (!twoHanded) out.offHand = { fwd: lerp(10, -9, D), up: lerp(-11, -3, D) };
       } else {
-        out.hand = { fwd: lerp(24, 10, K), up: lerp(4, -14, K) };
-        out.dirRel = lerp(0.45, -0.55, K);
-        out.lean = lerp(0.24, 0.08, K);
+        // Follow-through: momentum carries a touch past, then back to guard.
+        const carry = Math.sin(Math.min(1, k * 2.2) * Math.PI) * (flick ? 0.1 : 0.18);
+        const from = handAt(followEnd);
+        out.hand = {
+          fwd: lerp(from.fwd, 10, K) + carry * 6,
+          up: lerp(from.up, -14, K) + carry * 4,
+        };
+        out.dirRel = lerp(followEnd + 0.15, -0.55, K) + carry;
+        out.lean = lerp(drive, 0.08, K) + carry * 0.4;
+        out.hipsDy = lerp(sink, 0, K);
+        if (!twoHanded) out.offHand = { fwd: lerp(-9, 3, K), up: lerp(-3, -8, K) };
       }
       break;
     }
@@ -503,7 +546,7 @@ export function createAnimator(bones: Bones): Animator {
           phase = "recovery";
           k = Math.min(1, (e - atkTiming.windup - atkTiming.active) / atkTiming.recovery);
         }
-        atk = attackContribution(style, phase, k);
+        atk = attackContribution(style, phase, k, inp.weaponForm, inp.weaponSize, twoHanded);
       }
 
       // --- Hips: track the physics root, plus per-state bob/weight. ---

@@ -55,3 +55,19 @@ dodge/retreat FSM and feeds the same input shape and stat budget as the player.
 | `npm run dev`   | Client (Vite, :5173) + server (:8787)     |
 | `npm run build` | Typecheck + production client build       |
 | `npm run lint`  | TypeScript project check (`tsc --noEmit`) |
+
+## Security note — AI-authored ability code
+
+Abilities can carry LLM-written logic in two tiers: an interpreted behavior
+DSL (verb whitelist, hard caps, per-action try/catch — safe by construction)
+and a raw-JS `customScript` escape hatch. Scripts run in a `new Function`
+sandbox with browser globals shadowed, a per-cast time budget/call cap, and a
+Web Worker halt-test at generation (hard-terminated on timeout) before they
+ever ship on a fighter.
+
+That is adequate while fighters are **self-generated and local**. It is NOT
+hardened against deliberately malicious authors (e.g. prototype/constructor
+chain escapes from `new Function`). Before any public deployment where
+fighter specs can be shared between users, this feature needs a proper
+security review — or disable raw scripts outright by setting
+`VITE_ALLOW_CUSTOM_SCRIPT=false` (the interpreted DSL remains available).

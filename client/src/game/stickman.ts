@@ -1,6 +1,7 @@
 import Matter from "matter-js";
 import type { CharacterSpec } from "../types/character";
-import { resolveStyle, type ResolvedStyle } from "../generation/enrich";
+import { resolveStyle, type ResolvedOutfit, type ResolvedStyle } from "../generation/enrich";
+import type { BehaviorRuntime } from "./engine/interpreter";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
 import {
   drawWeapon as drawParametricWeapon,
@@ -99,8 +100,13 @@ export interface Fighter {
   attackWindow: number;
   hasHitThisSwing: boolean;
   projectileFired: boolean;
+  /** Weapon behavior's onAttack already fired for this swing. */
+  weaponAttackFired: boolean;
   jumpCooldown: number;
+  /** ATTACK ability cooldown. */
   abilityCooldown: number;
+  /** UTILITY ability cooldown (separate key, separate clock). */
+  utilityCooldown: number;
   shieldTimer: number;
   /** Fraction of damage the active shield blocks (from ability params). */
   shieldCoverage: number;
@@ -114,6 +120,37 @@ export interface Fighter {
   /** Heal-over-time: hp += regenRate per second while regenTimer > 0. */
   regenTimer: number;
   regenRate: number;
+  // Behavior-engine transform state — all timers auto-revert in combat.ts,
+  // and everything resets on death. Anti-softlock, not balance.
+  /** Personal gravity multiplier (negative = floats up). */
+  gravityScale: number;
+  gravityTimer: number;
+  /** Personal time scale: slows/hastens motion, timers and attacks. */
+  timeFactor: number;
+  timeFactorTimer: number;
+  /** Visual + reach scale (grow/shrink). */
+  displayScale: number;
+  displayScaleTimer: number;
+  /** Intangible: attacks and projectiles pass through. */
+  phaseTimer: number;
+  /** Parry window: reflects projectiles and returns damage. */
+  reflectTimer: number;
+  tintColor: string | null;
+  tintTimer: number;
+  /** recall(): where to snap back to when recallTimer hits 0. */
+  recallPoint: { x: number; y: number } | null;
+  recallTimer: number;
+  /** customScript persistent state, keyed by ability slot / "weapon". */
+  scriptState: Record<string, Record<string, unknown>>;
+  /** Persistent weapon-behavior runtime (set by equipWeaponBehavior). */
+  weaponRuntime: BehaviorRuntime | null;
+  /** Last ability this fighter cast — scripts can sense the OPPONENT's. */
+  lastAbility: { name: string; kind: string } | null;
+  /** Damage-over-time (bleed / elemental) from weapon properties. */
+  dotTimer: number;
+  dotPerSec: number;
+  dotColor: string;
+  dotTickAcc: number;
 
   buffs: FighterBuffs;
   trail: TrailPoint[];
@@ -197,6 +234,7 @@ export function createFighter(
     projectileFired: false,
     jumpCooldown: 0,
     abilityCooldown: 0,
+    utilityCooldown: 0,
     shieldTimer: 0,
     shieldCoverage: 0.7,
     buffTimer: 0,
@@ -207,6 +245,26 @@ export function createFighter(
     invulnTimer: 0,
     regenTimer: 0,
     regenRate: 0,
+    gravityScale: 1,
+    gravityTimer: 0,
+    timeFactor: 1,
+    timeFactorTimer: 0,
+    displayScale: 1,
+    displayScaleTimer: 0,
+    phaseTimer: 0,
+    reflectTimer: 0,
+    tintColor: null,
+    tintTimer: 0,
+    recallPoint: null,
+    recallTimer: 0,
+    scriptState: {},
+    weaponRuntime: null,
+    weaponAttackFired: false,
+    lastAbility: null,
+    dotTimer: 0,
+    dotPerSec: 0,
+    dotColor: "#e05555",
+    dotTickAcc: 0,
     buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
   };
@@ -530,7 +588,7 @@ export function drawContactShadow(
   ctx.restore();
 }
 
-function weaponRenderStyle(style: ResolvedStyle): WeaponRenderStyle {
+export function weaponRenderStyle(style: ResolvedStyle): WeaponRenderStyle {
   return {
     ...style.weapon,
     element: style.element,
@@ -601,70 +659,476 @@ function updateAndDrawTrail(
   ctx.restore();
 }
 
-function drawAccessories(
+// ---------------------------------------------------------------------------
+// Parametric outfit rendering — cosmetic slots layered on the body:
+// back items BEHIND, armor OVER the body, head/face on top. Flat fills only.
+// ---------------------------------------------------------------------------
+
+export interface OutfitAnchors {
+  facing: 1 | -1;
+  s: number;
+  time: number;
+  head: { x: number; y: number; angle: number; r: number };
+  neck: Vec;
+  hips: Vec;
+  arms: { elbow: Vec; hand: Vec }[];
+  legs: { knee: Vec; foot: Vec }[];
+}
+
+export interface OutfitColors {
+  /** Material-tinted main garment color (still flat). */
+  main: string;
+  /** Accent trim. */
+  trim: string;
+  glow: string;
+}
+
+export function materialColor(material: ResolvedOutfit["material"], accent: string): string {
+  switch (material) {
+    case "leather":
+      return mix(accent, "#7a5a3c", 0.55);
+    case "metal":
+      return mix("#9aa3b2", accent, 0.25);
+    case "gold":
+      return mix("#e8b33c", accent, 0.2);
+    case "bone":
+      return mix("#e8e2d0", accent, 0.15);
+    default:
+      return accent; // cloth
+  }
+}
+
+/** Back slot: drawn BEFORE the body so it sits behind the silhouette. */
+export function drawOutfitBack(
   ctx: CanvasRenderingContext2D,
-  fighter: Fighter,
-  sk: Skeleton,
-  headAngle: number,
-  which: "back" | "front",
-  time: number,
+  outfit: ResolvedOutfit,
+  c: OutfitColors,
+  a: OutfitAnchors,
 ): void {
-  const n = fighter.spec.appearance.accessories.length;
-  const { scale: s, style } = fighter;
+  const { facing: f, s, time: t, neck, hips } = a;
+  const back = -f;
 
-  if (which === "back" && n >= 2) {
-    // Cape: filled flowing shape off the back shoulder, drawn behind the body.
-    const sway = Math.sin(time * 3 + sk.hips.x * 0.01) * 6 * s;
-    const sx = sk.neck.x - fighter.facing * 4 * s;
-    const sy = sk.neck.y + 2 * s;
-    ctx.save();
+  switch (outfit.back) {
+    case "cape":
+    case "cloak": {
+      const long = outfit.back === "cloak";
+      const sway = Math.sin(t * 3 + hips.x * 0.01) * (long ? 4 : 6) * s;
+      const sx = neck.x + back * 4 * s;
+      const sy = neck.y + 2 * s;
+      const drop = (long ? 62 : 52) * s;
+      const spread = (long ? 30 : 24) * s;
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.quadraticCurveTo(sx + back * spread + sway, sy + drop * 0.45, sx + back * spread * 0.66 - sway, sy + drop);
+      if (long) ctx.lineTo(sx + f * 6 * s + sway * 0.5, sy + drop * 0.96);
+      ctx.quadraticCurveTo(sx + back * 4 * s + sway * 0.4, sy + drop * 0.62, sx + f * 3 * s, sy + 12 * s);
+      ctx.closePath();
+      ctx.fillStyle = mix(c.main, "#20242a", 0.25);
+      ctx.fill();
+      break;
+    }
+    case "wings": {
+      const flap = Math.sin(t * 2.2) * 0.1;
+      for (const [dy, len, tilt] of [
+        [-4, 30, -0.55],
+        [2, 24, -0.15],
+      ] as const) {
+        ctx.save();
+        ctx.translate(neck.x + back * 3 * s, neck.y + dy * s);
+        ctx.rotate((tilt + flap) * back * -1);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.quadraticCurveTo(back * len * s, -10 * s, back * len * 1.35 * s, -2 * s);
+        ctx.quadraticCurveTo(back * len * 0.9 * s, 4 * s, back * len * 0.55 * s, 3 * s);
+        ctx.quadraticCurveTo(back * len * 0.3 * s, 7 * s, 0, 4 * s);
+        ctx.closePath();
+        ctx.fillStyle = mix(c.main, "#20242a", 0.2);
+        ctx.fill();
+        ctx.strokeStyle = withAlpha("#20242a", 0.35);
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(back * len * 0.35 * s, -2 * s);
+        ctx.lineTo(back * len * 0.5 * s, 3 * s);
+        ctx.stroke();
+        ctx.restore();
+      }
+      break;
+    }
+    case "quiver": {
+      ctx.save();
+      ctx.translate(neck.x + back * 5 * s, neck.y + 10 * s);
+      ctx.rotate(back * 0.5);
+      flatPart(ctx, capsulePath(0, -9 * s, 0, 9 * s, 3.2 * s, 3.2 * s), c.main);
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.6 * s;
+      ctx.lineCap = "round";
+      for (const ox of [-1.4, 1.4]) {
+        ctx.beginPath();
+        ctx.moveTo(ox * s, -9 * s);
+        ctx.lineTo(ox * s, -15 * s);
+        ctx.stroke();
+      }
+      ctx.restore();
+      break;
+    }
+    case "pack": {
+      ctx.save();
+      ctx.translate(neck.x + back * 6 * s, neck.y + 12 * s);
+      const p = new Path2D();
+      p.roundRect(-5 * s, -8 * s, 10 * s, 16 * s, 3 * s);
+      flatPart(ctx, p, c.main);
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(-5 * s, -1 * s);
+      ctx.lineTo(5 * s, -1 * s);
+      ctx.stroke();
+      ctx.restore();
+      break;
+    }
+    case "sheath": {
+      ctx.save();
+      ctx.translate(hips.x + back * 3 * s, hips.y - 8 * s);
+      ctx.rotate(back * 0.85);
+      flatPart(ctx, capsulePath(0, -4 * s, 0, 16 * s, 2.2 * s, 1.7 * s), c.main);
+      ctx.restore();
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+/** Torso / shoulders / arms / legs: drawn OVER the body silhouette. */
+function drawOutfitBody(
+  ctx: CanvasRenderingContext2D,
+  outfit: ResolvedOutfit,
+  c: OutfitColors,
+  a: OutfitAnchors,
+  bulk: number,
+): void {
+  const { facing: f, s, time: t, neck, hips } = a;
+  const dxAxis = hips.x - neck.x;
+  const dyAxis = hips.y - neck.y;
+  const at = (k: number): Vec => ({ x: neck.x + dxAxis * k, y: neck.y + dyAxis * k });
+
+  // Legs first (under torso hem).
+  for (const leg of a.legs) {
+    const mid = { x: (leg.knee.x + leg.foot.x) / 2, y: (leg.knee.y + leg.foot.y) / 2 };
+    if (outfit.legs === "boots") {
+      flatPart(ctx, capsulePath(mid.x, mid.y, leg.foot.x, leg.foot.y, 3 * s, 2.8 * s), c.main);
+    } else if (outfit.legs === "greaves") {
+      flatPart(ctx, capsulePath(leg.knee.x, leg.knee.y, leg.foot.x, leg.foot.y, 3 * s, 2.6 * s), c.main);
+      flatPart(ctx, circlePath(leg.knee.x, leg.knee.y, 2.6 * s), c.trim);
+    }
+  }
+  if (outfit.legs === "skirt") {
+    const sway = Math.sin(t * 2.5) * 1.2 * s;
     ctx.beginPath();
-    ctx.moveTo(sx, sy);
-    ctx.quadraticCurveTo(
-      sx - fighter.facing * 24 * s + sway,
-      sy + 24 * s,
-      sx - fighter.facing * 16 * s - sway,
-      sy + 52 * s,
-    );
-    ctx.quadraticCurveTo(
-      sx - fighter.facing * 4 * s + sway * 0.4,
-      sy + 34 * s,
-      sx + fighter.facing * 3 * s,
-      sy + 12 * s,
-    );
+    ctx.moveTo(hips.x - 5.5 * s, hips.y - 4 * s);
+    ctx.lineTo(hips.x + 5.5 * s, hips.y - 4 * s);
+    ctx.lineTo(hips.x + 9 * s + sway, hips.y + 12 * s);
+    ctx.lineTo(hips.x - 9 * s + sway, hips.y + 12 * s);
     ctx.closePath();
-    ctx.fillStyle = mix(style.accent, "#20242a", 0.25);
+    ctx.fillStyle = c.main;
     ctx.fill();
-    ctx.restore();
+    ctx.strokeStyle = withAlpha("#20242a", 0.3);
+    ctx.lineWidth = 1;
+    ctx.stroke();
   }
 
-  if (which !== "front") return;
+  // Torso garment.
+  switch (outfit.torso) {
+    case "chestplate": {
+      const w = (6.5 + bulk * 2.5) * s;
+      const top = at(0.12);
+      const bottom = at(0.62);
+      flatPart(ctx, capsulePath(top.x, top.y, bottom.x, bottom.y, w, w * 0.78), c.main);
+      ctx.strokeStyle = withAlpha("#20242a", 0.35);
+      ctx.lineWidth = 1.1;
+      ctx.beginPath();
+      ctx.moveTo(top.x, top.y + 2 * s);
+      ctx.lineTo(bottom.x, bottom.y - 1 * s);
+      ctx.stroke();
+      break;
+    }
+    case "vest": {
+      const top = at(0.1);
+      const bottom = at(0.66);
+      flatPart(ctx, capsulePath(top.x, top.y, bottom.x, bottom.y, 5 * s, 4.4 * s), c.main);
+      ctx.strokeStyle = mix(c.main, "#20242a", 0.5);
+      ctx.lineWidth = 1.6 * s;
+      ctx.beginPath();
+      ctx.moveTo(top.x, top.y);
+      ctx.lineTo(bottom.x, bottom.y);
+      ctx.stroke();
+      break;
+    }
+    case "robe": {
+      const sway = Math.sin(t * 2.5) * 1.6 * s;
+      const top = at(0.08);
+      ctx.beginPath();
+      ctx.moveTo(top.x - 5.5 * s, top.y);
+      ctx.lineTo(top.x + 5.5 * s, top.y);
+      ctx.lineTo(hips.x + 12 * s + sway, hips.y + 20 * s);
+      ctx.lineTo(hips.x - 12 * s + sway, hips.y + 20 * s);
+      ctx.closePath();
+      ctx.fillStyle = c.main;
+      ctx.fill();
+      ctx.strokeStyle = withAlpha("#20242a", 0.3);
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      // Sash.
+      const waist = at(0.6);
+      flatPart(ctx, capsulePath(waist.x - 5.5 * s, waist.y, waist.x + 5.5 * s, waist.y, 1.8 * s, 1.8 * s), c.trim);
+      break;
+    }
+    case "harness": {
+      const shoulder = at(0.08);
+      const hip = at(0.85);
+      ctx.strokeStyle = c.main;
+      ctx.lineWidth = 2.6 * s;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(shoulder.x + f * 4 * s, shoulder.y);
+      ctx.lineTo(hip.x - f * 4 * s, hip.y);
+      ctx.stroke();
+      flatPart(ctx, circlePath((shoulder.x + hip.x) / 2, (shoulder.y + hip.y) / 2, 1.8 * s), c.trim);
+      break;
+    }
+    case "scarf": {
+      const sway = Math.sin(t * 3.2) * 3 * s;
+      flatPart(ctx, capsulePath(neck.x - 4 * s, neck.y + 2 * s, neck.x + 4 * s, neck.y + 2 * s, 2.6 * s, 2.6 * s), c.main);
+      ctx.beginPath();
+      ctx.moveTo(neck.x - f * 3 * s, neck.y + 3 * s);
+      ctx.quadraticCurveTo(
+        neck.x - f * 14 * s + sway,
+        neck.y + 10 * s,
+        neck.x - f * 18 * s + sway * 1.4,
+        neck.y + 20 * s,
+      );
+      ctx.lineTo(neck.x - f * 12 * s + sway, neck.y + 18 * s);
+      ctx.quadraticCurveTo(neck.x - f * 8 * s, neck.y + 9 * s, neck.x + f * 1 * s, neck.y + 6 * s);
+      ctx.closePath();
+      ctx.fillStyle = c.main;
+      ctx.fill();
+      break;
+    }
+    default:
+      break;
+  }
 
-  if (n >= 1) {
-    // Hat riding on the head: brim capsule + crown.
-    ctx.save();
-    ctx.translate(sk.head.x, sk.head.y);
-    ctx.rotate(headAngle);
-    const r = 8.5 * s;
-    flatPart(ctx, capsulePath(-r * 1.45, -r * 0.72, r * 1.45, -r * 0.72, 2.2 * s, 2.2 * s), style.accent);
-    const crown = new Path2D();
-    crown.roundRect(-r * 0.75, -r * 1.75, r * 1.5, r, 2.5 * s);
-    flatPart(ctx, crown, style.accent);
-    ctx.restore();
+  // Shoulders.
+  if (outfit.shoulders !== "none") {
+    const w = (4.2 + bulk * 1.6) * s;
+    const anchor = { x: neck.x, y: neck.y + 1.5 * s };
+    if (outfit.shoulders === "epaulettes") {
+      const p = new Path2D();
+      p.roundRect(anchor.x - w, anchor.y - 2 * s, w * 2, 3 * s, 1.2 * s);
+      flatPart(ctx, p, c.main);
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.2;
+      for (let i = -1; i <= 1; i++) {
+        ctx.beginPath();
+        ctx.moveTo(anchor.x + i * w * 0.55, anchor.y + 1 * s);
+        ctx.lineTo(anchor.x + i * w * 0.55, anchor.y + 4.5 * s);
+        ctx.stroke();
+      }
+    } else {
+      // Pauldron cap (a hint of the far one peeks out behind).
+      flatPart(ctx, circlePath(anchor.x - f * 2 * s, anchor.y + 0.5 * s, w * 0.8), mix(c.main, "#20242a", 0.25));
+      const p = new Path2D();
+      p.arc(anchor.x, anchor.y, w, Math.PI, 0);
+      p.closePath();
+      flatPart(ctx, p, c.main);
+      if (outfit.shoulders === "spikes") {
+        for (const [ox, oy] of [[-w * 0.5, -w * 0.75], [w * 0.35, -w * 0.9]] as const) {
+          ctx.beginPath();
+          ctx.moveTo(anchor.x + ox - 1.4 * s, anchor.y + oy + 2 * s);
+          ctx.lineTo(anchor.x + ox + 1.4 * s, anchor.y + oy + 2 * s);
+          ctx.lineTo(anchor.x + ox, anchor.y + oy - 4 * s);
+          ctx.closePath();
+          ctx.fillStyle = c.main;
+          ctx.fill();
+        }
+      }
+    }
   }
-  if (n >= 3) {
-    // Belt with a glowing buckle.
-    const y = sk.hips.y - 4 * s;
-    flatPart(ctx, capsulePath(sk.hips.x - 6 * s, y, sk.hips.x + 6 * s, y, 2.6 * s, 2.6 * s), style.accent);
-    ctx.save();
-    ctx.shadowColor = fighter.style.glow;
-    ctx.shadowBlur = 6;
-    ctx.fillStyle = fighter.style.glow;
-    ctx.beginPath();
-    ctx.arc(sk.hips.x + fighter.facing * 2 * s, y, 1.6 * s, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.restore();
+
+  // Arms.
+  if (outfit.arms !== "none") {
+    for (const arm of a.arms) {
+      const mid = { x: (arm.elbow.x + arm.hand.x) / 2, y: (arm.elbow.y + arm.hand.y) / 2 };
+      if (outfit.arms === "gauntlets") {
+        flatPart(ctx, capsulePath(mid.x, mid.y, arm.hand.x, arm.hand.y, 2.6 * s, 2.9 * s), c.main);
+      } else {
+        flatPart(ctx, capsulePath(arm.elbow.x, arm.elbow.y, mid.x, mid.y, 2.3 * s, 2.3 * s), c.main);
+      }
+    }
   }
+}
+
+/** Head + face items, on top of everything except the weapon. */
+export function drawOutfitHead(
+  ctx: CanvasRenderingContext2D,
+  outfit: ResolvedOutfit,
+  c: OutfitColors,
+  a: OutfitAnchors,
+): void {
+  const { facing: f, s, time: t, head } = a;
+  const r = head.r;
+
+  ctx.save();
+  ctx.translate(head.x, head.y);
+  ctx.rotate(head.angle);
+  ctx.scale(f, 1); // local +x is always the facing side
+
+  switch (outfit.head) {
+    case "hat": {
+      flatPart(ctx, capsulePath(-r * 1.45, -r * 0.72, r * 1.45, -r * 0.72, 2.2 * s, 2.2 * s), c.main);
+      const crown = new Path2D();
+      crown.roundRect(-r * 0.75, -r * 1.75, r * 1.5, r, 2.5 * s);
+      flatPart(ctx, crown, c.main);
+      break;
+    }
+    case "tophat": {
+      flatPart(ctx, capsulePath(-r * 1.25, -r * 0.78, r * 1.25, -r * 0.78, 1.9 * s, 1.9 * s), c.main);
+      const crown = new Path2D();
+      crown.roundRect(-r * 0.7, -r * 2.45, r * 1.4, r * 1.7, 1.6 * s);
+      flatPart(ctx, crown, c.main);
+      flatPart(ctx, capsulePath(-r * 0.7, -r * 1.02, r * 0.7, -r * 1.02, 1.1 * s, 1.1 * s), c.trim);
+      break;
+    }
+    case "helmet": {
+      const dome = new Path2D();
+      dome.arc(0, -r * 0.1, r * 1.18, Math.PI, 0);
+      dome.closePath();
+      flatPart(ctx, dome, c.main);
+      // Nose guard.
+      const bar = new Path2D();
+      bar.roundRect(r * 0.72, -r * 0.35, r * 0.42, r * 0.95, 1.2 * s);
+      flatPart(ctx, bar, c.main);
+      // Crest stripe.
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.6 * s;
+      ctx.beginPath();
+      ctx.arc(0, -r * 0.1, r * 1.18, -Math.PI * 0.75, -Math.PI * 0.25);
+      ctx.stroke();
+      break;
+    }
+    case "hood": {
+      // Crescent wrapping the head, open toward the face.
+      const p = new Path2D();
+      p.arc(0, 0, r * 1.32, -Math.PI * 0.38, Math.PI * 0.42);
+      p.arc(r * 0.25, 0, r * 0.98, Math.PI * 0.42, -Math.PI * 0.38, true);
+      p.closePath();
+      flatPart(ctx, p, c.main);
+      // Point at the back.
+      ctx.beginPath();
+      ctx.moveTo(-r * 0.9, -r * 0.85);
+      ctx.quadraticCurveTo(-r * 1.9, -r * 0.7, -r * 1.55, r * 0.1);
+      ctx.quadraticCurveTo(-r * 1.35, -r * 0.2, -r * 1.05, -r * 0.3);
+      ctx.closePath();
+      ctx.fillStyle = c.main;
+      ctx.fill();
+      break;
+    }
+    case "crown": {
+      const band = new Path2D();
+      band.roundRect(-r * 0.85, -r * 1.35, r * 1.7, r * 0.55, 1 * s);
+      flatPart(ctx, band, c.main);
+      ctx.fillStyle = c.main;
+      for (const px of [-r * 0.6, 0, r * 0.6]) {
+        ctx.beginPath();
+        ctx.moveTo(px - r * 0.24, -r * 1.32);
+        ctx.lineTo(px + r * 0.24, -r * 1.32);
+        ctx.lineTo(px, -r * 1.95);
+        ctx.closePath();
+        ctx.fill();
+      }
+      break;
+    }
+    case "cap": {
+      const dome = new Path2D();
+      dome.arc(0, -r * 0.35, r * 0.95, Math.PI, 0);
+      dome.closePath();
+      flatPart(ctx, dome, c.main);
+      flatPart(ctx, capsulePath(r * 0.5, -r * 0.5, r * 1.6, -r * 0.42, 1.3 * s, 1.1 * s), c.main);
+      break;
+    }
+    case "horns": {
+      ctx.fillStyle = c.main;
+      for (const side of [-1, 1] as const) {
+        ctx.beginPath();
+        ctx.moveTo(side * r * 0.45, -r * 0.75);
+        ctx.quadraticCurveTo(side * r * 1.15, -r * 1.3, side * r * 1.05, -r * 2.05);
+        ctx.quadraticCurveTo(side * r * 0.8, -r * 1.35, side * r * 0.15, -r * 0.95);
+        ctx.closePath();
+        ctx.fill();
+      }
+      break;
+    }
+    case "halo": {
+      const bob = Math.sin(t * 2.5) * 1.2 * s;
+      ctx.save();
+      ctx.shadowColor = c.glow;
+      ctx.shadowBlur = 10;
+      ctx.strokeStyle = mix("#ffe6a3", c.trim, 0.25);
+      ctx.lineWidth = 2 * s;
+      ctx.beginPath();
+      ctx.ellipse(0, -r * 1.9 + bob, r * 0.85, r * 0.28, 0, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.restore();
+      break;
+    }
+    default:
+      break;
+  }
+
+  switch (outfit.face) {
+    case "mask": {
+      const p = new Path2D();
+      p.roundRect(-r * 0.1, -r * 0.1, r * 1.2, r * 0.75, 1.6 * s);
+      flatPart(ctx, p, mix(c.main, "#20242a", 0.35));
+      break;
+    }
+    case "visor": {
+      const p = new Path2D();
+      p.roundRect(-r * 0.15, -r * 0.55, r * 1.35, r * 0.55, 1.4 * s);
+      ctx.save();
+      ctx.shadowColor = c.glow;
+      ctx.shadowBlur = 6;
+      flatPart(ctx, p, mix(c.glow, "#20242a", 0.45));
+      ctx.restore();
+      break;
+    }
+    case "goggles": {
+      flatPart(ctx, circlePath(r * 0.5, -r * 0.28, r * 0.4), c.trim);
+      flatPart(ctx, circlePath(r * 0.5, -r * 0.28, r * 0.22), mix(c.glow, "#20242a", 0.3));
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.5 * s;
+      ctx.beginPath();
+      ctx.arc(0, -r * 0.28, r * 0.92, Math.PI * 0.55, Math.PI * 1.45);
+      ctx.stroke();
+      break;
+    }
+    case "warpaint": {
+      ctx.strokeStyle = c.trim;
+      ctx.lineWidth = 1.8 * s;
+      ctx.lineCap = "round";
+      for (const oy of [-0.15, 0.25]) {
+        ctx.beginPath();
+        ctx.moveTo(r * 0.15, r * oy);
+        ctx.lineTo(r * 0.85, r * (oy + 0.12));
+        ctx.stroke();
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  ctx.restore();
 }
 
 export function renderFighter(
@@ -674,7 +1138,10 @@ export function renderFighter(
   groundY: number,
 ): void {
   const s = fighter.scale;
-  const fill = fighter.style.fill;
+  const fill =
+    fighter.tintTimer > 0 && fighter.tintColor
+      ? mix(fighter.style.fill, fighter.tintColor, 0.65)
+      : fighter.style.fill;
 
   const sk = fighter.ragdoll
     ? skeletonFromRagdoll(fighter.ragdoll, fighter.facing)
@@ -689,13 +1156,45 @@ export function renderFighter(
   drawContactShadow(ctx, sk.hips.x, groundY, feetY, s);
 
   ctx.save();
-  ctx.globalAlpha = fighter.alive ? 1 : 0.8;
+  // Behavior-engine transforms: grow/shrink about the ground contact so the
+  // feet stay planted; phase() renders as a ghost.
+  if (fighter.displayScale !== 1) {
+    ctx.translate(sk.hips.x, groundY);
+    ctx.scale(fighter.displayScale, fighter.displayScale);
+    ctx.translate(-sk.hips.x, -groundY);
+  }
+  ctx.globalAlpha = (fighter.alive ? 1 : 0.8) * (fighter.phaseTimer > 0 ? 0.4 : 1);
 
   // Lean build: thin arms (finer than legs), slim legs, half-width spine.
   const armR0 = 1.9 * s, armR1 = 1.1 * s;
   const legR0 = 2.4 * s, legR1 = 1.4 * s;
 
-  drawAccessories(ctx, fighter, sk, headAngle, "back", time);
+  // Outfit anchors + colors (material tint stays flat).
+  const anchors: OutfitAnchors = {
+    facing: fighter.facing,
+    s,
+    time,
+    head: { x: sk.head.x, y: sk.head.y, angle: headAngle, r: 8.5 * s },
+    neck: sk.neck,
+    hips: sk.hips,
+    arms: [
+      { elbow: sk.elbowL, hand: sk.handL },
+      { elbow: sk.elbowR, hand: sk.handR },
+    ],
+    legs: [
+      { knee: sk.kneeL, foot: sk.footL },
+      { knee: sk.kneeR, foot: sk.footR },
+    ],
+  };
+  const outfit = fighter.style.outfit;
+  const outfitColors: OutfitColors = {
+    main: materialColor(outfit.material, fighter.style.accent),
+    trim: fighter.style.accent,
+    glow: fighter.style.glow,
+  };
+
+  // Back items sit BEHIND the body silhouette.
+  drawOutfitBack(ctx, outfit, outfitColors, anchors);
 
   // Every body part in one batch so overlaps merge into a single continuous
   // silhouette. Joints come straight from the animated skeleton.
@@ -719,7 +1218,8 @@ export function renderFighter(
     fill,
   );
 
-  drawAccessories(ctx, fighter, sk, headAngle, "front", time);
+  drawOutfitBody(ctx, outfit, outfitColors, anchors, fighter.style.bulk);
+  drawOutfitHead(ctx, outfit, outfitColors, anchors);
 
   // Swing trail + weapon attached to the hand joint.
   updateAndDrawTrail(ctx, fighter, sk.handR, weaponAngle, time);
@@ -826,6 +1326,23 @@ export function drawStickmanPreview(
 
   drawContactShadow(ctx, cx, groundY, groundY, u);
 
+  const previewAnchors: OutfitAnchors = {
+    facing: 1,
+    s: u,
+    time: 1.7, // frozen mid-sway
+    head: { x: cx, y: headY, angle: 0, r: headR },
+    neck: { x: cx, y: shoulderY },
+    hips: hip,
+    arms: [], // filled below once hand targets exist
+    legs: [],
+  };
+  const outfitColors: OutfitColors = {
+    main: materialColor(style.outfit.material, style.accent),
+    trim: style.accent,
+    glow: style.glow,
+  };
+  drawOutfitBack(ctx, style.outfit, outfitColors, previewAnchors);
+
   // Whole body in one batch: legs in a slight stance (knees bent), slim
   // spine, off arm down with a relaxed elbow, thin neck, small round head.
   const lFoot = { x: cx - 14 * u, y: groundY };
@@ -846,17 +1363,17 @@ export function drawStickmanPreview(
     fill,
   );
 
-  // Hat.
-  if (spec.appearance.accessories.length > 0) {
-    flatPart(
-      ctx,
-      capsulePath(cx - headR * 1.45, headY - headR * 0.72, cx + headR * 1.45, headY - headR * 0.72, 2.2 * u, 2.2 * u),
-      style.accent,
-    );
-    const crown = new Path2D();
-    crown.roundRect(cx - headR * 0.75, headY - headR * 1.75, headR * 1.5, headR, 2.5 * u);
-    flatPart(ctx, crown, style.accent);
-  }
+  // Outfit over the body: armor slots, then head/face on top.
+  previewAnchors.arms = [
+    { elbow: bendPoint(shoulder, offHand, -0.16), hand: offHand },
+    { elbow: bendPoint(shoulder, weaponHand, 0.12), hand: weaponHand },
+  ];
+  previewAnchors.legs = [
+    { knee: bendPoint(hip, lFoot, -0.1), foot: lFoot },
+    { knee: bendPoint(hip, rFoot, 0.1), foot: rFoot },
+  ];
+  drawOutfitBody(ctx, style.outfit, outfitColors, previewAnchors, style.bulk);
+  drawOutfitHead(ctx, style.outfit, outfitColors, previewAnchors);
 
   // Weapon in the raised hand. Long flexible forms point slightly down so
   // they stay inside the portrait; everything else presents raised.

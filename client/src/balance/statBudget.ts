@@ -1,4 +1,5 @@
-import type { AbilityParams, CharacterSpec } from "../types/character";
+import type { AbilityParams, AbilitySpec, CharacterSpec, WeaponForm, WeaponProperty } from "../types/character";
+import { detectElement, deriveWeaponProperties, resolveWeaponIdentity } from "../game/weapons/mapWeapon";
 
 /**
  * Deterministic balancing — no LLM involved. The LLM's numbers are treated as
@@ -39,6 +40,49 @@ const PARAM_LIMITS = {
   iframes: { min: 0, max: 0.5 }, // seconds
   duration: { min: 1.5, max: 6 }, // seconds (shield/buff)
 } as const;
+
+/** Weapon-property fairness: at most 3 properties, magnitudes 1–10 each,
+ * summed magnitude scaled down to this budget, and base damage taxed by up
+ * to DAMAGE_TAX in proportion to the load — power is a trade, never free. */
+export const WEAPON_PROPERTY_BUDGET = 14;
+export const MAX_WEAPON_PROPERTIES = 3;
+const PROPERTY_DAMAGE_TAX = 0.25;
+
+/**
+ * Clamp + budget the weapon's mechanical properties, deriving concept-fitting
+ * defaults when none were given, and tax base damage for the load carried.
+ * Returns the final properties and the damage multiplier to apply.
+ */
+function balanceWeaponProperties(
+  spec: CharacterSpec,
+  form: WeaponForm,
+): { properties: WeaponProperty[]; damageMul: number } {
+  const w = spec.weapon;
+  let props: WeaponProperty[] = (w.properties ?? []).map((p) => ({
+    kind: p.kind,
+    magnitude: clamp(p.magnitude, 1, 10),
+  }));
+
+  // Dedupe by kind (first mention wins) and cap the count.
+  const seen = new Set<string>();
+  props = props.filter((p) => !seen.has(p.kind) && seen.add(p.kind));
+  props = props.slice(0, MAX_WEAPON_PROPERTIES);
+
+  if (props.length === 0) {
+    const element = w.element ?? detectElement(w.name);
+    props = deriveWeaponProperties(w.name, form, element);
+  }
+
+  // Enforce the total budget proportionally.
+  const total = props.reduce((sum, p) => sum + p.magnitude, 0);
+  if (total > WEAPON_PROPERTY_BUDGET) {
+    const k = WEAPON_PROPERTY_BUDGET / total;
+    props = props.map((p) => ({ ...p, magnitude: Math.max(1, Math.round(p.magnitude * k * 10) / 10) }));
+  }
+
+  const load = Math.min(WEAPON_PROPERTY_BUDGET, props.reduce((sum, p) => sum + p.magnitude, 0));
+  return { properties: props, damageMul: 1 - PROPERTY_DAMAGE_TAX * (load / WEAPON_PROPERTY_BUDGET) };
+}
 
 const clamp = (v: number, min: number, max: number) =>
   Math.min(max, Math.max(min, Number.isFinite(v) ? v : min));
@@ -99,8 +143,23 @@ function balanceAbilityParams(params: AbilityParams | undefined): AbilityParams 
   return out;
 }
 
+/** Clamp one ability slot's numbers into the fair bands. */
+function balanceAbility(ability: AbilitySpec): AbilitySpec {
+  return {
+    ...ability,
+    power: Math.round(scaleToBand(ability.power, BANDS.abilityPower)),
+    cooldown: Math.round(clampCooldown(ability.cooldown) * 10) / 10,
+    params: balanceAbilityParams(ability.params),
+  };
+}
+
 /** Produce the tournament-legal version of a proposed character. */
 export function balanceCharacter(spec: CharacterSpec): CharacterSpec {
+  // FORM is the weapon's identity: the mechanical type follows from it (an
+  // explicit hammer stays melee even if tagged "ranged"), and the range band
+  // is chosen by the CORRECTED type so the numbers match how it plays.
+  const identity = resolveWeaponIdentity(spec.weapon);
+  const { properties, damageMul } = balanceWeaponProperties(spec, identity.form);
   return {
     ...spec,
     appearance: {
@@ -110,15 +169,17 @@ export function balanceCharacter(spec: CharacterSpec): CharacterSpec {
     },
     weapon: {
       ...spec.weapon,
-      damage: Math.round(scaleToBand(spec.weapon.damage, BANDS.weaponDamage)),
-      range: Math.round(scaleToBand(spec.weapon.range, BANDS.weaponRange[spec.weapon.type])),
+      form: identity.form,
+      type: identity.type,
+      damage: Math.max(
+        BANDS.weaponDamage.min - 2,
+        Math.round(scaleToBand(spec.weapon.damage, BANDS.weaponDamage) * damageMul),
+      ),
+      range: Math.round(scaleToBand(spec.weapon.range, BANDS.weaponRange[identity.type])),
+      properties,
     },
-    ability: {
-      ...spec.ability,
-      power: Math.round(scaleToBand(spec.ability.power, BANDS.abilityPower)),
-      cooldown: Math.round(clampCooldown(spec.ability.cooldown) * 10) / 10,
-      params: balanceAbilityParams(spec.ability.params),
-    },
+    ability: balanceAbility(spec.ability),
+    utility: spec.utility ? balanceAbility(spec.utility) : undefined,
     stats: normalizeStats(spec.stats),
   };
 }

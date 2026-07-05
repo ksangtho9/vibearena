@@ -35,7 +35,7 @@ export function createBotBrain(): BotBrain {
       const toward = dx > 0 ? "right" : "left";
       const away = dx > 0 ? "left" : "right";
 
-      const { weapon, ability } = bot.spec;
+      const { weapon, ability, utility } = bot.spec;
       const melee = weapon.type === "melee";
       const engageDist = melee ? weapon.range * 0.85 : weapon.range * 0.75;
 
@@ -78,16 +78,21 @@ export function createBotBrain(): BotBrain {
         }
       }
 
-      // Ability usage, matched to what the ability actually does.
+      // Attack ability (aoe close in, projectiles at range).
       if (bot.abilityCooldown <= 0) {
-        const hurt = bot.hp < bot.maxHp * 0.45;
         input.ability =
-          (ability.kind === "heal" && hurt) ||
-          (ability.kind === "shield" && dist < 200 && player.attackWindow > 0) ||
           (ability.kind === "aoe" && dist < 80 + ability.power * 3) ||
-          (ability.kind === "projectile" && dist > 180) ||
-          (ability.kind === "dash" && dist > 240) ||
-          (ability.kind === "buff" && state === "approach" && Math.random() < 0.05);
+          (ability.kind === "projectile" && dist > 180);
+      }
+
+      // Utility ability, matched to what it actually does.
+      if (utility && bot.utilityCooldown <= 0) {
+        const hurt = bot.hp < bot.maxHp * 0.45;
+        input.utility =
+          (utility.kind === "heal" && hurt) ||
+          (utility.kind === "shield" && dist < 200 && player.attackWindow > 0) ||
+          (utility.kind === "dash" && dist > 240) ||
+          (utility.kind === "buff" && state === "approach" && Math.random() < 0.05);
       }
 
       return input;

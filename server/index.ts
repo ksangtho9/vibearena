@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { generateWithGroq } from "./providers/groq";
+import { AllModelsBusyError, generateWithGroq } from "./providers/groq";
 import { generateWithOpenRouter } from "./providers/openrouter";
 // Single source of truth for the system prompt, shared with the client build.
 import { SYSTEM_PROMPT } from "../client/src/generation/prompt";
@@ -40,11 +40,21 @@ app.post("/api/generate", limiter, async (req, res) => {
   const provider = activeProvider();
   try {
     const content = await provider.generate(SYSTEM_PROMPT, prompt);
-    res.json({ content, provider: provider.name, mocked: provider.name === "mock" });
+    res.json({
+      content,
+      provider: provider.name,
+      mocked: provider.name === "mock",
+      // The only way to land on the mock with a healthy key is asking for it.
+      ...(provider.name === "mock" ? { mockReason: "nokey" as const } : {}),
+    });
   } catch (err) {
     // Provider trouble should never kill the game — fall back to the mock.
+    // mockReason lets the client tell "come back in a minute" apart from
+    // "no key configured" (it may ignore the field; that's fine).
     console.error(`[vibearena] ${provider.name} failed:`, err);
-    res.json({ content: mockCharacter(prompt), provider: "mock", mocked: true });
+    const mockReason =
+      err instanceof AllModelsBusyError && err.rateLimited ? "busy" : "error";
+    res.json({ content: mockCharacter(prompt), provider: "mock", mocked: true, mockReason });
   }
 });
 

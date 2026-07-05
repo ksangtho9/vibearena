@@ -1,6 +1,7 @@
 import { DEFAULT_CHARACTER, parseCharacterSpec, type CharacterSpec } from "../types/character";
 import { balanceCharacter } from "../balance/statBudget";
 import { enrichCharacter } from "./enrich";
+import { vetCustomScripts } from "../game/engine/customScript";
 import type { ModelAdapter } from "./modelAdapter";
 
 /**
@@ -39,7 +40,9 @@ export async function generateCharacter(prompt: string): Promise<GenerationResul
     if (!spec) throw new Error("LLM response failed CharacterSpec validation");
 
     return {
-      spec: enrichCharacter(balanceCharacter(spec)),
+      // vetCustomScripts: Worker halt-test on any raw-JS ability scripts —
+      // hung/throwing scripts are dropped here, before the spec ships.
+      spec: await vetCustomScripts(enrichCharacter(balanceCharacter(spec))),
       fallback: false,
       mocked: Boolean(body.mocked),
     };

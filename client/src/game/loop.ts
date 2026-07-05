@@ -26,8 +26,9 @@ import {
 import { createKeyboard, emptyInput, INPUT_BINDINGS } from "./input";
 import { createBotBrain, type BotBrain } from "./bot";
 import { createTheme, type ThemeView } from "./arena/themes";
-import { drawMotifEffect } from "./effectsRender";
-import { withAlpha } from "../render/color";
+import { drawMotifEffect, drawProjectile } from "./effectsRender";
+import { equipWeaponBehavior, tickBehaviors } from "./engine/interpreter";
+import { renderEntities, tickEntities } from "./engine/api";
 
 /**
  * requestAnimationFrame loop with a fixed physics timestep. Rendering is a
@@ -41,10 +42,13 @@ export interface HudState {
   playerMaxHp: number;
   botHp: number;
   botMaxHp: number;
-  /** Player 1's ability cooldown: 0 = ready, 1 = just used. */
+  /** Player 1's ATTACK-ability cooldown: 0 = ready, 1 = just used. */
   abilityCdFrac: number;
-  /** Right-side fighter's ability cooldown (shown for P2 in hotseat). */
+  /** Player 1's UTILITY-ability cooldown. */
+  utilityCdFrac: number;
+  /** Right-side fighter's cooldowns (shown for P2 in hotseat). */
   botAbilityCdFrac: number;
+  botUtilityCdFrac: number;
 }
 
 export interface GameCallbacks {
@@ -89,7 +93,25 @@ export function startGame(
   // veto; fighter capsules land kinematically in combat.ts.
   installOneWayPlatforms(arena);
 
-  const combat: CombatCtx = { arena, projectiles: [], effects: [], hitstop: 0, time: 0 };
+  const combat: CombatCtx = {
+    arena,
+    fighters: { player, bot },
+    projectiles: [],
+    effects: [],
+    behaviors: [],
+    entities: [],
+    hitstop: 0,
+    time: 0,
+    shakeTimer: 0,
+    shakeAmp: 0,
+    flashTimer: 0,
+    flashMax: 0,
+    flashColor: "#ffffff",
+  };
+
+  // Weapon behaviors are match-long passives: attach + fire onEquip now.
+  equipWeaponBehavior(player, combat);
+  equipWeaponBehavior(bot, combat);
 
   // Input routing: in hotseat, the right-side fighter is PLAYER 2's key
   // cluster instead of the bot FSM. Same InputState shape either way.
@@ -122,6 +144,9 @@ export function startGame(
       return;
     }
 
+    combat.shakeTimer = Math.max(0, combat.shakeTimer - dt);
+    combat.flashTimer = Math.max(0, combat.flashTimer - dt);
+
     time += dt;
     combat.time = time;
 
@@ -150,6 +175,8 @@ export function startGame(
     updateFighter(bot, player, botInput, combat, dt);
     updateProjectiles({ player, bot }, combat, dt);
     updateEffects(combat, dt);
+    tickBehaviors(combat, dt);
+    tickEntities(combat, dt);
 
     Matter.Engine.update(arena.engine, dt * 1000);
 
@@ -231,41 +258,9 @@ export function startGame(
   }
 
   function drawProjectiles(): void {
-    for (const p of combat.projectiles) {
-      ctx2d.save();
-      // Motion streak.
-      ctx2d.globalCompositeOperation = "lighter";
-      ctx2d.strokeStyle = withAlpha(p.glow, 0.4);
-      ctx2d.lineWidth = p.radius * 1.2;
-      ctx2d.lineCap = "round";
-      ctx2d.beginPath();
-      ctx2d.moveTo(p.body.position.x, p.body.position.y);
-      ctx2d.lineTo(
-        p.body.position.x - p.body.velocity.x * 2.4,
-        p.body.position.y - p.body.velocity.y * 2.4,
-      );
-      ctx2d.stroke();
-      ctx2d.globalCompositeOperation = "source-over";
-      // Glowing core.
-      ctx2d.shadowColor = p.glow;
-      ctx2d.shadowBlur = 14;
-      ctx2d.fillStyle = p.color;
-      ctx2d.beginPath();
-      ctx2d.arc(p.body.position.x, p.body.position.y, p.radius, 0, Math.PI * 2);
-      ctx2d.fill();
-      ctx2d.shadowBlur = 0;
-      ctx2d.fillStyle = withAlpha("#ffffff", 0.5);
-      ctx2d.beginPath();
-      ctx2d.arc(
-        p.body.position.x - p.radius * 0.3,
-        p.body.position.y - p.radius * 0.3,
-        p.radius * 0.35,
-        0,
-        Math.PI * 2,
-      );
-      ctx2d.fill();
-      ctx2d.restore();
-    }
+    // Each projectile draws as its source: arrow, tracer, spinning thrown
+    // weapon, or element bolt (visual only — hitbox is the physics body).
+    for (const p of combat.projectiles) drawProjectile(ctx2d, p, time);
   }
 
   function drawEffects(): void {
@@ -280,12 +275,60 @@ export function startGame(
       ctx2d.strokeStyle = e.color;
       ctx2d.fillStyle = e.color;
       if (e.kind === "ring") {
-        const r = (e.radius ?? 20) * (1.6 - life * 0.6);
-        ctx2d.lineWidth = 3;
+        const age = e.maxTtl - e.ttl;
+        // expand (px/s) lets behaviors design their own ring motion.
+        const r =
+          e.expand !== undefined
+            ? Math.max(1, (e.radius ?? 20) + e.expand * age)
+            : (e.radius ?? 20) * (1.6 - life * 0.6);
+        ctx2d.lineWidth = e.width ?? 3;
         ctx2d.shadowColor = e.color;
         ctx2d.shadowBlur = 10;
         ctx2d.beginPath();
         ctx2d.arc(e.x, e.y, r, 0, Math.PI * 2);
+        ctx2d.stroke();
+      } else if (e.kind === "particle") {
+        // Behavior-authored free-flying particle.
+        const size = (e.size ?? 4) * (0.4 + life * 0.6);
+        ctx2d.shadowColor = e.color;
+        ctx2d.shadowBlur = 7;
+        if (e.particleShape === "square") {
+          ctx2d.fillRect(e.x - size / 2, e.y - size / 2, size, size);
+        } else if (e.particleShape === "spark") {
+          const v = Math.hypot(e.vx ?? 0, e.vy ?? 1) || 1;
+          ctx2d.lineWidth = Math.max(1, size * 0.4);
+          ctx2d.beginPath();
+          ctx2d.moveTo(e.x, e.y);
+          ctx2d.lineTo(e.x - ((e.vx ?? 0) / v) * size * 2, e.y - ((e.vy ?? 0) / v) * size * 2);
+          ctx2d.stroke();
+        } else if (e.particleShape === "star") {
+          ctx2d.beginPath();
+          for (let k = 0; k < 8; k++) {
+            const a = (k / 8) * Math.PI * 2;
+            const rr = k % 2 === 0 ? size : size * 0.4;
+            ctx2d[k === 0 ? "moveTo" : "lineTo"](e.x + Math.cos(a) * rr, e.y + Math.sin(a) * rr);
+          }
+          ctx2d.closePath();
+          ctx2d.fill();
+        } else {
+          ctx2d.beginPath();
+          ctx2d.arc(e.x, e.y, size, 0, Math.PI * 2);
+          ctx2d.fill();
+        }
+      } else if (e.kind === "shape") {
+        // Behavior-engine draw verb: bare glowing strokes.
+        ctx2d.lineWidth = e.width ?? 2.5;
+        ctx2d.shadowColor = e.color;
+        ctx2d.shadowBlur = 9;
+        ctx2d.beginPath();
+        if (e.shape === "line") {
+          ctx2d.moveTo(e.x, e.y);
+          ctx2d.lineTo(e.x2 ?? e.x, e.y2 ?? e.y);
+        } else if (e.shape === "arc") {
+          ctx2d.arc(e.x, e.y, e.radius ?? 20, e.a0 ?? 0, e.a1 ?? Math.PI);
+        } else {
+          ctx2d.arc(e.x, e.y, e.radius ?? 20, 0, Math.PI * 2);
+        }
         ctx2d.stroke();
       } else if (e.kind === "spark") {
         ctx2d.lineWidth = 2.5;
@@ -326,6 +369,14 @@ export function startGame(
       groundY: arena.groundY,
     };
 
+    // Behavior-engine screenShake: jitter the whole frame while active.
+    const shaking = combat.shakeTimer > 0;
+    if (shaking) {
+      const k = combat.shakeAmp * Math.min(1, combat.shakeTimer * 4);
+      ctx2d.save();
+      ctx2d.translate((Math.random() - 0.5) * k, (Math.random() - 0.5) * k);
+    }
+
     // 1. Sky — pure screen space.
     theme.drawSky(ctx2d, view);
 
@@ -341,6 +392,7 @@ export function startGame(
     ctx2d.save();
     applyLayerTransform(1);
     for (const rect of arena.platformRects) theme.drawPlatform(ctx2d, rect);
+    renderEntities(ctx2d, combat, time);
     renderFighter(ctx2d, player, time, supportYFor(player));
     renderFighter(ctx2d, bot, time, supportYFor(bot));
     drawProjectiles();
@@ -369,6 +421,17 @@ export function startGame(
     ctx2d.fillStyle = "#06080a";
     ctx2d.fillRect(0, 0, ARENA_WIDTH, bar);
     ctx2d.fillRect(0, ARENA_HEIGHT - bar, ARENA_WIDTH, bar);
+
+    if (shaking) ctx2d.restore();
+
+    // Behavior-engine flash(): brief full-screen tint, fading out.
+    if (combat.flashTimer > 0 && combat.flashMax > 0) {
+      ctx2d.save();
+      ctx2d.globalAlpha = Math.min(0.55, (combat.flashTimer / combat.flashMax) * 0.55);
+      ctx2d.fillStyle = combat.flashColor;
+      ctx2d.fillRect(0, 0, ARENA_WIDTH, ARENA_HEIGHT);
+      ctx2d.restore();
+    }
   }
 
   function tick(now: number): void {
@@ -383,19 +446,17 @@ export function startGame(
     render();
 
     if (frame++ % 5 === 0) {
+      const cdFrac = (cd: number, total: number | undefined) =>
+        total && total > 0 ? cd / total : 0;
       cb.onHud({
         playerHp: player.hp,
         playerMaxHp: player.maxHp,
         botHp: bot.hp,
         botMaxHp: bot.maxHp,
-        abilityCdFrac:
-          player.spec.ability.cooldown > 0
-            ? player.abilityCooldown / player.spec.ability.cooldown
-            : 0,
-        botAbilityCdFrac:
-          bot.spec.ability.cooldown > 0
-            ? bot.abilityCooldown / bot.spec.ability.cooldown
-            : 0,
+        abilityCdFrac: cdFrac(player.abilityCooldown, player.spec.ability.cooldown),
+        utilityCdFrac: cdFrac(player.utilityCooldown, player.spec.utility?.cooldown),
+        botAbilityCdFrac: cdFrac(bot.abilityCooldown, bot.spec.ability.cooldown),
+        botUtilityCdFrac: cdFrac(bot.utilityCooldown, bot.spec.utility?.cooldown),
       });
     }
   }

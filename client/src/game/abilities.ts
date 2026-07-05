@@ -1,5 +1,7 @@
 import Matter from "matter-js";
-import type { AbilityMotif, AbilityParams, ElementKind } from "../types/character";
+import { castBehavior } from "./engine/interpreter";
+import { runCustomScript } from "./engine/customScript";
+import type { AbilityMotif, AbilityParams, AbilitySpec, ElementKind } from "../types/character";
 import type { Fighter } from "./stickman";
 import { CAST_TIME } from "./animation";
 import { elementGlow } from "../generation/enrich";
@@ -26,14 +28,15 @@ interface AbilityRuntime {
 }
 
 /** Safe accessors with enrich-equivalent fallbacks (handles bare specs). */
-function runtimeOf(user: Fighter): AbilityRuntime {
-  const a = user.spec.ability;
-  const element = a.element ?? "none";
+function runtimeOf(user: Fighter, ability: AbilitySpec): AbilityRuntime {
+  const element = ability.element ?? "none";
   return {
     element,
-    motif: a.motif ?? "burst",
-    glow: elementGlow(element, user.style.glow),
-    params: a.params ?? {},
+    motif: ability.motif ?? "burst",
+    // LLM-designed vfx color wins — two same-motif abilities stop looking
+    // identical the moment the model picks its palette.
+    glow: ability.vfx?.primary || elementGlow(element, user.style.glow),
+    params: ability.params ?? {},
   };
 }
 
@@ -57,12 +60,38 @@ function motifEffect(
   });
 }
 
-export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): void {
-  const { ability } = user.spec;
+/** Fire one ability slot (attack or utility — same coded handlers). */
+export function useAbility(
+  user: Fighter,
+  opponent: Fighter,
+  ctx: CombatCtx,
+  ability: AbilitySpec,
+): void {
   const pos = user.root.position;
-  const rt = runtimeOf(user);
+  const rt = runtimeOf(user, ability);
   const p = rt.params;
   user.castTimer = CAST_TIME; // cast pose for the animator
+  user.lastAbility = { name: ability.name, kind: ability.kind }; // scripts sense this
+
+  // Dispatch order: customScript (raw-JS escape hatch) → interpreted
+  // behavior → legacy kind. Each tier falls through on failure/absence.
+  if (ability.customScript || ability.behavior) {
+    pushEffect(ctx, {
+      kind: "text",
+      x: pos.x,
+      y: pos.y - 95 * user.scale,
+      ttl: 0.9,
+      color: rt.glow,
+      text: ability.name.toUpperCase(),
+    });
+    const visuals = { element: rt.element, motif: rt.motif, glow: rt.glow };
+    if (ability.customScript && runCustomScript(user, ctx, ability, visuals)) return;
+    if (ability.behavior) {
+      castBehavior(user, ctx, ability.behavior, visuals);
+      return;
+    }
+    // customScript failed with no behavior fallback → legacy kind below.
+  }
 
   // Announce the move with its LLM-given name, tinted by its element.
   pushEffect(ctx, {
@@ -148,6 +177,8 @@ export function useAbility(user: Fighter, opponent: Fighter, ctx: CombatCtx): vo
           angle: t * 2 * halfArc,
           homing: p.homing ?? false,
           glow: rt.glow,
+          visual: "bolt",
+          element: rt.element,
         });
       }
       motifEffect(ctx, rt, pos.x + user.facing * 24 * user.scale, pos.y - 24 * user.scale, {

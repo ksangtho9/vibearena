@@ -21,7 +21,8 @@ export async function generateWithOpenRouter(system: string, userPrompt: string)
         { role: "user", content: userPrompt },
       ],
       temperature: 0.9,
-      max_tokens: 700,
+      // Behavior programs made specs much longer — leave generous headroom.
+      max_tokens: 2200,
     }),
   });
 

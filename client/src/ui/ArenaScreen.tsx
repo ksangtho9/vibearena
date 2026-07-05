@@ -30,6 +30,25 @@ function HpBar({
   );
 }
 
+function AbilityHint({
+  keyLabel,
+  ability,
+  cdFrac,
+  showReady = false,
+}: {
+  keyLabel: string;
+  ability: { name: string; cooldown: number };
+  cdFrac: number;
+  showReady?: boolean;
+}) {
+  return (
+    <span className={cdFrac > 0 ? "ability-cooling" : "ability-ready"}>
+      <kbd>{keyLabel}</kbd> {ability.name}
+      {cdFrac > 0 ? ` (${Math.ceil(cdFrac * ability.cooldown)}s)` : showReady ? " — ready" : ""}
+    </span>
+  );
+}
+
 /**
  * The ring: canvas + corner-tape HP bars + controls hint.
  */
@@ -85,10 +104,10 @@ export function ArenaScreen() {
           <span><kbd>A</kbd><kbd>D</kbd> move</span>
           <span><kbd>W</kbd>/<kbd>Space</kbd> jump</span>
           <span><kbd>J</kbd> attack</span>
-          <span className={hud && hud.abilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
-            <kbd>K</kbd> {spec.ability.name}
-            {hud && hud.abilityCdFrac > 0 ? ` (${Math.ceil(hud.abilityCdFrac * spec.ability.cooldown)}s)` : " — ready"}
-          </span>
+          <AbilityHint keyLabel="K" ability={spec.ability} cdFrac={hud?.abilityCdFrac ?? 0} showReady />
+          {spec.utility && (
+            <AbilityHint keyLabel="L" ability={spec.utility} cdFrac={hud?.utilityCdFrac ?? 0} showReady />
+          )}
         </div>
       ) : (
         <div className="controls-hint controls-hint-2p">
@@ -97,20 +116,20 @@ export function ArenaScreen() {
             <span><kbd>A</kbd><kbd>D</kbd> move</span>
             <span><kbd>W</kbd> jump</span>
             <span><kbd>F</kbd> attack</span>
-            <span className={hud && hud.abilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
-              <kbd>G</kbd> {spec.ability.name}
-              {hud && hud.abilityCdFrac > 0 ? ` (${Math.ceil(hud.abilityCdFrac * spec.ability.cooldown)}s)` : ""}
-            </span>
+            <AbilityHint keyLabel="G" ability={spec.ability} cdFrac={hud?.abilityCdFrac ?? 0} />
+            {spec.utility && (
+              <AbilityHint keyLabel="H" ability={spec.utility} cdFrac={hud?.utilityCdFrac ?? 0} />
+            )}
           </div>
           <div className="controls-cluster">
             <span className="cluster-label">P2</span>
             <span><kbd>←</kbd><kbd>→</kbd> move</span>
             <span><kbd>↑</kbd> jump</span>
             <span><kbd>.</kbd> attack</span>
-            <span className={hud && hud.botAbilityCdFrac > 0 ? "ability-cooling" : "ability-ready"}>
-              <kbd>/</kbd> {botSpec.ability.name}
-              {hud && hud.botAbilityCdFrac > 0 ? ` (${Math.ceil(hud.botAbilityCdFrac * botSpec.ability.cooldown)}s)` : ""}
-            </span>
+            <AbilityHint keyLabel="/" ability={botSpec.ability} cdFrac={hud?.botAbilityCdFrac ?? 0} />
+            {botSpec.utility && (
+              <AbilityHint keyLabel="'" ability={botSpec.utility} cdFrac={hud?.botUtilityCdFrac ?? 0} />
+            )}
           </div>
         </div>
       )}
