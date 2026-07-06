@@ -41,7 +41,7 @@ const TIP: Record<WeaponForm, number> = {
   sword: 46, greatsword: 60, dagger: 26, axe: 36, hammer: 34, warhammer: 40,
   mace: 34, rapier: 50, spear: 62, halberd: 62, scythe: 52, whip: 56,
   flail: 42, staff: 46, bow: 26, gun: 32, cannon: 38, orb: 14, shield: 16,
-  claw: 22, chakram: 22, bomb: 16,
+  claw: 22, chakram: 22, bomb: 16, fist: 10, gauntlet: 13,
 };
 
 export function weaponTipLength(form: WeaponForm, size: WeaponSize): number {
@@ -809,31 +809,90 @@ function composePolearm(
 }
 
 /** Fist weapon: wrist wrap + talon blades. */
+/**
+ * Fist family — WORN on the striking hand, not held. Local origin = the hand
+ * joint, +x = the strike direction (weaponAngle), so everything hugs the
+ * fist/lower forearm and claws project forward past the knuckles.
+ */
 function composeClaw(
   ctx: CanvasRenderingContext2D,
   s: WeaponRenderStyle,
   p: Palette,
 ): void {
   const parts = s.parts;
+  // Knuckle band wrapping the fist (over the hand joint).
   ctx.beginPath();
-  ctx.roundRect(-6, -5.5, 4, 11, 2);
-  strokedFill(ctx, s.accent, s.outline);
-  ctx.beginPath();
-  ctx.roundRect(-2, -6, 9, 12, 3.5);
+  ctx.roundRect(-4, -5, 8, 10, 3);
   strokedFill(ctx, mix("#9aa3b2", s.accent, 0.4), s.outline);
+  // Short wrist strap trailing the forearm.
+  ctx.beginPath();
+  ctx.roundRect(-9, -3.5, 5, 7, 2);
+  strokedFill(ctx, s.accent, s.outline);
+  // Talons rake FORWARD past the knuckles.
   const blade = parts.blade ?? {
     profile: "dagger" as const, length: 0.3, width: 0.2, edges: 1 as const,
     count: 3 as const, fuller: false, tip: "point" as const,
   };
-  const talons = Math.max(2, blade.count + 1);
+  const talons = Math.max(2, Math.min(4, blade.count + 1));
   for (let i = 0; i < talons; i++) {
-    const y = -5 + (i * 10) / Math.max(1, talons - 1);
+    const y = -4.5 + (i * 9) / Math.max(1, talons - 1);
     ctx.save();
-    ctx.translate(7, y);
-    ctx.rotate(y * 0.02);
-    drawBlade(ctx, s, p, { ...blade, count: 1 }, 0, 13 + blade.length * 10);
+    ctx.translate(3.5, y);
+    ctx.rotate(y * 0.03); // slight fan
+    drawBlade(ctx, s, p, { ...blade, count: 1 }, 0, 12 + blade.length * 10);
     ctx.restore();
   }
+}
+
+/** Bare/wrapped fist or brass knuckles: a band + studs over the fist. */
+function composeFist(
+  ctx: CanvasRenderingContext2D,
+  s: WeaponRenderStyle,
+  p: Palette,
+): void {
+  // Hand wrap over the fist.
+  ctx.beginPath();
+  ctx.roundRect(-5, -5, 9, 10, 4);
+  strokedFill(ctx, s.accent, s.outline);
+  // Wrist wrap on the forearm side.
+  ctx.beginPath();
+  ctx.roundRect(-10, -3.5, 5, 7, 2);
+  strokedFill(ctx, mix(s.accent, "#3a352c", 0.35), s.outline);
+  // Brass-knuckle studs across the leading edge.
+  for (let i = 0; i < 4; i++) {
+    ctx.beginPath();
+    ctx.arc(4.5, -4 + i * 2.7, 1.5, 0, Math.PI * 2);
+    strokedFill(ctx, p.metal, s.outline);
+  }
+}
+
+/** Armored power gauntlet: forearm sleeve + plated fist + knuckle ridge. */
+function composeGauntlet(
+  ctx: CanvasRenderingContext2D,
+  s: WeaponRenderStyle,
+  p: Palette,
+): void {
+  // Forearm sleeve.
+  ctx.beginPath();
+  ctx.roundRect(-15, -4.5, 10, 9, 3);
+  strokedFill(ctx, mix(p.metal, "#5a616e", 0.35), s.outline);
+  // Big armored fist over the hand.
+  ctx.beginPath();
+  ctx.roundRect(-6, -6.5, 12, 13, 4.5);
+  strokedFill(ctx, p.metal, s.outline);
+  // Plate ridges.
+  ctx.strokeStyle = s.outline;
+  ctx.lineWidth = 1;
+  for (const x of [-2, 1.5]) {
+    ctx.beginPath();
+    ctx.moveTo(x, -6);
+    ctx.lineTo(x, 6);
+    ctx.stroke();
+  }
+  // Knuckle ridge plate on the striking face.
+  ctx.beginPath();
+  ctx.roundRect(5, -5.5, 3.5, 11, 1.5);
+  strokedFill(ctx, mix(p.metal, "#ffffff", 0.25), s.outline);
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1284,8 @@ export function drawWeapon(
   else if (HAFTED.includes(style.form)) composeHafted(ctx, style, p, time);
   else if (POLEARM.includes(style.form)) composePolearm(ctx, style, p, time);
   else if (style.form === "claw") composeClaw(ctx, style, p);
+  else if (style.form === "fist") composeFist(ctx, style, p);
+  else if (style.form === "gauntlet") composeGauntlet(ctx, style, p);
   else composeSpecial(ctx, style, p, time);
 
   drawElementFX(ctx, style, time);

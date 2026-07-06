@@ -5,6 +5,7 @@ export const WEAPON_FORMS = [
   "sword", "greatsword", "dagger", "axe", "hammer", "warhammer", "mace",
   "rapier", "spear", "halberd", "scythe", "whip", "flail", "staff", "bow",
   "gun", "cannon", "orb", "shield", "claw", "chakram", "bomb",
+  "fist", "gauntlet",
 ] as const;
 export type WeaponForm = (typeof WEAPON_FORMS)[number];
 

@@ -143,6 +143,10 @@ function defaultParts(form: WeaponForm): ResolvedParts {
       return { ...base, blade: { ...bladed("sickle", 0.55, 0.35), edges: 1 }, haft: { length: 0.85, wrapped: false }, material: "steel" };
     case "claw":
       return { ...base, blade: { ...bladed("dagger", 0.3, 0.2), count: 3, edges: 1 }, material: "steel" };
+    case "fist":
+      return { ...base, material: "steel" };
+    case "gauntlet":
+      return { ...base, material: "steel" };
     case "whip":
       return { ...base, haft: { length: 0.15, wrapped: true }, material: "wood" };
     case "staff":

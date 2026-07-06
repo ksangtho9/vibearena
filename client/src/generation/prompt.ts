@@ -39,7 +39,7 @@ The JSON must match this exact shape:
                                        // the keyword set can't cover.
   },
   "weapon": {
-    "form": "sword" | "greatsword" | "dagger" | "axe" | "hammer" | "warhammer" | "mace" | "rapier" | "spear" | "halberd" | "scythe" | "whip" | "flail" | "staff" | "bow" | "gun" | "cannon" | "orb" | "shield" | "claw" | "chakram" | "bomb",
+    "form": "sword" | "greatsword" | "dagger" | "axe" | "hammer" | "warhammer" | "mace" | "rapier" | "spear" | "halberd" | "scythe" | "whip" | "flail" | "staff" | "bow" | "gun" | "cannon" | "orb" | "shield" | "claw" | "chakram" | "bomb" | "fist" | "gauntlet",
                                        // the form IS the weapon — pick what the weapon actually is.
                                        // The mechanical type follows from the form (a hammer swings
                                        // melee, a gun shoots), so express ranged intent through the

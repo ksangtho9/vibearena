@@ -93,6 +93,7 @@ export type AttackStyle =
   | "draw" // bow: pull string, release
   | "shoot" // gun: aim + recoil
   | "bash" // shield shove
+  | "punch" // fist-family jab / claw rake (also unarmed mount:none)
   | "throw"; // over-the-shoulder release
 
 type MechType = "melee" | "ranged" | "thrown";
@@ -105,6 +106,10 @@ export function attackStyleOf(form: WeaponForm, type: MechType): AttackStyle {
     return "cast"; // staff, orb
   }
   switch (form) {
+    case "fist":
+    case "gauntlet":
+    case "claw":
+      return "punch";
     case "greatsword":
     case "axe":
     case "hammer":
@@ -151,6 +156,7 @@ export const ATTACK_TIMINGS: Record<AttackStyle, AttackTiming> = {
   reap: timing(0.14, 0.18, 0.2),
   crack: timing(0.12, 0.14, 0.18),
   bash: timing(0.08, 0.12, 0.16),
+  punch: timing(0.1, 0.14, 0.18),
   cast: timing(0.12, 0.08, 0.16),
   draw: timing(0.18, 0.08, 0.14),
   shoot: timing(0.08, 0.08, 0.14),
@@ -501,6 +507,39 @@ function attackContribution(
       }
       break;
     }
+    case "punch": {
+      // A PUNCH, not a swing: retract + coil, EXPLODE straight forward with
+      // the whole body behind it, snap back to guard. Claws rake — the same
+      // jab with a small forward arc as the talons drag through.
+      const rake = form === "claw";
+      out.dirRel = -0.25; // knuckles angled slightly up at guard
+      if (phase === "windup") {
+        // Retract the fist to the ribs; shoulder + hip coil behind it.
+        out.hand = { fwd: lerp(10, 1, K), up: lerp(-14, -9, K) };
+        out.dirRel = lerp(-0.25, -0.35, K);
+        out.lean = lerp(0.08, -0.12, K);
+        out.hipsDy = -1.2 * K;
+        out.offHand = { fwd: lerp(3, 9, K), up: -13 }; // lead guard stays up
+      } else if (phase === "active") {
+        const D = easeIn(k); // explode out
+        const arc = rake ? Math.sin(D * Math.PI) * 4 : 0; // talons rake an arc
+        out.hand = { fwd: lerp(1, 17.5, D), up: lerp(-9, rake ? -6 : -11, D) - arc };
+        out.dirRel = lerp(-0.35, rake ? 0.2 : -0.02, D);
+        out.lean = lerp(-0.12, 0.3, D); // hips + shoulder drive through
+        out.hipsDy = lerp(-1.2, 2, D);
+        out.offHand = { fwd: lerp(9, -6, D), up: lerp(-13, -8, D) }; // counter-pull
+      } else {
+        // Quick snap back to guard (faster than the swing recovery).
+        const Q = 1 - (1 - Math.min(1, k * 1.35)) * (1 - Math.min(1, k * 1.35));
+        const c = carry(k, 0.8);
+        out.hand = { fwd: lerp(17.5, 10, Q) + c * 1.2, up: lerp(rake ? -6 : -11, -14, Q) };
+        out.dirRel = lerp(rake ? 0.2 : -0.02, -0.25, Q);
+        out.lean = lerp(0.3, 0.08, Q) + c * 0.03;
+        out.hipsDy = lerp(2, 0, Q);
+        out.offHand = { fwd: lerp(-6, 3, Q), up: lerp(-8, -8, Q) };
+      }
+      break;
+    }
     case "throw": {
       if (phase === "windup") {
         out.hand = { fwd: lerp(8, -8, K), up: lerp(-10, -19, K) };
@@ -671,9 +710,12 @@ export function createAnimator(bones: Bones): Animator {
         }
         const mounted =
           inp.weaponMount === "head" || inp.weaponMount === "body" || inp.weaponMount === "floating";
+        // Unarmed (mount "none"): the BODY throws a proper punch whatever
+        // form drives the mechanics; phases still follow the form's timing.
+        const poseStyle = inp.weaponMount === "none" ? "punch" : style;
         atk = mounted
           ? commandContribution(phase, k)
-          : attackContribution(style, phase, k, inp.weaponForm, inp.weaponSize, twoHanded);
+          : attackContribution(poseStyle, phase, k, inp.weaponForm, inp.weaponSize, twoHanded);
       }
 
       // --- Hips: track the physics root, plus per-state bob/weight. ---

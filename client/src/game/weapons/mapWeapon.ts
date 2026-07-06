@@ -48,9 +48,14 @@ const FORM_KEYWORDS: Record<WeaponForm, string[]> = {
     "plasma", "rune", "pearl", "eye", "lantern", "tome",
   ],
   shield: ["shield", "buckler", "aegis", "wall", "door", "lid", "manhole"],
-  claw: [
-    "claw", "fist", "gauntlet", "glove", "knuckle", "punch", "paw", "talon",
-    "nail", "mitt", "boxing", "slap", "hand",
+  claw: ["claw", "talon", "paw", "wolverine", "rake", "nail", "shredder"],
+  fist: [
+    "fist", "punch", "boxing", "boxer", "knuckle", "brass knuckle", "jab",
+    "glove", "mitt", "slap", "hand",
+  ],
+  gauntlet: [
+    "gauntlet", "power fist", "iron fist", "armored fist", "mech fist",
+    "piston", "power glove",
   ],
   chakram: [
     "chakram", "ring", "disc", "disk", "discus", "frisbee", "boomerang",
@@ -72,7 +77,7 @@ export const FORM_TYPE: Record<WeaponForm, MechType> = {
   sword: "melee", greatsword: "melee", dagger: "melee", axe: "melee",
   hammer: "melee", warhammer: "melee", mace: "melee", rapier: "melee",
   spear: "melee", halberd: "melee", scythe: "melee", whip: "melee",
-  flail: "melee", shield: "melee", claw: "melee",
+  flail: "melee", shield: "melee", claw: "melee", fist: "melee", gauntlet: "melee",
   staff: "ranged", bow: "ranged", gun: "ranged", cannon: "ranged", orb: "ranged",
   chakram: "thrown", bomb: "thrown",
 };
@@ -93,7 +98,7 @@ const TYPE_COMPAT: Record<MechType, WeaponForm[]> = {
   melee: [
     "sword", "greatsword", "dagger", "axe", "hammer", "warhammer", "mace",
     "rapier", "spear", "halberd", "scythe", "whip", "flail", "staff",
-    "shield", "claw",
+    "shield", "claw", "fist", "gauntlet",
   ],
   ranged: ["bow", "gun", "cannon", "orb", "staff"],
   thrown: ["chakram", "bomb", "dagger", "axe", "spear", "hammer", "orb"],
@@ -102,10 +107,11 @@ const TYPE_COMPAT: Record<MechType, WeaponForm[]> = {
 /** Where an incompatible form lands, per mechanical type. */
 const TYPE_SNAP: Record<MechType, Partial<Record<WeaponForm, WeaponForm>>> = {
   melee: { gun: "hammer", cannon: "hammer", bow: "staff", orb: "staff", chakram: "sword", bomb: "flail" },
-  ranged: { orb: "orb", whip: "staff", sword: "gun" },
+  ranged: { orb: "orb", whip: "staff", sword: "gun", fist: "gun", gauntlet: "cannon" },
   thrown: {
     sword: "dagger", greatsword: "axe", scythe: "chakram", whip: "chakram",
     flail: "bomb", halberd: "spear", shield: "chakram", claw: "dagger",
+    fist: "dagger", gauntlet: "hammer",
     staff: "spear", warhammer: "hammer", mace: "hammer", rapier: "dagger",
   },
 };
@@ -290,6 +296,10 @@ export function deriveWeaponProperties(
     case "dagger":
     case "claw":
       return [{ kind: "attackSpeed", magnitude: 5 }, { kind: "crit", magnitude: 3 }];
+    case "fist":
+      return [{ kind: "attackSpeed", magnitude: 6 }, { kind: "stagger", magnitude: 3 }];
+    case "gauntlet":
+      return [{ kind: "knockback", magnitude: 5 }, { kind: "stagger", magnitude: 4 }];
     case "rapier":
       return [{ kind: "crit", magnitude: 5 }, { kind: "reach", magnitude: 4 }];
     case "warhammer":
