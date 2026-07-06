@@ -3,6 +3,14 @@ import { castBehavior } from "./engine/interpreter";
 import { runCustomScript } from "./engine/customScript";
 import { playSfx } from "../audio/sfx";
 import { dashJuice } from "./movementFx";
+import {
+  aoeDetonation,
+  auraGlow,
+  fieldTint,
+  impactSparks,
+  risingMotes,
+  shockwaveRing,
+} from "./effectsJuice";
 import type { AbilityMotif, AbilityParams, AbilitySpec, ElementKind } from "../types/character";
 import type { Fighter } from "./stickman";
 import { CAST_TIME } from "./animation";
@@ -126,7 +134,9 @@ export function useAbility(
     case "shield": {
       user.shieldTimer = p.duration ?? 3;
       user.shieldCoverage = p.coverage ?? 0.7;
-      motifEffect(ctx, rt, pos.x, pos.y - 20 * user.scale, { radius: 62, ttl: 0.7 });
+      // Bubble rise-in; the dome itself is drawn live by renderFighter.
+      shockwaveRing(ctx, pos.x, pos.y - 24 * user.scale, { color: rt.glow, radius: 14, expand: 170, thickness: 3, ttl: 0.35 });
+      risingMotes(ctx, pos.x, pos.y - 20 * user.scale, { count: 6, color: rt.glow, ttl: 0.6 });
       break;
     }
 
@@ -137,6 +147,8 @@ export function useAbility(
         dir: user.facing,
         ttl: 0.65,
       });
+      // A real detonation: shockwave + debris + scorch + shake + boom.
+      aoeDetonation(ctx, pos.x, pos.y - 10 * user.scale, radius, rt.glow, ctx.arena.groundY, rt.element);
       const d = Matter.Vector.magnitude(Matter.Vector.sub(opponent.root.position, pos));
       if (d <= radius) {
         dealDamage(opponent, rawDamage(user, ability.power * 0.9), user.facing, ctx, {
@@ -164,6 +176,8 @@ export function useAbility(
         text: p.overTime ? `+${amount} over time` : `+${amount}`,
       });
       motifEffect(ctx, rt, pos.x, pos.y - 24 * user.scale, { radius: 46, ttl: 0.9 });
+      risingMotes(ctx, pos.x, pos.y - 24 * user.scale, { count: 10, color: "#8fd18a", ttl: 0.9 });
+      auraGlow(ctx, user, { color: "#8fd18a", ttl: 0.5 });
       break;
     }
 
@@ -193,6 +207,7 @@ export function useAbility(
         dir: user.facing,
         ttl: 0.4,
       });
+      impactSparks(ctx, pos.x + user.facing * 26 * user.scale, pos.y - 24 * user.scale, { color: rt.glow, count: 4 });
       break;
     }
 
@@ -213,6 +228,10 @@ export function useAbility(
         color: rt.glow,
         text: `${stat.toUpperCase()} UP`,
       });
+      auraGlow(ctx, user, { color: rt.glow, ttl: 0.5 });
+      risingMotes(ctx, pos.x, pos.y - 26 * user.scale, { count: 9, color: rt.glow, ttl: 0.8 });
+      fieldTint(ctx, rt.glow, 0.22);
+      playSfx("generate", { pitch: 1.3, volume: 0.5, element: rt.element });
       motifEffect(ctx, rt, pos.x, pos.y - 24 * user.scale, { radius: 50, ttl: 0.8 });
       break;
     }

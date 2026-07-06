@@ -639,6 +639,42 @@ export function drawEffect(g: CanvasRenderingContext2D, e: Effect, time: number)
     drawMotifEffect(g, e, time);
     return;
   }
+  if (e.kind === "decal") {
+    // Flat ground mark under AoEs/hazards: squashed ellipse + kind detail.
+    const life = Math.max(0, e.ttl / e.maxTtl);
+    const r = e.radius ?? 46;
+    g.save();
+    g.globalAlpha = 0.5 * Math.min(1, life * 2); // hold, then fade out
+    g.translate(e.x, e.y);
+    g.scale(1, 0.28);
+    const grad = g.createRadialGradient(0, 0, 0, 0, 0, r);
+    if (e.decalKind === "frost") {
+      grad.addColorStop(0, "rgba(190, 230, 255, 0.7)");
+      grad.addColorStop(1, "rgba(190, 230, 255, 0)");
+    } else if (e.decalKind === "crack") {
+      grad.addColorStop(0, "rgba(30, 26, 22, 0.75)");
+      grad.addColorStop(1, "rgba(30, 26, 22, 0)");
+    } else {
+      grad.addColorStop(0, "rgba(26, 18, 10, 0.8)");
+      grad.addColorStop(1, "rgba(26, 18, 10, 0)");
+    }
+    g.fillStyle = grad;
+    g.beginPath();
+    g.arc(0, 0, r, 0, Math.PI * 2);
+    g.fill();
+    // Kind detail: cracks radiate, frost crystallizes, scorch embers.
+    g.strokeStyle = e.decalKind === "frost" ? "rgba(225, 245, 255, 0.8)" : "rgba(12, 9, 6, 0.8)";
+    g.lineWidth = 2;
+    for (let k = 0; k < 5; k++) {
+      const a = (k / 5) * Math.PI * 2 + (e.decalKind === "frost" ? 0.3 : 0.11);
+      g.beginPath();
+      g.moveTo(Math.cos(a) * r * 0.15, Math.sin(a) * r * 0.15);
+      g.lineTo(Math.cos(a + 0.35) * r * 0.62, Math.sin(a + 0.35) * r * 0.62);
+      g.stroke();
+    }
+    g.restore();
+    return;
+  }
   const life = e.ttl / e.maxTtl; // 1 → 0
   g.save();
   g.globalAlpha = Math.max(0, life) * 0.9;

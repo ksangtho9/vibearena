@@ -8,6 +8,19 @@ import type { CombatCtx } from "../combat";
 import { dealDamage, pushEffect, rawDamage, spawnProjectile } from "../combat";
 import { attackTimingOf } from "../animation";
 import { blinkJuice, dashJuice, leapJuice } from "../movementFx";
+import {
+  aoeDetonation,
+  beamCore,
+  chargeUp,
+  fieldTint,
+  groundDecal,
+  impactSparks,
+  materialize,
+  particleBurst,
+  shake,
+  shockwaveRing,
+  vortex,
+} from "../effectsJuice";
 import { playSfx, SFX_KINDS, type SfxKind } from "../../audio/sfx";
 import { ARENA_HEIGHT, ARENA_WIDTH } from "../arena";
 import { mix, withAlpha } from "../../render/color";
@@ -246,7 +259,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const radius = N(a.radius, 60, 12, 260);
       const damage = N(a.damage, 14, 0, MAX_DAMAGE_PER_ACTION);
       const col = colorOf(a.color, rt.glow);
-      pushEffect(ctx, { kind: "ring", x, y, ttl: 0.35, color: col, radius });
+      aoeDetonation(ctx, x, y, radius, col, ctx.arena.groundY, rt.element);
       pushEffect(ctx, {
         kind: "motif", x, y, ttl: 0.5, color: col,
         motif: rt.motif, element: rt.element, radius, dir: caster.facing,
@@ -329,6 +342,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const f = foe();
       const dir = Math.sign(pos().x - f.root.position.x) || -caster.facing;
       setVel(f, dir * N(a.strength, 12, 0, 36), -N(a.up, 3, 0, 16));
+      vortex(ctx, f.root.position.x, f.root.position.y - 20, { color: rt.glow, dir: 1 });
     },
     /** lifesteal {damage?, percent?} — drain: hurt the foe, drink a share. */
     lifesteal(a) {
@@ -362,7 +376,13 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       for (const t of targetsOf(a.target)) {
         t.gravityScale = N(a.scale, 0.4, -2, 3);
         t.gravityTimer = dur(a.duration, 2);
+        const up = t.gravityScale < 1;
+        particleBurst(ctx, t.root.position.x, t.root.position.y - 20, {
+          count: 8, color: rt.glow, speed: 150, spread: 0.8,
+          baseAngle: up ? -Math.PI / 2 : Math.PI / 2, gravity: 0, shape: "spark", ttl: 0.4,
+        });
       }
+      fieldTint(ctx, rt.glow, 0.25);
     },
     /** launch {target?, power?} — pop airborne (combo starter). */
     launch(a) {
@@ -372,7 +392,13 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
           y: -N(a.power, 14, 4, 30),
         });
         if (t !== caster) t.launchedTimer = Math.max(t.launchedTimer, 0.35);
-        pushEffect(ctx, { kind: "ring", x: t.root.position.x, y: t.root.position.y + 26, ttl: 0.3, color: rt.glow, radius: 20 });
+        const tx = t.root.position.x;
+        const ty = t.root.position.y;
+        shockwaveRing(ctx, tx, ty + 26, { color: rt.glow, radius: 14, expand: 120, thickness: 3, ttl: 0.3 });
+        particleBurst(ctx, tx, ty + 20, { count: 8, color: rt.glow, speed: 210, spread: 1.1, baseAngle: -Math.PI / 2, gravity: 140, ttl: 0.4 });
+        for (let sl = -1; sl <= 1; sl++) {
+          pushEffect(ctx, { kind: "shape", shape: "line", x: tx + sl * 12, y: ty + 30, x2: tx + sl * 12, y2: ty - 20, color: rt.glow, width: 1.5, ttl: 0.2 });
+        }
       }
     },
     /** teleportBehind {} — blink directly behind the opponent. */
@@ -385,7 +411,9 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const y = N(a.y, pos().y, 0, ARENA_HEIGHT);
       const radius = N(a.radius, 120, 20, 320);
       const force = N(a.force, 14, 0, 34);
-      pushEffect(ctx, { kind: "ring", x, y, ttl: 0.35, color: colorOf(a.color, rt.glow), radius, expand: radius * 1.4, width: 4 });
+      shockwaveRing(ctx, x, y, { color: colorOf(a.color, rt.glow), radius: 12, expand: radius * 1.8, thickness: 4.5, ttl: 0.35 });
+      particleBurst(ctx, x, y, { count: 10, color: colorOf(a.color, rt.glow), speed: radius * 1.8, gravity: 120, ttl: 0.4 });
+      shake(ctx, 3.5, 0.15);
       const f = foe();
       const dx = f.root.position.x - x;
       const dy = f.root.position.y - y;
@@ -404,7 +432,9 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       for (const t of targetsOf(a.target)) {
         t.timeFactor = N(a.scale, 0.5, 0.2, 3);
         t.timeFactorTimer = dur(a.duration, 1.5);
+        shockwaveRing(ctx, t.root.position.x, t.root.position.y - 20, { color: "#cfd8dc", radius: 20, expand: 90, thickness: 2, ttl: 0.5 });
       }
+      fieldTint(ctx, "#aebcc4", 0.3);
     },
     /** recall {seconds?} — mark this spot now, snap back after `seconds`. */
     recall(a) {
@@ -419,25 +449,31 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       for (const t of targetsOf(a.target)) {
         t.displayScale = N(a.factor, 1.6, 0.4, 2.5);
         t.displayScaleTimer = dur(a.duration, 3);
-        pushEffect(ctx, { kind: "ring", x: t.root.position.x, y: t.root.position.y, ttl: 0.3, color: rt.glow, radius: 30 });
+        const grow = t.displayScale > 1;
+        shockwaveRing(ctx, t.root.position.x, t.root.position.y, { color: rt.glow, radius: grow ? 12 : 46, expand: grow ? 200 : -80, thickness: 3.5, ttl: 0.35 });
+        particleBurst(ctx, t.root.position.x, t.root.position.y - 16, { count: 10, color: rt.glow, speed: grow ? 200 : 90, gravity: grow ? 120 : -60, ttl: 0.4 });
       }
     },
     /** phase {target?, duration?} — intangible ghost (dodge). */
     phase(a) {
       for (const t of targetsOf(a.target)) {
         t.phaseTimer = Math.max(t.phaseTimer, dur(a.duration, 0.8, 1.5));
+        materialize(ctx, t.root.position.x, t.root.position.y - 20, { color: "#cfd6ff" });
       }
     },
     /** reflect {duration?} — parry window: projectiles + damage bounce back. */
     reflect(a) {
       caster.reflectTimer = Math.max(caster.reflectTimer, dur(a.duration, 1, 2));
-      pushEffect(ctx, { kind: "ring", x: pos().x, y: pos().y - 20, ttl: 0.3, color: "#ffd75e", radius: 26 });
+      shockwaveRing(ctx, pos().x, pos().y - 20, { color: "#ffffff", radius: 30, expand: 24, thickness: 2, ttl: 0.4 });
+      shockwaveRing(ctx, pos().x, pos().y - 20, { color: "#ffd75e", radius: 24, expand: 30, thickness: 2.5, ttl: 0.4 });
+      impactSparks(ctx, pos().x, pos().y - 40, { color: "#ffd75e", count: 4 });
     },
     /** tint {target?, color?, duration?} — recolor a fighter. */
     tint(a) {
       for (const t of targetsOf(a.target)) {
         t.tintColor = colorOf(a.color, rt.glow);
         t.tintTimer = dur(a.duration, 2);
+        shockwaveRing(ctx, t.root.position.x, t.root.position.y - 20, { color: t.tintColor, radius: 16, expand: 110, thickness: 3, ttl: 0.3 });
       }
     },
 
@@ -445,6 +481,8 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
     /** beam {dir?(-0.6..0.6 rad), length?, damage?(per second), duration?, color?} */
     beam(a) {
       if (--rt.entityBudget <= 0) return;
+      chargeUp(ctx, pos().x, pos().y - 14, { color: colorOf(a.color, rt.glow), count: 10, radius: 42, ttl: 0.18 });
+      playSfx("zap", { pitch: 0.9, volume: 0.6, element: rt.element });
       pushEntity(ctx, {
         ...baseEntity(rt, ctx, "beam"),
         x: pos().x,
@@ -468,16 +506,39 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const hazardGlow: Record<HazardKind, string> = {
         fire: "#ff9a3c", ice: "#7cd7ff", spikes: "#c9ced9", void: "#9257e8",
       };
+      const hx = N(a.x, pos().x + caster.facing * 90, 30, ARENA_WIDTH - 30);
+      const hr = N(a.radius, 44, 20, 90);
+      const hglow = colorOf(a.color, hazardGlow[kind]);
       pushEntity(ctx, {
         ...baseEntity(rt, ctx, "hazard"),
-        x: N(a.x, pos().x + caster.facing * 90, 30, ARENA_WIDTH - 30),
+        x: hx,
         y: ctx.arena.groundY - 2,
-        radius: N(a.radius, 44, 20, 90),
+        radius: hr,
         ttl: dur(a.ttl, 4, 8),
         maxTtl: dur(a.ttl, 4, 8),
-        glow: colorOf(a.color, hazardGlow[kind]),
+        glow: hglow,
         hazardKind: kind,
       });
+      // Kind-distinct arrival: decal + burst + sound.
+      const gy = ctx.arena.groundY;
+      if (kind === "fire") {
+        groundDecal(ctx, hx, gy, { kind: "scorch", radius: hr * 0.9, ttl: 3 });
+        particleBurst(ctx, hx, gy - 6, { count: 10, color: hglow, speed: 130, spread: 1.6, gravity: -60, ttl: 0.6 });
+        playSfx("explosion", { pitch: 1.2, volume: 0.45, element: "fire" });
+      } else if (kind === "ice") {
+        groundDecal(ctx, hx, gy, { kind: "frost", radius: hr * 0.9, ttl: 3 });
+        particleBurst(ctx, hx, gy - 8, { count: 8, color: hglow, speed: 90, gravity: 60, shape: "star", ttl: 0.7 });
+        playSfx("cast", { pitch: 1.4, volume: 0.5, element: "ice" });
+      } else if (kind === "spikes") {
+        groundDecal(ctx, hx, gy, { kind: "crack", radius: hr * 0.8, ttl: 3 });
+        particleBurst(ctx, hx, gy - 4, { count: 9, color: hglow, speed: 180, spread: 1.2, gravity: 380, shape: "square", ttl: 0.4 });
+        playSfx("hitHeavy", { pitch: 1.1, volume: 0.4 });
+        shake(ctx, 3, 0.15);
+      } else {
+        vortex(ctx, hx, gy - 16, { color: hglow, radius: hr, dir: 1, count: 10 });
+        fieldTint(ctx, "#2a1840", 0.3);
+        playSfx("zap", { pitch: 0.6, volume: 0.45, element: "shadow" });
+      }
     },
     /** boomerang {damage?, range?, color?} — flies out, then comes back. */
     boomerang(a) {
@@ -760,6 +821,8 @@ function spawnEntityImpl(
     Matter.World.add(ctx.arena.world, body);
   }
 
+  materialize(ctx, entity.x, entity.y - 20, { color: entity.glow });
+  playSfx("cast", { pitch: 1.2, volume: 0.35, element: rt.element });
   pushEntity(ctx, entity);
 }
 
@@ -878,6 +941,26 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
         break;
       }
       case "hazard": {
+        // Ambient per-kind emissions (cadence via the unused angle field).
+        e.angle += dt;
+        if (e.angle >= 0.2) {
+          e.angle = 0;
+          const ex = e.x + (Math.random() - 0.5) * e.radius * 1.6;
+          switch (e.hazardKind) {
+            case "fire":
+              pushEffect(ctx, { kind: "particle", x: ex, y: e.groundY - 4, vx: (Math.random() - 0.5) * 20, vy: -60 - Math.random() * 50, gravity: -40, size: 3, particleShape: "spark", color: e.glow, ttl: 0.5 });
+              break;
+            case "ice":
+              pushEffect(ctx, { kind: "particle", x: ex, y: e.groundY - 10 - Math.random() * 16, vx: (Math.random() - 0.5) * 24, vy: 10, gravity: 20, size: 2.5, particleShape: "star", color: e.glow, ttl: 0.8 });
+              break;
+            case "spikes":
+              pushEffect(ctx, { kind: "particle", x: ex, y: e.groundY - 4, vx: 0, vy: -30, gravity: 160, size: 2.5, particleShape: "square", color: e.glow, ttl: 0.35 });
+              break;
+            case "void":
+              vortex(ctx, e.x, e.groundY - 14, { color: e.glow, radius: e.radius, dir: 1, count: 3 });
+              break;
+          }
+        }
         // Ground zone: applies its effect while the opponent stands in it.
         const inside =
           dist < e.radius && fp.y > e.groundY - 80 && foe.alive;
@@ -923,6 +1006,15 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
         if (!caster.alive) e.dead = true;
         const endX = e.x + Math.cos(b.dir) * b.length * e.facing;
         const endY = e.y + Math.sin(b.dir) * b.length;
+        // Sustained juice: flickering bright core over the base render, a
+        // low rumble, and sparks boiling off the far end (cadence via angle).
+        beamCore(ctx, { x: e.x, y: e.y }, { x: endX, y: endY }, { color: e.glow, width: 7, ttl: 0.07 });
+        shake(ctx, 1.6, 0.06);
+        e.angle += dt;
+        if (e.angle >= 0.12) {
+          e.angle = 0;
+          impactSparks(ctx, endX, endY, { color: e.glow, count: 4 });
+        }
         if (b.tickAcc >= 0.15 && foe.alive) {
           b.tickAcc = 0;
           // Point-to-segment distance for the opponent's chest.

@@ -20,6 +20,13 @@ import {
   type Side,
 } from "./stickman";
 import { landingImpact } from "./movementFx";
+import {
+  auraGlow,
+  impactSparks,
+  particleBurst,
+  risingMotes,
+  shockwaveRing,
+} from "./effectsJuice";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
 import { attackTimingOf } from "./animation";
@@ -67,10 +74,12 @@ export interface Projectile {
   returning?: boolean;
   /** Re-hit debounce for piercing/reflected projectiles. */
   rehit?: number;
+  /** Trail-particle emission accumulator. */
+  trailAcc?: number;
 }
 
 export interface Effect {
-  kind: "ring" | "spark" | "text" | "motif" | "shape" | "particle";
+  kind: "ring" | "spark" | "text" | "motif" | "shape" | "particle" | "decal";
   x: number;
   y: number;
   ttl: number;
@@ -100,6 +109,8 @@ export interface Effect {
   gravity?: number;
   size?: number;
   particleShape?: "circle" | "square" | "spark" | "star";
+  /** Flat ground mark (kind "decal"): scorch/frost/crack under AoEs. */
+  decalKind?: "scorch" | "frost" | "crack";
 }
 
 export interface CombatCtx {
@@ -323,7 +334,14 @@ export function dealDamage(
   const effectiveDefense = target.spec.stats.defense * target.buffs.defenseMul * (1 - pierce);
 
   let dmg = amount * (130 / (130 + effectiveDefense)) * DAMAGE_SCALE;
-  if (target.shieldTimer > 0) dmg *= 1 - target.shieldCoverage;
+  if (target.shieldTimer > 0) {
+    dmg *= 1 - target.shieldCoverage;
+    // The bubble visibly ripples where it soaks a hit.
+    shockwaveRing(ctx, target.root.position.x, target.root.position.y - 24 * target.scale, {
+      color: target.style.glow, radius: 46 * target.scale, expand: 40, thickness: 3, ttl: 0.25,
+    });
+    playSfx("block", { pitch: 1.4, volume: 0.5, element: target.style.element });
+  }
   dmg = Math.max(1, Math.round(dmg));
 
   target.hp = Math.max(0, target.hp - dmg);
@@ -808,6 +826,38 @@ export function updateFighter(
     landingImpact(f, ctx);
   }
 
+  // Ambient state VFX (juice library): heal motes, buff aura, gravity
+  // streaks, slow-mo motes, phase echoes, reflect shimmer. One small
+  // emission per 0.14s per state — bounded well under the effect cap.
+  f.fxAcc += dt;
+  if (f.fxAcc >= 0.14 && f.alive) {
+    f.fxAcc = 0;
+    const { x, y } = f.root.position;
+    if (f.regenTimer > 0) risingMotes(ctx, x, y - 20 * f.scale, { count: 2, color: "#8fd18a", ttl: 0.6 });
+    if (f.buffTimer > 0) auraGlow(ctx, f, { ttl: 0.3 });
+    if (f.gravityTimer > 0) {
+      particleBurst(ctx, x, y - 20, {
+        count: 2, color: f.style.glow, speed: 90, spread: 0.5,
+        baseAngle: f.gravityScale < 1 ? -Math.PI / 2 : Math.PI / 2, gravity: 0, ttl: 0.35,
+      });
+    }
+    if (f.timeFactorTimer > 0 && f.timeFactor < 1) {
+      pushEffect(ctx, {
+        kind: "particle", x: x + (Math.random() - 0.5) * 40, y: y - 30 * Math.random(),
+        vx: 0, vy: -8, gravity: 0, size: 2, particleShape: "circle", color: "#cfd8dc", ttl: 0.7,
+      });
+    }
+    if (f.phaseTimer > 0) {
+      if (ctx.afterimages.length < 14) {
+        ctx.afterimages.push({
+          sk: snapshotSkeleton(f.skeleton), scale: f.scale, facing: f.facing,
+          color: "#cfd6ff", ttl: 0.25, maxTtl: 0.25,
+        });
+      }
+    }
+    if (f.reflectTimer > 0) auraGlow(ctx, f, { color: "#ffd75e", ttl: 0.25, radius: 30 * f.scale });
+  }
+
   tickEngineTransforms(f, ctx, dt);
   if (!f.alive) return; // the KO ragdoll belongs to the physics engine now
 
@@ -947,6 +997,24 @@ export function updateProjectiles(
     const p = ctx.projectiles[i];
     p.ttl -= dt;
 
+    // Element-tinted trail: a small fading mote every few frames.
+    p.trailAcc = (p.trailAcc ?? 0) + dt;
+    if (p.trailAcc >= 0.055) {
+      p.trailAcc = 0;
+      pushEffect(ctx, {
+        kind: "particle",
+        x: p.body.position.x,
+        y: p.body.position.y,
+        vx: -p.body.velocity.x * 6,
+        vy: -p.body.velocity.y * 6,
+        gravity: 0,
+        size: Math.max(2, p.radius * 0.5),
+        particleShape: "circle",
+        color: p.glow,
+        ttl: 0.22,
+      });
+    }
+
     // Ranged shots fly nearly flat: cancel most of gravity every tick.
     if (!p.arc) {
       Matter.Body.applyForce(p.body, p.body.position, {
@@ -1056,13 +1124,9 @@ export function updateProjectiles(
           text: "CRIT!",
         });
       }
-      pushEffect(ctx, {
-        kind: "ring",
-        x: p.body.position.x,
-        y: p.body.position.y,
-        ttl: 0.3,
-        color: p.glow,
-        radius: p.radius * 4,
+      impactSparks(ctx, p.body.position.x, p.body.position.y, { color: p.glow, count: 6 });
+      shockwaveRing(ctx, p.body.position.x, p.body.position.y, {
+        color: p.glow, radius: 6, expand: p.radius * 26, thickness: 2.5, ttl: 0.22,
       });
       // Behavior-engine hook: this projectile came from a program.
       try {

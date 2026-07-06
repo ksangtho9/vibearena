@@ -181,6 +181,8 @@ export interface Fighter {
   /** Gap-closer poke: while > 0, passing through the foe lands one light hit. */
   dashPokeTimer: number;
   dashPokeHit: boolean;
+  /** Ambient state-VFX emission accumulator (effectsJuice upkeep). */
+  fxAcc: number;
 
   buffs: FighterBuffs;
   trail: TrailPoint[];
@@ -323,6 +325,7 @@ export function createFighter(
     leapLandState: 0,
     dashPokeTimer: 0,
     dashPokeHit: false,
+    fxAcc: 0,
     buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
   };
@@ -1445,19 +1448,39 @@ export function renderFighter(
     ctx.restore();
   }
 
-  // Shield bubble.
+  // Shield bubble: a real translucent dome with a drifting shimmer band,
+  // scaled in over the first beat. Absorb ripples come from dealDamage.
   if (fighter.shieldTimer > 0) {
+    const cxs = sk.hips.x;
+    const cys = sk.hips.y - 24 * s;
+    const rise = Math.min(1, (3 - Math.min(3, fighter.shieldTimer)) * 6 + 0.35);
+    const rr = 58 * s * rise;
     ctx.save();
-    ctx.globalAlpha = 0.3 + 0.15 * Math.sin(time * 10);
+    // Glassy fill.
+    const dome = ctx.createRadialGradient(cxs, cys, rr * 0.3, cxs, cys, rr);
+    dome.addColorStop(0, withAlpha(fighter.style.glow, 0.03));
+    dome.addColorStop(0.82, withAlpha(fighter.style.glow, 0.1));
+    dome.addColorStop(1, withAlpha(fighter.style.glow, 0.28));
+    ctx.fillStyle = dome;
+    ctx.beginPath();
+    ctx.arc(cxs, cys, rr, 0, Math.PI * 2);
+    ctx.fill();
+    // Rim + slow-drifting shimmer band.
+    ctx.globalAlpha = 0.5 + 0.18 * Math.sin(time * 9);
     ctx.strokeStyle = fighter.style.glow;
     ctx.lineWidth = 2.5;
     ctx.shadowColor = fighter.style.glow;
-    ctx.shadowBlur = 12;
-    ctx.setLineDash([10, 7]);
+    ctx.shadowBlur = 14;
     ctx.beginPath();
-    ctx.arc(sk.hips.x, sk.hips.y - 24 * s, 58 * s, 0, Math.PI * 2);
+    ctx.arc(cxs, cys, rr, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.setLineDash([]);
+    ctx.globalAlpha = 0.65;
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 1.5;
+    const band = time * 1.7;
+    ctx.beginPath();
+    ctx.arc(cxs, cys, rr * 0.92, band, band + 0.9);
+    ctx.stroke();
     ctx.restore();
   }
   // Buff motes.
