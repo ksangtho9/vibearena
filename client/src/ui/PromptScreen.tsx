@@ -2,38 +2,57 @@ import { useState } from "react";
 import { useVibeStore } from "../store";
 
 /**
- * Curated pool of example fighters. Three are drawn at random per mount, so
- * every visit to this screen suggests something new — intentionally NOT
- * LLM-generated (no API cost just for loading the page).
+ * Curated example fighters in THREE escalating tiers. One chip is drawn from
+ * each tier per mount (simplest first), so the suggestions read as a power
+ * curve — intentionally NOT LLM-generated (no API cost just for loading the
+ * page).
  */
-const EXAMPLE_POOL = [
-  "a drunk samurai who throws exploding sake bottles and dashes on a hangover",
-  "a librarian who silences the arena and hurls overdue encyclopedias",
-  "a tiny wizard grandpa with a walking-stick railgun and a nap-powered shield",
-  "a grandma knight with a cast-iron skillet and an impenetrable shawl",
-  "a ballet assassin whose pirouettes whip up razor wind",
-  "a sentient traffic cone that lobs molten asphalt",
-  "a mime who punches through the walls of his invisible box",
-  "a barista berserker flinging scalding espresso shots",
-  "a haunted scarecrow guarded by a tornado of crows",
-  "a disco knight whose shield is a spinning mirrorball",
-  "a sleepy panda monk who fights better while dreaming",
-  "a glitchy arcade hologram with a flickering pixel sword",
-  "a beekeeper general who calls in hive artillery strikes",
-  "a lava-lamp golem lobbing blobs of hypnotic goo",
-  "an origami dragon that folds itself into paper blades",
-  "a plumber sage with a pipe staff and a geyser slam",
-  "a vampire accountant who drains HP like unpaid taxes",
-  "a rooftop pigeon king armed with a baguette lance",
-] as const;
+const MEDIUM = [
+  "a grumpy lumberjack with an axe that bursts into flames",
+  "a ballet assassin who dashes across the stage on pointe",
+  "a retired sumo who belly-flops shockwaves",
+  "a vampire barista who drains life with a scalding espresso whip",
+  "a punk skater swinging a rocket-powered skateboard",
+  "a tiny wizard grandpa with a nap-powered shield and a walking-stick zap",
+  "a cowboy raccoon who flings spinning trash-can lids",
+];
+const COMPLEX = [
+  "a frost witch who freezes the floor slick and splits into a mirror image",
+  "a cactus gunslinger who fans six thorn-bullets and roots you to the spot",
+  "a thunder monk whose fists chain lightning and who blinks behind you to counter",
+  "a plague alchemist who lobs poison bombs and heals off every hit",
+  "a gravity-hexed knight whose greatsword slams a shockwave and yanks you in",
+  "a beekeeper general who calls in hive artillery and hides behind a swarm shield",
+  "a mirror duelist who parries with a shield of glass and launches you skyward",
+];
+const CHAOS = [
+  "a cosmic disco lich who fires rainbow lasers from his third eye, flips gravity on the beat, and splits into two glowing clone dancers",
+  "an ancient clockwork god with no hands who levitates twin hourglass blades, rewinds out of danger, and freezes you mid-swing",
+  "a black-hole sorcerer whose floating orb drags you in, rains meteors from the sky, and grows giant when he's cornered",
+  "a storm titan who hurls boomerang lightning, blinks through the rain, and summons two thunder-clones to mob you",
+  "a void jester juggling three floating knives who teleports behind you, drops a gravity trap, and shrinks you to a bug",
+  "a phoenix empress made of fire whose eye-beams scorch the ground, who bursts back to life on death, and slows the world to embers",
+  "a doomsday DJ whose speaker-cannon fires bass shockwaves, raises a wall of sound, and quakes the whole arena on the drop",
+];
 
-function pickExamples(): string[] {
-  const pool = [...EXAMPLE_POOL];
-  for (let i = pool.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [pool[i], pool[j]] = [pool[j], pool[i]];
-  }
-  return pool.slice(0, 3);
+interface TieredExample {
+  text: string;
+  /** Escalation pips: ◆ / ◆◆ / ◆◆◆. */
+  pips: string;
+  label: string;
+}
+
+const TIERS: { pool: string[]; pips: string; label: string }[] = [
+  { pool: MEDIUM, pips: "◆", label: "warm-up" },
+  { pool: COMPLEX, pips: "◆◆", label: "spicy" },
+  { pool: CHAOS, pips: "◆◆◆", label: "chaos" },
+];
+
+const pickFrom = (pool: string[]) => pool[Math.floor(Math.random() * pool.length)];
+
+/** One chip per tier, ordered simplest → wildest. */
+function pickExamples(): TieredExample[] {
+  return TIERS.map((t) => ({ text: pickFrom(t.pool), pips: t.pips, label: t.label }));
 }
 
 /**
@@ -88,7 +107,7 @@ export function PromptScreen() {
         id="fighter-prompt"
         className="prompt-input"
         value={text}
-        placeholder={`e.g. "${examples[0]}"`}
+        placeholder={`e.g. "${examples[0].text}"`}
         rows={3}
         maxLength={300}
         disabled={generating}
@@ -98,16 +117,19 @@ export function PromptScreen() {
         }}
       />
 
-      <div className="chips" aria-label="Example fighters">
+      <div className="chips chips-tiered" aria-label="Example fighters, simplest to wildest">
         {examples.map((example) => (
           <button
-            key={example}
+            key={example.text}
             type="button"
-            className="chip"
+            className="chip chip-tiered"
             disabled={generating}
-            onClick={() => setText(example)}
+            onClick={() => setText(example.text)}
           >
-            {example}
+            <span className="chip-tier" aria-label={example.label} title={example.label}>
+              {example.pips}
+            </span>
+            {example.text}
           </button>
         ))}
       </div>

@@ -602,3 +602,25 @@ body {
   align-items: center;
   gap: 4px;
 }
+
+/* Tiered example chips: one per tier, stacked simplest → wildest. */
+.chips-tiered {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+
+.chips-tiered .chip-tiered {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  text-align: left;
+}
+
+.chip-tier {
+  flex: 0 0 34px;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--gold);
+  opacity: 0.65;
+}
