@@ -26,18 +26,17 @@ The JSON must match this exact shape:
   "name": string,                      // short, punchy fighter name
   "appearance": {
     "color": string,                   // CSS color for the fighter's body, e.g. "#ff5533" or "crimson"
-    "accessories": string[],           // 0-4 short items, e.g. ["straw hat", "cape"]
+    "accessories": string[],           // 0-4 short items, e.g. ["straw hat", "cape"] — head keywords
+                                       // here auto-pick a drawn hat/helm (viking→horned helm, wizard→
+                                       // pointed hat, king→crown, samurai→kabuto, ninja→mask, angel→halo…)
     "height": number,                  // 0.8 (short) to 1.2 (tall)
-    "outfit": {                        // DRESS the fighter to match the concept ("none" where bare)
-      "head": "none"|"hat"|"tophat"|"helmet"|"hood"|"crown"|"cap"|"horns"|"halo",
-      "face": "none"|"mask"|"visor"|"goggles"|"warpaint",
-      "back": "none"|"cape"|"cloak"|"wings"|"quiver"|"pack"|"sheath",
-      "torso": "none"|"chestplate"|"vest"|"robe"|"harness"|"scarf",
-      "shoulders": "none"|"pauldrons"|"spikes"|"epaulettes",
-      "arms": "none"|"gauntlets"|"bracers",
-      "legs": "none"|"boots"|"greaves"|"skirt",
-      "material": "cloth"|"leather"|"metal"|"gold"|"bone"
-    }
+    "gear": [ { "kind": "armor"|"wings" } ],
+                                       // OPTIONAL, only when the CONCEPT grants it: armor = drawn
+                                       // plate + tanky (+defense); wings = drawn wings + DOUBLE JUMP.
+    "headgear": {"handlers":{"onRenderHead":[Action]}}
+                                       // OPTIONAL: DRAW a bespoke head accessory yourself (~30x/s at
+                                       // the head; draw verbs default to it). Only for exotic headwear
+                                       // the keyword set can't cover.
   },
   "weapon": {
     "form": "sword" | "greatsword" | "dagger" | "axe" | "hammer" | "warhammer" | "mace" | "rapier" | "spear" | "halberd" | "scythe" | "whip" | "flail" | "staff" | "bow" | "gun" | "cannon" | "orb" | "shield" | "claw" | "chakram" | "bomb",
@@ -205,6 +204,8 @@ EXOTIC WEAPONS — when the concept's weapon is NOT a held object (a body-part e
   3. still pick the closest "form" — it silently drives mechanics/reach only (a head laser: form "gun", type "ranged");
   4. attacks fire FROM the mount automatically; pair with a weapon "behavior" (onAttack beam/projectile) to complete the fantasy.
   Held weapons (swords, hammers, bows…) should SKIP renderProgram and just use form+parts.
+  HEAD + GEAR: every fighter gets a drawn head accessory automatically from name/accessory keywords — author "headgear" (onRenderHead, same rules as onRenderWeapon) ONLY for exotic headwear (a fishbowl helmet, a candle crown). Add "gear" ONLY when the concept truly includes it: {"kind":"armor"} for armored/iron-clad concepts (tanky), {"kind":"wings"} for winged/valkyrie concepts (double jump). A plain brawler gets NEITHER.
+    e.g. armored juggernaut: "appearance":{...,"gear":[{"kind":"armor"}]} · winged valkyrie: "gear":[{"kind":"wings"}]
   Worked examples:
     laser eyes: "form":"gun","type":"ranged","mount":"head","renderProgram":{"handlers":{"onRenderWeapon":[{"do":"drawShape","shape":"circle","x":{"op":"+","a":"mount.x","b":4},"y":"mount.y","radius":3,"color":"#ff2d2d","ttl":0.06},{"do":"drawShape","shape":"circle","x":{"op":"-","a":"mount.x","b":4},"y":"mount.y","radius":3,"color":"#ff2d2d","ttl":0.06}]}},"behavior":{"handlers":{"onAttack":[{"do":"beam","dir":0,"length":260,"damage":18,"duration":0.5,"color":"#ff2d2d"}]}}
     floating soul blade (orbits + slashes): "form":"sword","mount":"floating","renderProgram":{"handlers":{"onRenderWeapon":[{"do":"drawLine","x":"mount.x","y":{"op":"-","a":"mount.y","b":14},"x2":"mount.x","y2":{"op":"+","a":"mount.y","b":14},"color":"#9be8ff","width":4,"ttl":0.07},{"do":"drawShape","shape":"circle","x":"mount.x","y":{"op":"-","a":"mount.y","b":14},"radius":2,"color":"#e8fbff","ttl":0.07},{"do":"spawnParticles","count":1,"x":"mount.x","y":"mount.y","color":"#9be8ff","speed":20,"lifetime":0.3}]}}
@@ -228,15 +229,15 @@ EXOTIC WEAPONS — when the concept's weapon is NOT a held object (a body-part e
 
 const EXAMPLE_VOLTAGE = `
 Example — user: "a forgotten thunder god working as a demolition contractor"
-{"name":"Foreman Voltage","appearance":{"color":"#4a6fa5","accessories":["hard hat","tool belt"],"height":1.15,"outfit":{"head":"helmet","face":"none","back":"none","torso":"harness","shoulders":"none","arms":"gauntlets","legs":"boots","material":"metal"}},"weapon":{"form":"warhammer","type":"melee","name":"Storm Maul","size":"large","curve":0,"spikes":2,"doubleEnded":false,"element":"lightning","parts":{"head":{"type":"hammer","size":0.9,"spikes":2},"haft":{"length":0.7,"wrapped":true},"pommel":"ring","adornments":["runes"],"material":"steel"},"properties":[{"kind":"knockback","magnitude":6},{"kind":"stagger","magnitude":5}],"range":4,"damage":8},"ability":{"name":"Scheduled Outage","kind":"aoe","element":"lightning","motif":"nova","params":{"radius":8},"cooldown":8,"power":8},"utility":{"name":"Union Break","kind":"buff","element":"lightning","motif":"burst","params":{"stat":"strength","magnitude":7,"duration":4},"cooldown":9,"power":6},"stats":{"hp":7,"speed":3,"strength":9,"defense":5},"flavor":"Every demolition is on time, under budget, and slightly smited."}`;
+{"name":"Foreman Voltage","appearance":{"color":"#4a6fa5","accessories":["hard hat","tool belt"],"height":1.15,"gear":[{"kind":"armor"}]},"weapon":{"form":"warhammer","type":"melee","name":"Storm Maul","size":"large","curve":0,"spikes":2,"doubleEnded":false,"element":"lightning","parts":{"head":{"type":"hammer","size":0.9,"spikes":2},"haft":{"length":0.7,"wrapped":true},"pommel":"ring","adornments":["runes"],"material":"steel"},"properties":[{"kind":"knockback","magnitude":6},{"kind":"stagger","magnitude":5}],"range":4,"damage":8},"ability":{"name":"Scheduled Outage","kind":"aoe","element":"lightning","motif":"nova","params":{"radius":8},"cooldown":8,"power":8},"utility":{"name":"Union Break","kind":"buff","element":"lightning","motif":"burst","params":{"stat":"strength","magnitude":7,"duration":4},"cooldown":9,"power":6},"stats":{"hp":7,"speed":3,"strength":9,"defense":5},"flavor":"Every demolition is on time, under budget, and slightly smited."}`;
 
 const EXAMPLE_WITCH = `
 Example — user: "a swamp witch who brews hexes in a cracked cauldron"
-{"name":"Granny Bilewater","appearance":{"color":"#6e8f5a","accessories":["pointed hat","charm necklace"],"height":0.85,"outfit":{"head":"hat","face":"none","back":"cloak","torso":"robe","shoulders":"none","arms":"none","legs":"none","material":"cloth"}},"weapon":{"form":"staff","type":"ranged","name":"Hex-Tipped Broom Staff","size":"medium","curve":0.4,"spikes":0,"doubleEnded":false,"element":"arcane","parts":{"haft":{"length":1,"wrapped":false},"pommel":"gem","adornments":["runes","tassel"],"material":"wood"},"range":8,"damage":5},"ability":{"name":"Cauldron Belch","kind":"projectile","element":"poison","motif":"orbs","params":{"count":3,"spread":0.5,"homing":true},"cooldown":6,"power":7},"utility":{"name":"Bog Remedy","kind":"heal","element":"poison","motif":"aura","params":{"amount":6,"overTime":true},"cooldown":9,"power":6},"stats":{"hp":5,"speed":4,"strength":3,"defense":6},"flavor":"Her hexes are artisanal, small-batch, and deeply personal."}`;
+{"name":"Granny Bilewater","appearance":{"color":"#6e8f5a","accessories":["pointed hat","charm necklace"],"height":0.85},"weapon":{"form":"staff","type":"ranged","name":"Hex-Tipped Broom Staff","size":"medium","curve":0.4,"spikes":0,"doubleEnded":false,"element":"arcane","parts":{"haft":{"length":1,"wrapped":false},"pommel":"gem","adornments":["runes","tassel"],"material":"wood"},"range":8,"damage":5},"ability":{"name":"Cauldron Belch","kind":"projectile","element":"poison","motif":"orbs","params":{"count":3,"spread":0.5,"homing":true},"cooldown":6,"power":7},"utility":{"name":"Bog Remedy","kind":"heal","element":"poison","motif":"aura","params":{"amount":6,"overTime":true},"cooldown":9,"power":6},"stats":{"hp":5,"speed":4,"strength":3,"defense":6},"flavor":"Her hexes are artisanal, small-batch, and deeply personal."}`;
 
 const EXAMPLE_RONIN = `
 Example — user: "a wandering ronin who duels at dawn"
-{"name":"Kagerou","appearance":{"color":"#d94f30","accessories":["straw hat"],"height":1.05,"outfit":{"head":"hat","face":"none","back":"sheath","torso":"robe","shoulders":"none","arms":"none","legs":"none","material":"cloth"}},"weapon":{"form":"sword","type":"melee","name":"Dawnlight Katana","size":"medium","curve":0.3,"spikes":0,"doubleEnded":false,"element":"holy","parts":{"blade":{"profile":"katana","length":0.8,"width":0.25,"edges":1,"count":1,"fuller":true,"tip":"tanto"},"haft":{"length":0.35,"wrapped":true},"guard":"disc","pommel":"none","adornments":["ribbon"],"material":"steel"},"properties":[{"kind":"bleed","magnitude":5},{"kind":"attackSpeed","magnitude":6}],"range":5,"damage":7},"ability":{"name":"Crescent Wave","kind":"projectile","element":"holy","motif":"slash","params":{"count":1,"homing":false},"cooldown":5,"power":7},"utility":{"name":"Iaijutsu Step","kind":"dash","element":"holy","motif":"slash","params":{"distance":8,"iframes":0.3},"cooldown":6,"power":7},"stats":{"hp":5,"speed":8,"strength":6,"defense":3},"flavor":"He has drawn his blade twice; both dawns are remembered."}`;
+{"name":"Kagerou","appearance":{"color":"#d94f30","accessories":["straw hat"],"height":1.05},"weapon":{"form":"sword","type":"melee","name":"Dawnlight Katana","size":"medium","curve":0.3,"spikes":0,"doubleEnded":false,"element":"holy","parts":{"blade":{"profile":"katana","length":0.8,"width":0.25,"edges":1,"count":1,"fuller":true,"tip":"tanto"},"haft":{"length":0.35,"wrapped":true},"guard":"disc","pommel":"none","adornments":["ribbon"],"material":"steel"},"properties":[{"kind":"bleed","magnitude":5},{"kind":"attackSpeed","magnitude":6}],"range":5,"damage":7},"ability":{"name":"Crescent Wave","kind":"projectile","element":"holy","motif":"slash","params":{"count":1,"homing":false},"cooldown":5,"power":7},"utility":{"name":"Iaijutsu Step","kind":"dash","element":"holy","motif":"slash","params":{"distance":8,"iframes":0.3},"cooldown":6,"power":7},"stats":{"hp":5,"speed":8,"strength":6,"defense":3},"flavor":"He has drawn his blade twice; both dawns are remembered."}`;
 
 /** Build the system prompt for a model tier (see file header). */
 export function buildSystemPrompt(tier: PromptTier): string {

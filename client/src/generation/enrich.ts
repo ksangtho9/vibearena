@@ -24,6 +24,8 @@ import {
   resolveWeaponIdentity,
 } from "../game/weapons/mapWeapon";
 import { hueShift, safeCssColor, shade } from "../render/color";
+import { headgearFromText, type HeadgearKind } from "../game/gear";
+import type { GearItem } from "../types/character";
 
 /**
  * Post-generation normalization: snaps the LLM's visual weapon descriptors
@@ -305,6 +307,8 @@ function resolveOutfit(spec: CharacterSpec): ResolvedOutfit {
 
 export interface ResolvedStyle {
   fill: string;
+  /** Keyword-derived parametric head accessory (LLM headgear wins). */
+  headgear: HeadgearKind | null;
   outline: string;
   accent: string;
   glow: string;
@@ -350,7 +354,30 @@ export function resolveStyle(spec: CharacterSpec): ResolvedStyle {
   // Heavier defenders wear visibly chunkier armor (stats 32–208 → 0–1).
   const bulk = Math.max(0, Math.min(1, (spec.stats.defense - 32) / 176));
 
-  return { fill, outline, accent, glow, element, weapon, trail, outfit, bulk };
+  // Keyword head accessory: reliable fallback beneath any LLM headgear
+  // program ("viking" always gets the horned helm).
+  const headgear =
+    (spec.appearance.headgearKind as HeadgearKind | undefined) ??
+    headgearFromText(
+      `${spec.name} ${spec.flavor ?? ""} ${(spec.appearance.accessories ?? []).join(" ")} ${spec.appearance.outfit?.head ?? ""}`,
+    );
+
+  return { fill, outline, accent, glow, element, weapon, trail, outfit, bulk, headgear };
+}
+
+/** Keyword backstop for FUNCTIONAL gear — only when the concept clearly
+ * grants it (armor → tanky, wings → double jump). */
+function detectGear(spec: CharacterSpec, sourcePrompt = ""): GearItem[] | undefined {
+  const have = new Set((spec.appearance.gear ?? []).map((g) => g.kind));
+  const text = `${sourcePrompt} ${spec.name} ${spec.flavor ?? ""} ${(spec.appearance.accessories ?? []).join(" ")}`;
+  if (!have.has("armor") && /armou?r|plated|iron-?clad|plate ?mail|juggernaut|steel-?clad/i.test(text)) {
+    have.add("armor");
+  }
+  if (!have.has("wings") && /wing(s|ed)?\b|valkyrie|seraph/i.test(text)) {
+    have.add("wings");
+  }
+  if (have.size === 0) return undefined;
+  return [...have].map((kind) => ({ kind }));
 }
 
 const DEFAULT_MOTIF: Record<AbilitySpec["kind"], AbilityMotif> = {
@@ -480,7 +507,7 @@ function defaultAbilityParams(ability: AbilitySpec): AbilityParams {
 }
 
 /** Write the resolved style back into the spec's optional derived fields. */
-export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
+export function enrichCharacter(spec: CharacterSpec, sourcePrompt = ""): CharacterSpec {
   // Resolve from a copy with fully-derived fields cleared, so enriching an
   // already enriched spec recomputes rather than echoes.
   const bare: CharacterSpec = {
@@ -497,6 +524,18 @@ export function enrichCharacter(spec: CharacterSpec): CharacterSpec {
       outfit: style.outfit,
       accentColor: style.accent,
       outline: style.outline,
+      // AI-drawn head accessory: vetted exactly like weapon renderPrograms;
+      // when it's dropped, the keyword shape takes over. The USER PROMPT is
+      // part of the keyword text, so "viking berserker" reliably gets the
+      // horned helm even when the LLM names him something else.
+      headgear: vetProgram(spec.appearance.headgear, `${spec.name} (headgear)`),
+      headgearKind:
+        headgearFromText(
+          `${sourcePrompt} ${spec.name} ${spec.flavor ?? ""} ${(spec.appearance.accessories ?? []).join(" ")} ${spec.appearance.outfit?.head ?? ""}`,
+        ) ?? undefined,
+      // Functional gear: LLM-emitted, plus a keyword backstop (prompt
+      // included) so "armored"/"winged" prompts reliably grant the effect.
+      gear: detectGear(spec, sourcePrompt),
     },
     weapon: {
       ...spec.weapon,

@@ -305,6 +305,25 @@ export function equipWeaponRender(caster: Fighter, ctx: CombatCtx): void {
   ctx.behaviors.push(rt);
 }
 
+/**
+ * AI-drawn HEAD accessory: identical machinery to the weapon render, but the
+ * onRenderHead handler anchors its draw verbs to the head joint. Fallback on
+ * failure = the keyword-derived parametric shape (style.headgear).
+ */
+export function equipHeadgearRender(caster: Fighter, ctx: CombatCtx): void {
+  const program = caster.spec.appearance.headgear;
+  if (!program?.handlers.onRenderHead) return;
+  const rt = makeRuntime(
+    caster,
+    program,
+    { element: caster.style.element, motif: "burst", glow: caster.style.glow },
+    true,
+  );
+  rt.anchor = () => ({ x: caster.skeleton.head.x, y: caster.skeleton.head.y });
+  caster.headRenderRuntime = rt;
+  ctx.behaviors.push(rt);
+}
+
 /** Called from the fixed-step loop: waits, onTick (10 Hz), onLand, expiry. */
 export function tickBehaviors(ctx: CombatCtx, dt: number): void {
   for (const rt of ctx.behaviors) {
@@ -337,14 +356,15 @@ export function tickBehaviors(ctx: CombatCtx, dt: number): void {
 
     // onRenderWeapon: the LLM-drawn weapon look, ~30Hz with a tight draw
     // budget. A catastrophic failure kills the runtime → parametric fallback.
-    if (rt.program.handlers.onRenderWeapon) {
+    const renderHandler = rt.program.handlers.onRenderWeapon ?? rt.program.handlers.onRenderHead;
+    if (renderHandler) {
       rt.renderAcc += dt;
       if (rt.renderAcc >= 1 / 30) {
         rt.renderAcc = 0;
         try {
           beginInvocation(rt);
           rt.actionBudget = 40; // per-frame draw budget
-          runActions(rt, ctx, rt.program.handlers.onRenderWeapon, 0);
+          runActions(rt, ctx, renderHandler, 0);
         } catch (err) {
           console.warn("[vibearena] weapon renderProgram died (parametric fallback):", err);
           rt.done = true;

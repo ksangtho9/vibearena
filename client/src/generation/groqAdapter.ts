@@ -42,7 +42,7 @@ export async function generateCharacter(prompt: string): Promise<GenerationResul
     return {
       // vetCustomScripts: Worker halt-test on any raw-JS ability scripts —
       // hung/throwing scripts are dropped here, before the spec ships.
-      spec: await vetCustomScripts(enrichCharacter(balanceCharacter(spec))),
+      spec: await vetCustomScripts(enrichCharacter(balanceCharacter(spec), prompt)),
       fallback: false,
       mocked: Boolean(body.mocked),
     };

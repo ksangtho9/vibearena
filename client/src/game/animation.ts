@@ -20,6 +20,7 @@ export interface Vec {
 export type AnimState =
   | "idle"
   | "run"
+  | "backpedal"
   | "jump"
   | "fall"
   | "attack"
@@ -215,6 +216,9 @@ export interface AnimInputs {
   weaponForm: WeaponForm;
   weaponSize: WeaponSize;
   weaponType: MechType;
+  /** Where the weapon lives; non-hand mounts swap the swing for a command
+   * gesture (the weapon itself strikes — see stickman drawWeapon). */
+  weaponMount?: "hand" | "head" | "body" | "floating" | "dual" | "none";
   castTimer: number;
   hitstunTimer: number;
   launchedTimer: number;
@@ -235,7 +239,10 @@ export interface Animator {
 
 const easeOut = (t: number) => 1 - (1 - t) * (1 - t);
 const easeIn = (t: number) => t * t;
+const easeInOut = (t: number) => (t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+/** Follow-through bump: rises then settles within the phase (0 at both ends). */
+const carry = (k: number, amp: number) => Math.sin(Math.min(1, k * 2.2) * Math.PI) * amp;
 
 interface FootPlant {
   locked: boolean;
@@ -346,10 +353,12 @@ function attackContribution(
         out.lean = lerp(-0.14, 0.32, D);
         out.hipsDy = lerp(-3, 5, D); // drop the weight in
       } else {
-        out.hand = { fwd: lerp(18, 8, K), up: lerp(8, -12, K) };
-        out.dirRel = lerp(0.85, -0.7, K);
-        out.lean = lerp(0.32, 0.06, K);
-        out.hipsDy = lerp(5, 0, K);
+        // Follow-through: the head buries past the target, then eases home.
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(18, 8, K) + c * 2.5, up: lerp(8, -12, K) + c * 3 };
+        out.dirRel = lerp(0.85, -0.7, K) + c * 0.18;
+        out.lean = lerp(0.32, 0.06, K) + c * 0.05;
+        out.hipsDy = lerp(5, 0, K) + c * 0.8;
       }
       out.offHand = { fwd: out.hand.fwd, up: out.hand.up }; // both on the haft
       break;
@@ -358,16 +367,20 @@ function attackContribution(
       // Spear stays level: the tip travels the reach line.
       out.dirRel = -0.05;
       if (phase === "windup") {
-        out.hand = { fwd: lerp(4, -9, K), up: -6 };
-        out.lean = lerp(0.08, -0.02, K);
+        // Coil: hips + shoulder load back, tip stays on line.
+        out.hand = { fwd: lerp(4, -9, K), up: lerp(-6, -5, K) };
+        out.lean = lerp(0.08, -0.09, K);
+        out.hipsDy = -1.2 * K;
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(-9, 15, easeIn(k)), up: -6 };
-        out.lean = lerp(-0.02, 0.26, K);
-        out.hipsDy = 2 * K;
+        const D = easeIn(k);
+        out.hand = { fwd: lerp(-9, 15, D), up: -6 };
+        out.lean = lerp(-0.09, 0.28, D); // whole body lunges down the line
+        out.hipsDy = lerp(-1.2, 2.5, D);
       } else {
-        out.hand = { fwd: lerp(15, 4, K), up: -6 };
-        out.lean = lerp(0.26, 0.08, K);
-        out.hipsDy = lerp(2, 0, K);
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(15, 4, K) + c * 1.6, up: -6 };
+        out.lean = lerp(0.28, 0.08, K) + c * 0.04;
+        out.hipsDy = lerp(2.5, 0, K);
       }
       break;
     }
@@ -377,14 +390,16 @@ function attackContribution(
         out.dirRel = lerp(-0.6, -2.4, K);
         out.lean = lerp(0.06, -0.1, K);
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(-13, 19, K), up: lerp(-4, -8, K) };
-        out.dirRel = lerp(-2.4, 0.25, K);
-        out.lean = lerp(-0.1, 0.3, K);
-        out.hipsDy = 3 * K;
+        const D = easeIn(k); // the sweep ACCELERATES through the arc
+        out.hand = { fwd: lerp(-13, 19, D), up: lerp(-4, -8, D) };
+        out.dirRel = lerp(-2.4, 0.25, D);
+        out.lean = lerp(-0.1, 0.3, D);
+        out.hipsDy = 3 * D;
       } else {
-        out.hand = { fwd: lerp(19, 6, K), up: lerp(-8, -10, K) };
-        out.dirRel = lerp(0.25, -0.6, K);
-        out.lean = lerp(0.3, 0.06, K);
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(19, 6, K) + c * 2, up: lerp(-8, -10, K) };
+        out.dirRel = lerp(0.25, -0.6, K) + c * 0.22;
+        out.lean = lerp(0.3, 0.06, K) + c * 0.05;
         out.hipsDy = lerp(3, 0, K);
       }
       break;
@@ -399,9 +414,10 @@ function attackContribution(
         out.dirRel = lerp(-2.1, 0.2, easeIn(k));
         out.lean = lerp(-0.06, 0.26, K);
       } else {
-        out.hand = { fwd: lerp(20, 8, K), up: lerp(-4, -12, K) };
-        out.dirRel = lerp(0.2, -0.4, K);
-        out.lean = lerp(0.26, 0.06, K);
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(20, 8, K) + c * 1.5, up: lerp(-4, -12, K) };
+        out.dirRel = lerp(0.2, -0.4, K) + c * 0.25; // the lash settles in waves
+        out.lean = lerp(0.26, 0.06, K) + c * 0.04;
       }
       break;
     }
@@ -409,15 +425,20 @@ function attackContribution(
       if (phase === "windup") {
         out.hand = { fwd: lerp(8, 2, K), up: lerp(-12, -20, K) };
         out.dirRel = lerp(-0.55, -1.25, K);
-        out.lean = lerp(0.06, -0.05, K);
+        out.lean = lerp(0.06, -0.07, K); // gather: weight rocks back
+        out.hipsDy = -1 * K;
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(2, 17, K), up: lerp(-20, -6, K) };
-        out.dirRel = lerp(-1.25, -0.15, K);
-        out.lean = lerp(-0.05, 0.2, K);
+        const D = easeIn(k);
+        out.hand = { fwd: lerp(2, 17, D), up: lerp(-20, -6, D) };
+        out.dirRel = lerp(-1.25, -0.15, D);
+        out.lean = lerp(-0.07, 0.22, D); // the PUSH comes from the torso
+        out.hipsDy = lerp(-1, 1.5, D);
       } else {
-        out.hand = { fwd: lerp(17, 8, K), up: lerp(-6, -12, K) };
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(17, 8, K) + c * 1.4, up: lerp(-6, -12, K) };
         out.dirRel = lerp(-0.15, -0.55, K);
-        out.lean = lerp(0.2, 0.06, K);
+        out.lean = lerp(0.22, 0.06, K) + c * 0.03;
+        out.hipsDy = lerp(1.5, 0, K);
       }
       break;
     }
@@ -425,9 +446,12 @@ function attackContribution(
       out.dirRel = -0.08;
       out.lean = 0.12;
       if (phase === "windup") {
-        // Bow arm steady forward; string hand pulls back to the cheek.
+        // Bow arm steady forward; string hand pulls back to the cheek and
+        // the archer settles INTO the draw (weight sinks, slight lean back).
         out.hand = { fwd: 14, up: -6 };
-        out.offHand = { fwd: lerp(12, -2, K), up: -5 };
+        out.offHand = { fwd: lerp(12, -2, easeInOut(k)), up: -5 };
+        out.lean = lerp(0.12, 0.05, K);
+        out.hipsDy = -1 * K;
       } else if (phase === "active") {
         // Release: string hand snaps forward, slight bow recoil.
         out.hand = { fwd: lerp(14, 12.5, K), up: -6 };
@@ -451,8 +475,9 @@ function attackContribution(
         out.dirRel = lerp(0, -0.35, easeOut(k));
         out.lean = lerp(0.1, -0.04, K);
       } else {
-        out.hand = { fwd: lerp(8.5, 8, K), up: lerp(-11, -12, K) };
-        out.dirRel = lerp(-0.35, -0.5, K);
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(8.5, 8, K), up: lerp(-11, -12, K) + c * 1.2 };
+        out.dirRel = lerp(-0.35, -0.5, K) - c * 0.08; // muzzle settles down
         out.lean = lerp(-0.04, 0.08, K);
       }
       break;
@@ -461,15 +486,18 @@ function attackContribution(
       out.dirRel = -0.3;
       if (phase === "windup") {
         out.hand = { fwd: lerp(8, 1, K), up: lerp(-10, -6, K) };
-        out.lean = lerp(0.06, -0.05, K);
+        out.lean = lerp(0.06, -0.09, K); // shoulder loads behind the shield
+        out.hipsDy = -1 * K;
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(1, 18, easeIn(k)), up: -8 };
-        out.lean = lerp(-0.05, 0.3, K);
-        out.hipsDy = 2.5 * K;
+        const D = easeIn(k);
+        out.hand = { fwd: lerp(1, 18, D), up: -8 };
+        out.lean = lerp(-0.09, 0.32, D); // whole body slams in
+        out.hipsDy = lerp(-1, 3, D);
       } else {
-        out.hand = { fwd: lerp(18, 8, K), up: lerp(-8, -10, K) };
-        out.lean = lerp(0.3, 0.06, K);
-        out.hipsDy = lerp(2.5, 0, K);
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(18, 8, K) + c * 1.8, up: lerp(-8, -10, K) };
+        out.lean = lerp(0.32, 0.06, K) + c * 0.05;
+        out.hipsDy = lerp(3, 0, K);
       }
       break;
     }
@@ -477,20 +505,65 @@ function attackContribution(
       if (phase === "windup") {
         out.hand = { fwd: lerp(8, -8, K), up: lerp(-10, -19, K) };
         out.dirRel = lerp(-0.5, -2.0, K);
-        out.lean = lerp(0.06, -0.08, K);
+        out.lean = lerp(0.06, -0.13, K); // hips + torso coil behind the throw
+        out.hipsDy = -1.5 * K;
+        out.offHand = { fwd: lerp(3, 11, K), up: -10 }; // sight down the line
       } else if (phase === "active") {
-        out.hand = { fwd: lerp(-8, 19, easeOut(k)), up: lerp(-19, -8, K) };
-        out.dirRel = lerp(-2.0, 0.1, easeOut(k));
-        out.lean = lerp(-0.08, 0.26, K);
-        out.hipsDy = 2 * K;
+        const D = easeOut(k);
+        out.hand = { fwd: lerp(-8, 19, D), up: lerp(-19, -8, D) };
+        out.dirRel = lerp(-2.0, 0.1, D);
+        out.lean = lerp(-0.13, 0.28, D);
+        out.hipsDy = lerp(-1.5, 2.5, D);
+        out.offHand = { fwd: lerp(11, -7, D), up: lerp(-10, -4, D) }; // counter-swing
       } else {
-        out.hand = { fwd: lerp(19, 8, K), up: lerp(-8, -11, K) };
+        const c = carry(k, 1);
+        out.hand = { fwd: lerp(19, 8, K) + c * 2, up: lerp(-8, -11, K) + c * 1.5 };
         out.dirRel = lerp(0.1, -0.5, K);
-        out.lean = lerp(0.26, 0.06, K);
-        out.hipsDy = lerp(2, 0, K);
+        out.lean = lerp(0.28, 0.06, K) + c * 0.05;
+        out.hipsDy = lerp(2.5, 0, K);
+        out.offHand = { fwd: lerp(-7, 3, K), up: lerp(-4, -8, K) };
       }
       break;
     }
+  }
+  return out;
+}
+
+/**
+ * Attack gesture for NON-HAND mounts (floating/head/body): the fighter has
+ * nothing in hand — instead of an empty swing they COMMAND the weapon:
+ * gather (arm sweeps up-back), then snap the arm out pointing the strike,
+ * then ease back to guard. Same phase windows; the weapon's own strike
+ * motion is drawn at the mount by stickman.drawWeapon.
+ */
+function commandContribution(phase: AttackPhase, k: number): AttackContribution {
+  const out: AttackContribution = {
+    hand: { fwd: 10, up: -14 },
+    dirRel: null, // nothing held — the weapon animates at its mount
+    lean: 0.08,
+    hipsDy: 0,
+    offHand: null,
+  };
+  const K = easeOut(k);
+  if (phase === "windup") {
+    // Gather: hand sweeps up beside the head, weight coils back.
+    out.hand = { fwd: lerp(10, 1, K), up: lerp(-14, -22, K) };
+    out.lean = lerp(0.08, -0.07, K);
+    out.hipsDy = -1 * K;
+    out.offHand = { fwd: lerp(3, -5, K), up: -8 };
+  } else if (phase === "active") {
+    // Command: the arm snaps out, pointing the strike at the target.
+    const D = easeIn(k);
+    out.hand = { fwd: lerp(1, 17, D), up: lerp(-22, -12, D) };
+    out.lean = lerp(-0.07, 0.24, D);
+    out.hipsDy = lerp(-1, 1.5, D);
+    out.offHand = { fwd: lerp(-5, -8, D), up: lerp(-8, -4, D) };
+  } else {
+    const c = carry(k, 1);
+    out.hand = { fwd: lerp(17, 10, K) + c * 1.5, up: lerp(-12, -14, K) };
+    out.lean = lerp(0.24, 0.08, K) + c * 0.04;
+    out.hipsDy = lerp(1.5, 0, K);
+    out.offHand = { fwd: lerp(-8, 3, K), up: -8 };
   }
   return out;
 }
@@ -502,6 +575,28 @@ export function createAnimator(bones: Bones): Animator {
     { locked: false, x: 0 },
     { locked: false, x: 0 },
   ];
+  // Smooth state blending: on a state switch we snapshot the last output
+  // pose (root-relative) and crossfade into the new state's pose.
+  let fade = 0;
+  let fadeDur = 0.1;
+  let prevRel: Skeleton | null = null;
+  let prevWeaponAngle = 0;
+  let lastOut: AnimFrame | null = null;
+  let lastRoot = { x: 0, y: 0 };
+  // Weight timers: time since jump start (stretch → tuck) and landing
+  // absorb remaining (knee-bend + settle).
+  let jumpT = 0;
+  let landT = 0;
+  let wasAirborne = false;
+
+  /** Reactions snap fast; locomotion blends soft. */
+  const FADE_BY_STATE: Partial<Record<AnimState, number>> = {
+    attack: 0.045,
+    hitstun: 0.03,
+    launched: 0.03,
+    ko: 0,
+    block: 0.06,
+  };
 
   function pickState(inp: AnimInputs): AnimState {
     if (!inp.alive) return "ko";
@@ -511,7 +606,10 @@ export function createAnimator(bones: Bones): Animator {
     if (inp.castTimer > 0) return "cast";
     if (inp.blocking && inp.grounded) return "block";
     if (!inp.grounded) return inp.vy < -0.5 ? "jump" : "fall";
-    if (inp.moving) return "run";
+    if (inp.moving) {
+      // Moving against the facing = a careful backpedal, not a reversed run.
+      return Math.sign(inp.vx) * inp.facing < 0 ? "backpedal" : "run";
+    }
     return "idle";
   }
 
@@ -521,12 +619,33 @@ export function createAnimator(bones: Bones): Animator {
     update(dt: number, inp: AnimInputs): AnimFrame {
       const state = pickState(inp);
       if (state !== animator.state) {
+        // Snapshot the outgoing pose (relative to the root) for the crossfade.
+        if (lastOut) {
+          const rel = {} as Record<string, unknown>;
+          for (const [key, v] of Object.entries(lastOut.skeleton)) {
+            rel[key] =
+              typeof v === "number"
+                ? v
+                : { x: (v as Vec).x - lastRoot.x, y: (v as Vec).y - lastRoot.y };
+          }
+          prevRel = rel as unknown as Skeleton;
+          prevWeaponAngle = lastOut.weaponAngle;
+          fadeDur = FADE_BY_STATE[state] ?? 0.1;
+          fade = fadeDur;
+        }
+        if (state === "jump") jumpT = 0;
         animator.state = state;
-        if (state !== "run") {
+        if (state !== "run" && state !== "backpedal") {
           plants[0].locked = false;
           plants[1].locked = false;
         }
       }
+      if (state === "jump" || state === "fall") jumpT += dt;
+      // Landing absorb: touch-down after airtime bends the knees, then settles.
+      const airborneNow = state === "jump" || state === "fall" || state === "launched";
+      if (wasAirborne && !airborneNow && inp.grounded) landT = 0.16;
+      wasAirborne = airborneNow;
+      landT = Math.max(0, landT - dt);
 
       const f = inp.facing;
       const t = inp.time;
@@ -550,15 +669,28 @@ export function createAnimator(bones: Bones): Animator {
           phase = "recovery";
           k = Math.min(1, (e - atkTiming.windup - atkTiming.active) / atkTiming.recovery);
         }
-        atk = attackContribution(style, phase, k, inp.weaponForm, inp.weaponSize, twoHanded);
+        const mounted =
+          inp.weaponMount === "head" || inp.weaponMount === "body" || inp.weaponMount === "floating";
+        atk = mounted
+          ? commandContribution(phase, k)
+          : attackContribution(style, phase, k, inp.weaponForm, inp.weaponSize, twoHanded);
       }
 
       // --- Hips: track the physics root, plus per-state bob/weight. ---
+      // speedK: 0 at a walk, 1 at full sprint — scales stride/lean/bounce.
+      const speedK = Math.min(1, (Math.abs(inp.vx) * 60) / 420);
       let bob = 0;
       if (state === "idle") bob = Math.sin(t * 2.2) * 1.2 * s + 2.2 * s; // crouched guard
       if (state === "block") bob = 3.4 * s; // sunk into the guard
-      if (state === "run") bob = Math.sin(runPhase * 2) * 1.6 * s + 1 * s;
+      if (state === "run") bob = Math.sin(runPhase * 2) * (1 + 1.5 * speedK) * s + 1 * s;
+      if (state === "backpedal") bob = Math.sin(runPhase * 2) * 0.9 * s + 1.8 * s; // shorter, busier
+      if (state === "jump") {
+        // Launch stretch: rise out of the crouch over the first beat.
+        bob = lerp(3, -1.5, easeOut(Math.min(1, jumpT / 0.14))) * s;
+      }
       if (atk) bob = atk.hipsDy * s + 1.5 * s;
+      // Landing absorb: knees soak the impact, then the body settles up.
+      if (landT > 0) bob += Math.sin((1 - landT / 0.16) * Math.PI) * 4.5 * s;
       let hipsX = inp.rootX;
       if (state === "hitstun") hipsX += Math.sin(t * 45) * 1.4 * s;
       if (state === "idle") hipsX += Math.sin(t * 1.1) * 0.8 * s; // weight shift
@@ -567,8 +699,9 @@ export function createAnimator(bones: Bones): Animator {
       // --- Torso lean (positive leans toward facing). ---
       const moveDir = Math.abs(inp.vx) > 0.3 ? Math.sign(inp.vx) * f : 0;
       let lean = 0.09; // ready stance leans in by default
-      if (state === "run") lean = 0.16 * moveDir + 0.05;
-      if (state === "jump") lean = 0.12;
+      if (state === "run") lean = (0.12 + 0.14 * speedK) * (moveDir || 1) + 0.04;
+      if (state === "backpedal") lean = -0.08; // weight back, watching the foe
+      if (state === "jump") lean = lerp(0.2, 0.1, Math.min(1, jumpT / 0.2)); // drive then float
       if (state === "fall") lean = -0.05;
       if (state === "hitstun") lean = -0.32;
       if (state === "launched") lean = -0.6;
@@ -593,9 +726,12 @@ export function createAnimator(bones: Bones): Animator {
       let footTargetR: Vec;
       const groundFootY = inp.groundY - 1 * s;
 
-      if (state === "run") {
-        const stride = 17 * s;
-        const lift = 8 * s;
+      if (state === "run" || state === "backpedal") {
+        // Backpedal: shorter, quicker, more careful steps; run: stride and
+        // lift grow with speed for a real sprint gait.
+        const back = state === "backpedal";
+        const stride = (back ? 10 : 13 + 6 * speedK) * s;
+        const lift = (back ? 4.5 : 6 + 3.5 * speedK) * s;
         const speed = Math.abs(inp.vx) * 60; // px/tick → px/s
         const omega = (Math.PI * speed) / (2 * stride);
         runPhase += omega * dt * (moveDir || 1);
@@ -612,13 +748,24 @@ export function createAnimator(bones: Bones): Animator {
             return { x: plant.x, y: groundFootY };
           }
           plant.locked = false;
-          return { x: hips.x + xRel, y: groundFootY - swingUp * lift };
+          // Swing rides an eased arc — the foot accelerates through passing.
+          const sw = easeInOut(swingUp);
+          return { x: hips.x + xRel, y: groundFootY - sw * lift };
         };
         footTargetL = footFromPhase(runPhase, plants[0]);
         footTargetR = footFromPhase(runPhase + Math.PI, plants[1]);
       } else if (state === "jump") {
-        footTargetL = { x: hips.x + f * 8 * s, y: hips.y + 15 * s };
-        footTargetR = { x: hips.x - f * 4 * s, y: hips.y + 25 * s };
+        // Stretch off the ground (legs trail extended), then tuck as the
+        // arc tops out.
+        const tuck = easeInOut(Math.min(1, Math.max(0, (jumpT - 0.12) / 0.18)));
+        footTargetL = {
+          x: hips.x + f * lerp(4, 9, tuck) * s,
+          y: hips.y + lerp(26, 14, tuck) * s,
+        };
+        footTargetR = {
+          x: hips.x - f * lerp(7, 3, tuck) * s,
+          y: hips.y + lerp(30, 19, tuck) * s,
+        };
       } else if (state === "fall") {
         footTargetL = { x: hips.x + f * 5 * s, y: hips.y + 31 * s };
         footTargetR = { x: hips.x - f * 3 * s, y: hips.y + 34 * s };
@@ -655,14 +802,43 @@ export function createAnimator(bones: Bones): Animator {
           handTargetR = { x: hips.x + f * 8 * s, y: hips.y - 11 * s };
           dirRel = -0.65;
         } else {
-          const armSwing = Math.cos(runPhase) * 9 * s;
-          handTargetL = { x: hips.x - f * armSwing, y: hips.y - 6 * s };
-          handTargetR = { x: hips.x + f * (5 * s + armSwing * 0.4), y: hips.y - 9 * s };
+          // Counter-pump with OVERLAP: the hands trail the legs by a beat
+          // (phase lag) and ride an arc, so the arms whip instead of piston.
+          const lagPhase = runPhase - 0.55;
+          const pump = (0.75 + 0.35 * speedK) * 9 * s;
+          const armSwing = Math.cos(lagPhase) * pump;
+          const armRise = Math.abs(Math.sin(lagPhase)) * 2.5 * s;
+          handTargetL = { x: hips.x - f * armSwing, y: hips.y - (6 + armRise / s) * s };
+          handTargetR = {
+            x: hips.x + f * (5 * s + armSwing * 0.45),
+            y: hips.y - 9 * s - armRise * 0.5,
+          };
           dirRel = -0.5;
         }
+      } else if (state === "backpedal") {
+        // Arms up a touch for balance — a wary, watching silhouette.
+        const patter = Math.cos(runPhase - 0.5) * 3 * s;
+        handTargetR = { x: neck.x + f * 9 * s, y: neck.y - 1 * s + patter * 0.3 };
+        handTargetL = { x: neck.x + f * 4 * s, y: neck.y + 4 * s - patter * 0.3 };
+        dirRel = -0.75; // weapon held higher, guarding the retreat
       } else if (state === "jump" || state === "fall") {
-        handTargetL = { x: neck.x - f * 9 * s, y: neck.y - 3 * s };
-        handTargetR = { x: neck.x + f * 8 * s, y: neck.y - 5 * s };
+        if (state === "jump") {
+          // Arms swing UP with the launch, then ease to a mid-air spread.
+          const up = easeOut(Math.min(1, jumpT / 0.16));
+          const spread = easeInOut(Math.min(1, Math.max(0, (jumpT - 0.14) / 0.2)));
+          handTargetL = {
+            x: neck.x - f * lerp(2, 9, spread) * s,
+            y: neck.y - lerp(1, 10, up) * s + spread * 7 * s,
+          };
+          handTargetR = {
+            x: neck.x + f * lerp(4, 8, spread) * s,
+            y: neck.y - lerp(3, 12, up) * s + spread * 7 * s,
+          };
+        } else {
+          // Falling reach: arms out and slightly up, bracing.
+          handTargetL = { x: neck.x - f * 10 * s, y: neck.y - 2 * s };
+          handTargetR = { x: neck.x + f * 9 * s, y: neck.y - 4 * s };
+        }
         dirRel = null; // weapon follows the forearm mid-air
       } else if (state === "hitstun") {
         handTargetL = { x: neck.x - f * 10 * s, y: neck.y + 4 * s };
@@ -699,7 +875,8 @@ export function createAnimator(bones: Bones): Animator {
 
       // Two-handed grip: the off hand holds the shaft near the lead hand
       // (ahead of it for thrusting polearms, behind it for everything else).
-      const gripStates = state === "idle" || state === "run" || state === "attack";
+      const gripStates =
+        state === "idle" || state === "run" || state === "backpedal" || state === "attack";
       const offHandFree = atk?.offHand != null; // style already placed it (draw)
       if (twoHanded && gripStates && weaponDir && !offHandFree) {
         const gap = (style === "thrust" ? 8.5 : -8) * s;
@@ -721,7 +898,7 @@ export function createAnimator(bones: Bones): Animator {
         ? Math.atan2(weaponDir.y, weaponDir.x)
         : Math.atan2(armR.end.y - armR.mid.y, armR.end.x - armR.mid.x);
 
-      const skeleton: Skeleton = {
+      let skeleton: Skeleton = {
         hips,
         neck,
         head,
@@ -739,8 +916,41 @@ export function createAnimator(bones: Bones): Animator {
         kneeR: legR.mid,
         footR: legR.end,
       };
+      let outAngle = weaponAngle;
 
-      return { skeleton, weaponAngle, state };
+      // --- State crossfade: ease from the snapshotted outgoing pose into
+      // the new state (root-relative, so the body keeps tracking physics).
+      if (fade > 0 && prevRel) {
+        fade = Math.max(0, fade - dt);
+        const w = easeInOut(1 - fade / fadeDur); // 0 = old pose, 1 = new
+        const blended = {} as Record<string, unknown>;
+        for (const [key, v] of Object.entries(skeleton)) {
+          if (typeof v === "number") {
+            blended[key] = lerp(
+              (prevRel as unknown as Record<string, number>)[key],
+              v,
+              w,
+            );
+          } else {
+            const pv = (prevRel as unknown as Record<string, Vec>)[key];
+            blended[key] = {
+              x: lerp(inp.rootX + pv.x, (v as Vec).x, w),
+              y: lerp(inp.rootY + pv.y, (v as Vec).y, w),
+            };
+          }
+        }
+        skeleton = blended as unknown as Skeleton;
+        // Weapon angle blends by shortest arc.
+        let dAng = weaponAngle - prevWeaponAngle;
+        while (dAng > Math.PI) dAng -= Math.PI * 2;
+        while (dAng < -Math.PI) dAng += Math.PI * 2;
+        outAngle = prevWeaponAngle + dAng * w;
+      }
+
+      const frame: AnimFrame = { skeleton, weaponAngle: outAngle, state };
+      lastOut = frame;
+      lastRoot = { x: inp.rootX, y: inp.rootY };
+      return frame;
     },
   };
 

@@ -789,9 +789,10 @@ function spawnEntityImpl(
       groundY,
       caster.side,
     );
-    ghost.tintColor = rt.glow;
+    // Clones render OPAQUE — distinguishable by a cool desaturated recolor
+    // (mix toward slate) instead of alpha ghosting.
+    ghost.tintColor = mix(caster.style.fill, "#7e93ad", 0.65);
     ghost.tintTimer = Number.MAX_SAFE_INTEGER; // clones aren't combat-ticked
-    ghost.phaseTimer = Number.MAX_SAFE_INTEGER; // → renderFighter ghosts them
     ghost.displayScale = 0.92;
     // Same already-vetted renderProgram as the caster (no re-vetting) —
     // anchored to the CLONE's own mount so eye-lasers glow on the clone's head.
@@ -921,6 +922,9 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
         });
         ghost.skeleton = frame.skeleton;
         ghost.weaponAngle = frame.weaponAngle;
+        // Mounted clone weapons strike in sync too (drawWeapon reads these).
+        ghost.attackAnim = c.attackAnim;
+        ghost.attackTotal = c.attackTotal;
         break;
       }
       case "minion": {

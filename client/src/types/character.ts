@@ -92,6 +92,7 @@ export const BEHAVIOR_HANDLERS = [
   // Weapon LOOK (weapon.renderProgram): dispatched ~30x/s in the draw pass;
   // draw verbs default to the weapon mount anchor.
   "onRenderWeapon",
+  "onRenderHead",
 ] as const;
 export type BehaviorHandler = (typeof BEHAVIOR_HANDLERS)[number];
 
@@ -238,7 +239,17 @@ export type AbilityMotif = (typeof ABILITY_MOTIFS)[number];
 export const BUFF_STATS = ["speed", "strength", "defense"] as const;
 export type BuffStat = (typeof BUFF_STATS)[number];
 
-/** Parametric outfit slots — cosmetic only, rendered flat over the body. */
+/** Functional gear: each kind has BOTH a drawn look and a mechanical effect
+ * (armor → +defense, wings → double jump). Opt-in: present only when the
+ * concept grants it. Registry lives in game/gear.ts. */
+export const GEAR_KINDS = ["armor", "wings"] as const;
+export type GearKind = (typeof GEAR_KINDS)[number];
+export interface GearItem {
+  kind: GearKind;
+}
+
+/** Parametric outfit slots — LEGACY (v4.1 dropped the body outfit; the
+ * schema still tolerates these fields so old/mock specs validate). */
 export const OUTFIT_HEAD = [
   "none", "hat", "tophat", "helmet", "hood", "crown", "cap", "horns", "halo",
 ] as const;
@@ -309,10 +320,17 @@ export interface CharacterSpec {
     /** Legacy free-text trinkets — still validated and used for outfit derivation. */
     accessories: string[];
     height: number; // 0.8–1.2
-    /** Structured, LLM-emitted outfit (snapped in enrich; cosmetic only). */
+    /** LEGACY structured outfit — tolerated, no longer rendered (v4.1). */
     outfit?: Outfit;
     accentColor?: string;
     outline?: string;
+    /** AI-drawn head accessory (render program, onRenderHead handler);
+     * enrich derives a keyword fallback shape when absent. */
+    headgear?: BehaviorProgram;
+    /** Functional gear — visual + mechanical, opt-in (see game/gear.ts). */
+    gear?: GearItem[];
+    /** DERIVED by enrich (prompt keywords) — the fallback headgear shape. */
+    headgearKind?: string;
   };
   weapon: {
     type: "melee" | "ranged" | "thrown";
@@ -425,6 +443,12 @@ export const characterSpecSchema = z.object({
       .optional(),
     accentColor: z.string().max(48).optional(),
     outline: z.string().max(48).optional(),
+    /** AI-drawn head accessory: a render program with onRenderHead. */
+    headgear: z.unknown().optional(),
+    /** Functional gear (armor/wings) — only when the concept grants it. */
+    gear: z.array(z.object({ kind: z.enum(GEAR_KINDS) })).max(3).optional(),
+    /** Derived (enrich): keyword-fallback headgear shape. */
+    headgearKind: z.string().max(24).optional(),
   }),
   weapon: z.object({
     type: z.enum(WEAPON_TYPES),
@@ -725,6 +749,32 @@ function normalizeRaw(raw: unknown): unknown {
     // Outfit slots: keep only enum-legal values (junk must not sink the spec).
     if (appearance.outfit !== undefined && (typeof appearance.outfit !== "object" || appearance.outfit === null)) {
       delete appearance.outfit;
+    }
+    delete appearance.headgearKind; // derived-only (enrich writes it)
+    // headgear: a render program drawn at the head — same sanitizer as
+    // weapon renderPrograms; drop it entirely when unusable.
+    if (appearance.headgear !== undefined) {
+      const hg = sanitizeBehaviorShape(appearance.headgear);
+      if (hg && hg.handlers.onRenderHead) appearance.headgear = hg;
+      else delete appearance.headgear;
+    }
+    // gear: whitelist kinds, dedupe, cap.
+    if (appearance.gear !== undefined) {
+      const rawGear = appearance.gear;
+      if (!Array.isArray(rawGear)) delete appearance.gear;
+      else {
+        const seen = new Set<string>();
+        appearance.gear = (rawGear as unknown[])
+          .filter((g): g is Record<string, unknown> => typeof g === "object" && g !== null)
+          .map((g) => ({ kind: typeof g.kind === "string" ? g.kind.toLowerCase().trim() : "" }))
+          .filter((g) => {
+            if (!(GEAR_KINDS as readonly string[]).includes(g.kind) || seen.has(g.kind)) return false;
+            seen.add(g.kind);
+            return true;
+          })
+          .slice(0, 3);
+        if ((appearance.gear as unknown[]).length === 0) delete appearance.gear;
+      }
     }
     const outfit = appearance.outfit as Record<string, unknown> | undefined;
     if (outfit) {

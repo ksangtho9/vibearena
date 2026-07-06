@@ -4,6 +4,7 @@ import { resolveStyle, type ResolvedOutfit, type ResolvedStyle } from "../genera
 import type { BehaviorRuntime } from "./engine/interpreter";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
 import { playSfx } from "../audio/sfx";
+import { drawGearBack, drawGearFront, drawHeadgear } from "./gear";
 import {
   drawWeapon as drawParametricWeapon,
   weaponIsFloating,
@@ -11,6 +12,7 @@ import {
   type WeaponRenderStyle,
 } from "./weapons/archetypes";
 import {
+  ATTACK_TIMINGS,
   attackStyleOf,
   bonesFor,
   createAnimator,
@@ -183,6 +185,19 @@ export interface Fighter {
   dashPokeHit: boolean;
   /** Ambient state-VFX emission accumulator (effectsJuice upkeep). */
   fxAcc: number;
+  /** Full (attack-speed-scaled) duration of the current swing — drawWeapon
+   * uses it to sync mounted-weapon attack motion to the phase windows. */
+  attackTotal: number;
+  /** Weapon form is a shield (or named one) — shield parries reflect shots. */
+  hasShield: boolean;
+  /** Guard re-engage cooldown after release/parry (anti block-mash). */
+  guardCooldown: number;
+  /** LLM-drawn head accessory runtime (onRenderHead); null = keyword shape. */
+  headRenderRuntime: BehaviorRuntime | null;
+  /** Mid-air jumps spent since last grounded (wings grant extra). */
+  airJumpsUsed: number;
+  /** Block indicator fade 0→1 (render-only). */
+  blockVis: number;
 
   buffs: FighterBuffs;
   trail: TrailPoint[];
@@ -326,6 +341,12 @@ export function createFighter(
     dashPokeTimer: 0,
     dashPokeHit: false,
     fxAcc: 0,
+    attackTotal: 0,
+    hasShield,
+    guardCooldown: 0,
+    blockVis: 0,
+    headRenderRuntime: null,
+    airJumpsUsed: 0,
     buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
   };
@@ -724,11 +745,56 @@ function drawWeapon(
   }
 
   // head / body / floating without a renderProgram: hover the parametric
-  // weapon at the mount with a gentle bob instead of tying it to the swing.
+  // weapon at the mount with a gentle bob — and during an attack, the
+  // WEAPON performs the strike itself: coil back from the mount, dart at
+  // the target through the active frames, ease home in recovery. Synced to
+  // the same phase windows via attackTotal; the hitbox already lives at the
+  // mount (weaponMountAnchor), this makes the visible motion match it.
   const anchor = weaponMountAnchor(fighter, time);
+  const s = fighter.scale;
+  let ox = 0;
+  let oy = 0;
+  // Orientation follows FACING: the sprite is authored pointing right and
+  // mirrored when the fighter faces left, so a mounted weapon always aims
+  // at the enemy side (rotations below are in right-facing terms).
+  const mirror = fighter.facing < 0;
+  let rot = Math.sin(time * 1.8) * 0.15 - 0.35;
+  if (fighter.attackAnim > 0 && fighter.attackTotal > 0) {
+    const style = attackStyleOf(fighter.style.weapon.form, fighter.spec.weapon.type);
+    const tim = ATTACK_TIMINGS[style];
+    const u = 1 - fighter.attackAnim / fighter.attackTotal; // 0→1 over the swing
+    const wF = tim.windup / tim.total;
+    const aF = (tim.windup + tim.active) / tim.total;
+    const f = fighter.facing;
+    const lunge = (28 + weaponTipLength(fighter.style.weapon.form, fighter.style.weapon.size) * 0.9) * s;
+    if (u < wF) {
+      // Coil: draw back behind the mount, blade cocking up.
+      const k = u / wF;
+      const K = 1 - (1 - k) * (1 - k);
+      ox = -f * 12 * s * K;
+      oy = -5 * s * K;
+      rot = -(0.35 + 0.9 * K);
+    } else if (u < aF) {
+      // Strike: dart at the target, whipping level through the hit.
+      const k = (u - wF) / (aF - wF);
+      const D = k * k;
+      ox = f * (-12 * s + (lunge + 12 * s) * D);
+      oy = -5 * s + 7 * s * D;
+      rot = -(1.25 - 1.35 * D);
+    } else {
+      // Recovery: ease home with a touch of follow-through.
+      const k = Math.min(1, (u - aF) / (1 - aF));
+      const K = 1 - (1 - k) * (1 - k);
+      const c = Math.sin(Math.min(1, k * 2.2) * Math.PI) * 0.15;
+      ox = f * lunge * (1 - K) + f * c * 8 * s;
+      oy = 2 * s * (1 - K);
+      rot = 0.1 * (1 - K) + c;
+    }
+  }
   paint(
-    { x: anchor.x, y: anchor.y - 6 * fighter.scale + Math.sin(time * 2.4) * 2 },
-    Math.sin(time * 1.8) * 0.15 - fighter.facing * 0.35,
+    { x: anchor.x + ox, y: anchor.y + oy - 6 * s + Math.sin(time * 2.4) * 2 },
+    rot,
+    mirror,
   );
 }
 
@@ -917,8 +983,9 @@ export function drawOutfitBack(
   }
 }
 
-/** Torso / shoulders / arms / legs: drawn OVER the body silhouette. */
-function drawOutfitBody(
+/** Torso / shoulders / arms / legs: LEGACY (v4.1 dropped the body outfit;
+ * kept exported for reference/reuse). */
+export function drawOutfitBody(
   ctx: CanvasRenderingContext2D,
   outfit: ResolvedOutfit,
   c: OutfitColors,
@@ -1284,19 +1351,19 @@ export function drawAfterimage(ctx: CanvasRenderingContext2D, a: Afterimage): vo
   flatBody(
     ctx,
     [
-      taperedPath(sk.shoulderL, flourish(sk.shoulderL, sk.elbowL, sk.handL), sk.handL, 1.9 * s, 1.1 * s),
-      taperedPath(sk.hipL, flourish(sk.hipL, sk.kneeL, sk.footL), sk.footL, 2.4 * s, 1.4 * s),
+      taperedPath(sk.shoulderL, flourish(sk.shoulderL, sk.elbowL, sk.handL), sk.handL, 2.6 * s, 1.55 * s),
+      taperedPath(sk.hipL, flourish(sk.hipL, sk.kneeL, sk.footL), sk.footL, 3.3 * s, 1.95 * s),
       taperedPath(
         sk.neck,
         { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
         sk.hips,
-        2.8 * s,
-        2 * s,
+        3.9 * s,
+        2.9 * s,
       ),
-      taperedPath(sk.hipR, flourish(sk.hipR, sk.kneeR, sk.footR), sk.footR, 2.4 * s, 1.4 * s),
-      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 1.5 * s, 1.5 * s),
-      circlePath(sk.head.x, sk.head.y, 8.5 * s),
-      taperedPath(sk.shoulderR, flourish(sk.shoulderR, sk.elbowR, sk.handR), sk.handR, 1.9 * s, 1.1 * s),
+      taperedPath(sk.hipR, flourish(sk.hipR, sk.kneeR, sk.footR), sk.footR, 3.3 * s, 1.95 * s),
+      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 2.1 * s, 2.1 * s),
+      circlePath(sk.head.x, sk.head.y, 9.2 * s),
+      taperedPath(sk.shoulderR, flourish(sk.shoulderR, sk.elbowR, sk.handR), sk.handR, 2.6 * s, 1.55 * s),
     ],
     a.color,
   );
@@ -1326,7 +1393,6 @@ export function renderFighter(
   const sk = fighter.ragdoll
     ? skeletonFromRagdoll(fighter.ragdoll, fighter.facing)
     : fighter.skeleton;
-  const headAngle = fighter.ragdoll ? fighter.ragdoll.head.angle : sk.torsoAngle;
   const weaponAngle = fighter.ragdoll
     ? Math.atan2(sk.handR.y - sk.elbowR.y, sk.handR.x - sk.elbowR.x)
     : fighter.weaponAngle;
@@ -1345,36 +1411,13 @@ export function renderFighter(
   }
   ctx.globalAlpha = (fighter.alive ? 1 : 0.8) * (fighter.phaseTimer > 0 ? 0.4 : 1);
 
-  // Lean build: thin arms (finer than legs), slim legs, half-width spine.
-  const armR0 = 1.9 * s, armR1 = 1.1 * s;
-  const legR0 = 2.4 * s, legR1 = 1.4 * s;
+  // Athletic build (v4.1): ~35% more mass than the old spindly frame —
+  // Hyun's-Dojo weight, still a flat solid-color stickman.
+  const armR0 = 2.6 * s, armR1 = 1.55 * s;
+  const legR0 = 3.3 * s, legR1 = 1.95 * s;
 
-  // Outfit anchors + colors (material tint stays flat).
-  const anchors: OutfitAnchors = {
-    facing: fighter.facing,
-    s,
-    time,
-    head: { x: sk.head.x, y: sk.head.y, angle: headAngle, r: 8.5 * s },
-    neck: sk.neck,
-    hips: sk.hips,
-    arms: [
-      { elbow: sk.elbowL, hand: sk.handL },
-      { elbow: sk.elbowR, hand: sk.handR },
-    ],
-    legs: [
-      { knee: sk.kneeL, foot: sk.footL },
-      { knee: sk.kneeR, foot: sk.footR },
-    ],
-  };
-  const outfit = fighter.style.outfit;
-  const outfitColors: OutfitColors = {
-    main: materialColor(outfit.material, fighter.style.accent),
-    trim: fighter.style.accent,
-    glow: fighter.style.glow,
-  };
-
-  // Back items sit BEHIND the body silhouette.
-  drawOutfitBack(ctx, outfit, outfitColors, anchors);
+  // Back gear (wings) sits BEHIND the body silhouette.
+  drawGearBack(ctx, fighter, time);
 
   // Every body part in one batch so overlaps merge into a single continuous
   // silhouette. Joints come straight from the animated skeleton.
@@ -1387,19 +1430,26 @@ export function renderFighter(
         sk.neck,
         { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
         sk.hips,
-        2.8 * s,
-        2 * s,
+        3.9 * s,
+        2.9 * s,
       ),
       taperedPath(sk.hipR, flourish(sk.hipR, sk.kneeR, sk.footR), sk.footR, legR0, legR1),
-      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 1.5 * s, 1.5 * s),
-      circlePath(sk.head.x, sk.head.y, 8.5 * s),
+      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 2.1 * s, 2.1 * s),
+      circlePath(sk.head.x, sk.head.y, 9.2 * s),
       taperedPath(sk.shoulderR, flourish(sk.shoulderR, sk.elbowR, sk.handR), sk.handR, armR0, armR1),
     ],
     fill,
   );
 
-  drawOutfitBody(ctx, outfit, outfitColors, anchors, fighter.style.bulk);
-  drawOutfitHead(ctx, outfit, outfitColors, anchors);
+  // Functional gear over the body (chest plate etc.).
+  drawGearFront(ctx, fighter, time);
+
+  // Head accessory: an LLM onRenderHead program owns the look when alive;
+  // otherwise the keyword-derived parametric shape (viking → horned helm…).
+  const hgRt = fighter.headRenderRuntime;
+  if ((!hgRt || hgRt.done) && fighter.style.headgear) {
+    drawHeadgear(ctx, fighter, fighter.style.headgear, time);
+  }
 
   // Swing trail + weapon attached to the hand joint.
   updateAndDrawTrail(ctx, fighter, sk.handR, weaponAngle, time);
@@ -1424,6 +1474,37 @@ export function renderFighter(
       0,
       Math.PI * 2,
     );
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Guard stance: a translucent one-sided shield arc on the FRONT — reads
+  // as "blocking" and shows the guard only covers that side. Fades via
+  // blockVis; on guard-break combat bursts it apart.
+  if (fighter.blockVis > 0.03 && fighter.alive) {
+    const v = fighter.blockVis;
+    const cxb = sk.hips.x;
+    const cyb = sk.hips.y - 22 * s;
+    const rb = 40 * s;
+    const mid = fighter.facing > 0 ? 0 : Math.PI; // arc faces forward
+    const span = 1.05;
+    ctx.save();
+    ctx.globalAlpha = 0.5 * v;
+    ctx.lineCap = "round";
+    ctx.strokeStyle = withAlpha(fighter.style.glow, 0.9);
+    ctx.shadowColor = fighter.style.glow;
+    ctx.shadowBlur = 12;
+    ctx.lineWidth = 4.5;
+    ctx.beginPath();
+    ctx.arc(cxb, cyb, rb, mid - span, mid + span);
+    ctx.stroke();
+    // Soft translucent fill wedge behind the rim.
+    ctx.globalAlpha = 0.14 * v;
+    ctx.fillStyle = fighter.style.glow;
+    ctx.beginPath();
+    ctx.moveTo(cxb, cyb);
+    ctx.arc(cxb, cyb, rb, mid - span, mid + span);
+    ctx.closePath();
     ctx.fill();
     ctx.restore();
   }

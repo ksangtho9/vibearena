@@ -3,7 +3,7 @@ import type { CharacterSpec } from "../types/character";
 import type { CombatCtx } from "./combat";
 import { updateEffects } from "./combat";
 import { createFighter, renderFighter } from "./stickman";
-import { equipWeaponRender, tickBehaviors } from "./engine/interpreter";
+import { equipHeadgearRender, equipWeaponRender, tickBehaviors } from "./engine/interpreter";
 import { ALLOW_CUSTOM_SCRIPT } from "./engine/customScript";
 import { drawEffect } from "./effectsRender";
 import type { Arena } from "./arena";
@@ -53,7 +53,10 @@ export function startFighterPreview(
     flashMax: 0,
     flashColor: "#ffffff",
   };
-  if (ALLOW_CUSTOM_SCRIPT) equipWeaponRender(fighter, mini);
+  if (ALLOW_CUSTOM_SCRIPT) {
+    equipWeaponRender(fighter, mini);
+    equipHeadgearRender(fighter, mini);
+  }
 
   let raf = 0;
   let time = 0;

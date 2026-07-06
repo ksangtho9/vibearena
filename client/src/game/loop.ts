@@ -28,7 +28,7 @@ import { createKeyboard, emptyInput, INPUT_BINDINGS } from "./input";
 import { createBotBrain, type BotBrain } from "./bot";
 import { createTheme, type ThemeView } from "./arena/themes";
 import { drawEffect, drawProjectile } from "./effectsRender";
-import { equipWeaponBehavior, equipWeaponRender, tickBehaviors } from "./engine/interpreter";
+import { equipHeadgearRender, equipWeaponBehavior, equipWeaponRender, tickBehaviors } from "./engine/interpreter";
 import { ALLOW_CUSTOM_SCRIPT } from "./engine/customScript";
 import { renderEntities, tickEntities } from "./engine/api";
 
@@ -123,6 +123,8 @@ export function startGame(
   if (ALLOW_CUSTOM_SCRIPT) {
     equipWeaponRender(player, combat);
     equipWeaponRender(bot, combat);
+    equipHeadgearRender(player, combat);
+    equipHeadgearRender(bot, combat);
   }
 
   // Input routing: in hotseat, the right-side fighter is PLAYER 2's key

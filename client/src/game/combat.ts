@@ -20,6 +20,7 @@ import {
   type Side,
 } from "./stickman";
 import { landingImpact } from "./movementFx";
+import { gearAirJumps, gearDefenseBonus } from "./gear";
 import {
   auraGlow,
   impactSparks,
@@ -256,13 +257,16 @@ export function dealDamage(
   // Free (no guard cost), no damage, and the attacker is staggered open.
   if (frontal && target.parryTimer > 0 && target.introTimer <= 0) {
     target.parryTimer = 0; // consumed
+    target.guardCooldown = Math.max(target.guardCooldown, 0.35); // no parry-mash
     const { x, y } = target.root.position;
     playSfx("parry");
     pushEffect(ctx, { kind: "text", x, y: y - 84, ttl: 0.8, color: "#ffe95e", text: "PARRY!" });
     pushEffect(ctx, { kind: "spark", x: x + target.facing * 18, y: y - 22, ttl: 0.3, color: "#ffe95e", radius: 18 });
     pushEffect(ctx, { kind: "ring", x: x + target.facing * 18, y: y - 22, ttl: 0.25, color: "#ffffff", radius: 22 });
-    if (opts.attacker?.alive) {
-      // Riposte opening: stagger + interrupt whatever they were doing.
+    // Riposte opening — MELEE parries only: the attacker is in range to be
+    // staggered. Parrying a shot just negates it; the far-away shooter
+    // doesn't flinch.
+    if (opts.attacker?.alive && opts.source === "melee") {
       opts.attacker.hitstunTimer = Math.max(opts.attacker.hitstunTimer, 0.5);
       opts.attacker.attackAnim = 0;
       opts.attacker.attackWindow = 0;
@@ -297,6 +301,11 @@ export function dealDamage(
     target.guardRegenDelay = 0.35; // then ~2s to refill
     playSfx("guardBreak");
     pushEffect(ctx, { kind: "text", x, y: y - 92, ttl: 1, color: "#e0483e", text: "GUARD BREAK" });
+    // The shield indicator bursts apart.
+    particleBurst(ctx, x + target.facing * 20, y - 22, {
+      count: 10, color: target.style.glow, speed: 240, gravity: 300, shape: "square", ttl: 0.4,
+    });
+    target.blockVis = 0;
     pushEffect(ctx, { kind: "ring", x, y: y - 20, ttl: 0.4, color: "#e0483e", radius: 34 });
     for (let i = 0; i < 5; i++) {
       pushEffect(ctx, {
@@ -333,7 +342,12 @@ export function dealDamage(
   const pierce = Math.min(0.6, prop("armorPierce") * 0.06);
   const effectiveDefense = target.spec.stats.defense * target.buffs.defenseMul * (1 - pierce);
 
-  let dmg = amount * (130 / (130 + effectiveDefense)) * DAMAGE_SCALE;
+  // Functional gear: armor adds a flat slab of mitigation (opt-in grant).
+  const gearedDefense = effectiveDefense + gearDefenseBonus(target.spec);
+  let dmg = amount * (130 / (130 + gearedDefense)) * DAMAGE_SCALE;
+  // setScale(): bigger = tankier (the giant hurtbox has a payoff), smaller =
+  // frailer (the dodge tradeoff). Clamped so nothing bricks the match.
+  dmg *= Math.max(0.6, Math.min(1.45, 1 / target.displayScale));
   if (target.shieldTimer > 0) {
     dmg *= 1 - target.shieldCoverage;
     // The bubble visibly ripples where it soaks a hit.
@@ -450,13 +464,24 @@ export function spawnProjectile(
     restitution: opts.arc ? 0.5 : 0,
     label: `${owner.side}-projectile`,
   });
-  const a = opts.angle ?? 0;
+  // Aim at the OPPONENT, not just wherever the owner happens to face:
+  // horizontal direction snaps to the foe's side (facing is the fallback
+  // when they overlap), and boomerangs pitch toward the foe's chest so the
+  // outbound leg actually passes through them.
+  const foe = owner.side === "player" ? ctx.fighters.bot : ctx.fighters.player;
+  const dir = Math.sign(foe.root.position.x - owner.root.position.x) || owner.facing;
+  let a = opts.angle ?? 0;
+  if (opts.boomerang && opts.angle === undefined) {
+    const dy = foe.root.position.y - 20 - startY;
+    const dx = Math.abs(foe.root.position.x - startX) || 1;
+    a = Math.max(-0.55, Math.min(0.55, Math.atan2(dy, dx)));
+  }
   Matter.Body.setVelocity(
     body,
     opts.origin?.straightDown
       ? { x: (Math.random() - 0.5) * 2, y: opts.speed }
       : {
-          x: owner.facing * opts.speed * Math.cos(a),
+          x: dir * opts.speed * Math.cos(a),
           y: opts.speed * Math.sin(a) + (opts.arc ? -5.5 : 0),
         },
   );
@@ -487,6 +512,7 @@ function startAttack(f: Fighter): void {
   const ts = attackSpeedScale(f);
   f.attackCooldown = (isMissile(f) ? MISSILE_ATTACK_COOLDOWN : MELEE_ATTACK_COOLDOWN) * ts;
   f.attackAnim = attackTiming(f).total;
+  f.attackTotal = f.attackAnim; // drawWeapon syncs mounted-weapon strikes to this
   f.attackWindow = 0;
   f.hasHitThisSwing = false;
   f.projectileFired = false;
@@ -600,7 +626,10 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
   // The cleave property widens the swept arc.
   if (f.attackWindow > 0 && !f.hasHitThisSwing && opponent.alive) {
     const seg = weaponSegment(f, ctx.time);
-    const rayWidth = (10 * f.scale + weaponPropMag(f, "cleave") * 2.2) * f.displayScale;
+    const rayWidth =
+      (10 * f.scale + weaponPropMag(f, "cleave") * 2.2) * f.displayScale +
+      // A grown target's hurtbox matches its visible body.
+      Math.max(0, opponent.displayScale - 1) * 34 * opponent.scale;
     const hits = Matter.Query.ray([opponent.root], seg.from, seg.to, rayWidth);
     if (hits.length > 0) {
       f.hasHitThisSwing = true;
@@ -894,14 +923,27 @@ export function updateFighter(
   const v = f.root.velocity;
 
   // --- Block + parry input. A press EDGE arms the parry window; holding
-  // (past the window) is the guard stance. Guard at 0 = can't block.
+  // (past the window) is the guard stance. Guard at 0 = can't block. A short
+  // cooldown after releasing (or landing a parry) stops block-key mashing
+  // from spamming parry windows.
+  f.guardCooldown = Math.max(0, f.guardCooldown - dt);
   f.parryTimer = Math.max(0, f.parryTimer - dt);
-  if (input.block && !f.blockHeld && !stunned && f.introTimer <= 0) {
+  if (input.block && !f.blockHeld && !stunned && f.introTimer <= 0 && f.guardCooldown <= 0) {
     f.parryTimer = f.parryWindow;
+  }
+  if (f.blockHeld && !input.block && f.blocking) {
+    f.guardCooldown = Math.max(f.guardCooldown, 0.35); // released the guard
   }
   f.blockHeld = input.block;
   f.blocking =
-    input.block && !stunned && f.introTimer <= 0 && f.attackAnim <= 0 && f.guard > 0;
+    input.block &&
+    !stunned &&
+    f.introTimer <= 0 &&
+    f.attackAnim <= 0 &&
+    f.guard > 0 &&
+    f.guardCooldown <= 0;
+  // Indicator fade (render-only).
+  f.blockVis += ((f.blocking ? 1 : 0) - f.blockVis) * Math.min(1, dt * 14);
 
   // Guard regen: pauses while blocking / shortly after guard activity.
   if (f.blocking) {
@@ -923,6 +965,7 @@ export function updateFighter(
       Matter.Body.setVelocity(f.root, { x: v.x * 0.8, y: v.y });
     }
 
+    if (f.grounded) f.airJumpsUsed = 0;
     if (input.jump && f.grounded && f.jumpCooldown <= 0 && !f.blocking) {
       if (input.down && f.onPlatform) {
         // Drop through the one-way platform instead of jumping.
@@ -931,6 +974,20 @@ export function updateFighter(
         Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) });
         playSfx("jump", { volume: 0.45 });
       }
+      f.jumpCooldown = 0.3;
+    } else if (
+      // WINGS: one extra mid-air jump (gear grant; see game/gear.ts).
+      input.jump &&
+      !f.grounded &&
+      f.jumpCooldown <= 0 &&
+      !f.blocking &&
+      f.airJumpsUsed < gearAirJumps(f.spec)
+    ) {
+      f.airJumpsUsed++;
+      Matter.Body.setVelocity(f.root, { x: v.x, y: -jumpVelOf(f) * 0.92 });
+      playSfx("jump", { volume: 0.5, pitch: 1.25 });
+      // Wing-beat puff under the feet.
+      pushEffect(ctx, { kind: "ring", x: f.root.position.x, y: f.root.position.y + 28 * f.scale, ttl: 0.25, color: f.style.glow, radius: 12, expand: 90, width: 2.5 });
       f.jumpCooldown = 0.3;
     }
 
@@ -972,6 +1029,7 @@ export function updateFighter(
     alive: f.alive,
     attackElapsed: f.attackAnim > 0 ? (timing.total - f.attackAnim) / ts : -1,
     weaponForm: f.style.weapon.form,
+    weaponMount: f.spec.weapon.mount ?? "hand",
     weaponSize: f.style.weapon.size,
     weaponType: f.spec.weapon.type,
     castTimer: f.castTimer,
@@ -1083,15 +1141,42 @@ export function updateProjectiles(
         y: Math.sin(current + turn) * speed,
       });
     }
+    const tds = target.displayScale;
+    const scaledHit =
+      tds > 1.05 &&
+      Math.abs(p.body.position.x - target.root.position.x) < (12 * tds + 4) * target.scale + p.radius &&
+      Math.abs(p.body.position.y - target.root.position.y) < 48 * tds * target.scale + p.radius;
     const hit =
       target.alive &&
       (p.rehit ?? 0) <= 0 &&
-      Matter.Query.collides(p.body, [target.root]).length > 0;
+      (Matter.Query.collides(p.body, [target.root]).length > 0 || scaledHit);
     const hitGround = Matter.Query.collides(p.body, [arena.ground]).length > 0;
     const out =
       p.ttl <= 0 ||
       p.body.position.x < -60 ||
       p.body.position.x > arena.width + 60;
+
+    // SHIELD PARRY: a shield-carrier parrying a shot bats it straight back
+    // at the shooter (ownership flips, so it can hit them). Non-shield
+    // parries fall through to dealDamage, which negates without reflecting.
+    const shotFrontal = target.facing === -(Math.sign(p.body.velocity.x) || 1);
+    if (hit && target.hasShield && target.parryTimer > 0 && shotFrontal && target.introTimer <= 0) {
+      target.parryTimer = 0;
+      target.guardCooldown = Math.max(target.guardCooldown, 0.35);
+      const v = p.body.velocity;
+      p.ownerSide = p.ownerSide === "player" ? "bot" : "player";
+      Matter.Body.setVelocity(p.body, { x: -v.x * 1.2, y: -v.y * 0.6 });
+      p.ttl = Math.max(p.ttl, 1.2);
+      p.rehit = 0.3;
+      const tx = target.root.position.x;
+      const ty = target.root.position.y;
+      playSfx("block", { pitch: 1.5, volume: 0.8 });
+      playSfx("parry", { pitch: 0.9, volume: 0.6 });
+      shockwaveRing(ctx, tx + target.facing * 20, ty - 22, { color: "#ffe95e", radius: 14, expand: 150, thickness: 3.5, ttl: 0.3 });
+      impactSparks(ctx, p.body.position.x, p.body.position.y, { color: "#ffe95e", count: 6 });
+      pushEffect(ctx, { kind: "text", x: tx, y: ty - 84, ttl: 0.8, color: "#ffe95e", text: "REFLECTED!" });
+      continue;
+    }
 
     // reflect(): the parry window flips the projectile back at its owner.
     if (hit && target.reflectTimer > 0) {
