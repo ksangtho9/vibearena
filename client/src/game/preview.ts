@@ -44,6 +44,7 @@ export function startFighterPreview(
     effects: [],
     behaviors: [],
     entities: [],
+    afterimages: [],
     hitstop: 0,
     time: 0,
     shakeTimer: 0,

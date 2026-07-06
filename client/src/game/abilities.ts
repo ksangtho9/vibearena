@@ -2,6 +2,7 @@ import Matter from "matter-js";
 import { castBehavior } from "./engine/interpreter";
 import { runCustomScript } from "./engine/customScript";
 import { playSfx } from "../audio/sfx";
+import { dashJuice } from "./movementFx";
 import type { AbilityMotif, AbilityParams, AbilitySpec, ElementKind } from "../types/character";
 import type { Fighter } from "./stickman";
 import { CAST_TIME } from "./animation";
@@ -110,9 +111,10 @@ export function useAbility(
 
   switch (ability.kind) {
     case "dash": {
-      const burst = p.distance ?? 18;
+      const burst = Math.max(16, p.distance ?? 18); // snappy — a real reposition
       Matter.Body.setVelocity(user.root, { x: user.facing * burst, y: -2 });
       user.invulnTimer = p.iframes ?? 0.25;
+      dashJuice(user, ctx, rt.glow);
       motifEffect(ctx, rt, pos.x, pos.y - 20 * user.scale, {
         radius: 55,
         dir: -user.facing, // trail behind the dash

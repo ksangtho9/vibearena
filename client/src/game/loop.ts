@@ -9,6 +9,7 @@ import {
 } from "./arena";
 import {
   createFighter,
+  drawAfterimage,
   fighterX,
   fighterY,
   renderFighter,
@@ -104,6 +105,7 @@ export function startGame(
     effects: [],
     behaviors: [],
     entities: [],
+    afterimages: [],
     hitstop: 0,
     time: 0,
     shakeTimer: 0,
@@ -310,6 +312,7 @@ export function startGame(
     applyLayerTransform(1);
     for (const rect of arena.platformRects) theme.drawPlatform(ctx2d, rect);
     renderEntities(ctx2d, combat, time);
+    for (const a of combat.afterimages) drawAfterimage(ctx2d, a);
     renderFighter(ctx2d, player, time, supportYFor(player));
     renderFighter(ctx2d, bot, time, supportYFor(bot));
     drawProjectiles();

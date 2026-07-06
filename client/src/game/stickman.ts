@@ -170,6 +170,17 @@ export interface Fighter {
   dotPerSec: number;
   dotColor: string;
   dotTickAcc: number;
+  // Movement-primitive juice (dash/blink/leap — set by movementFx.ts).
+  /** While > 0, ghost silhouettes drop along the movement path. */
+  afterimageTimer: number;
+  afterimageAcc: number;
+  /** Mid-blink: the fighter isn't drawn for a beat. */
+  blinkVanishTimer: number;
+  /** Leap landing: 0 idle, 1 armed (awaiting liftoff), 2 airborne. */
+  leapLandState: 0 | 1 | 2;
+  /** Gap-closer poke: while > 0, passing through the foe lands one light hit. */
+  dashPokeTimer: number;
+  dashPokeHit: boolean;
 
   buffs: FighterBuffs;
   trail: TrailPoint[];
@@ -306,6 +317,12 @@ export function createFighter(
     dotPerSec: 0,
     dotColor: "#e05555",
     dotTickAcc: 0,
+    afterimageTimer: 0,
+    afterimageAcc: 0,
+    blinkVanishTimer: 0,
+    leapLandState: 0,
+    dashPokeTimer: 0,
+    dashPokeHit: false,
     buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
   };
@@ -1230,6 +1247,60 @@ export function drawOutfitHead(
 }
 
 /**
+ * Afterimage — a frozen ghost of a fighter's silhouette, dropped along
+ * dash/blink/leap paths and faded out by combat.updateEffects. Drawn with
+ * the SAME body-path code as renderFighter, so the ghost always matches the
+ * real silhouette.
+ */
+export interface Afterimage {
+  sk: Skeleton;
+  scale: number;
+  facing: 1 | -1;
+  color: string;
+  ttl: number;
+  maxTtl: number;
+}
+
+/** Deep-copy the pose (joints are mutated in place every frame). */
+export function snapshotSkeleton(sk: Skeleton): Skeleton {
+  const out = {} as Record<string, unknown>;
+  for (const [k, v] of Object.entries(sk)) {
+    out[k] = typeof v === "number" ? v : { x: (v as Vec).x, y: (v as Vec).y };
+  }
+  return out as unknown as Skeleton;
+}
+
+export function drawAfterimage(ctx: CanvasRenderingContext2D, a: Afterimage): void {
+  const life = Math.max(0, a.ttl / a.maxTtl); // 1 → 0
+  const sk = a.sk;
+  const s = a.scale;
+  ctx.save();
+  ctx.globalAlpha = 0.28 * life;
+  ctx.shadowColor = a.color;
+  ctx.shadowBlur = 8;
+  flatBody(
+    ctx,
+    [
+      taperedPath(sk.shoulderL, flourish(sk.shoulderL, sk.elbowL, sk.handL), sk.handL, 1.9 * s, 1.1 * s),
+      taperedPath(sk.hipL, flourish(sk.hipL, sk.kneeL, sk.footL), sk.footL, 2.4 * s, 1.4 * s),
+      taperedPath(
+        sk.neck,
+        { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
+        sk.hips,
+        2.8 * s,
+        2 * s,
+      ),
+      taperedPath(sk.hipR, flourish(sk.hipR, sk.kneeR, sk.footR), sk.footR, 2.4 * s, 1.4 * s),
+      capsulePath(sk.neck.x, sk.neck.y, sk.head.x, sk.head.y, 1.5 * s, 1.5 * s),
+      circlePath(sk.head.x, sk.head.y, 8.5 * s),
+      taperedPath(sk.shoulderR, flourish(sk.shoulderR, sk.elbowR, sk.handR), sk.handR, 1.9 * s, 1.1 * s),
+    ],
+    a.color,
+  );
+  ctx.restore();
+}
+
+/**
  * THE fighter renderer — the single source of truth for drawing any fighter
  * on any surface (game, preview card, clones, future UIs). It owns body,
  * outfit, transforms (scale/phase/tint) and — via drawWeapon below — the
@@ -1242,6 +1313,7 @@ export function renderFighter(
   time: number,
   groundY: number,
 ): void {
+  if (fighter.blinkVanishTimer > 0 && fighter.alive) return; // mid-blink
   const s = fighter.scale;
   const fill =
     fighter.tintTimer > 0 && fighter.tintColor
@@ -1350,6 +1422,26 @@ export function renderFighter(
       Math.PI * 2,
     );
     ctx.fill();
+    ctx.restore();
+  }
+
+  // Dodge i-frames: a visible shimmer so invulnerability reads as a state.
+  if (fighter.invulnTimer > 0 && fighter.alive) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = 0.55 + 0.3 * Math.sin(time * 26);
+    ctx.strokeStyle = "#ffffff";
+    ctx.lineWidth = 2;
+    ctx.shadowColor = fighter.style.glow;
+    ctx.shadowBlur = 14;
+    const cy = sk.hips.y - 24 * s;
+    const spin = time * 9;
+    ctx.beginPath();
+    ctx.arc(sk.hips.x, cy, 42 * s, spin, spin + Math.PI * 0.7);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(sk.hips.x, cy, 42 * s, spin + Math.PI, spin + Math.PI * 1.7);
+    ctx.stroke();
     ctx.restore();
   }
 

@@ -7,6 +7,7 @@ import { createBotBrain, type BotBrain } from "../bot";
 import type { CombatCtx } from "../combat";
 import { dealDamage, pushEffect, rawDamage, spawnProjectile } from "../combat";
 import { attackTimingOf } from "../animation";
+import { blinkJuice, dashJuice, leapJuice } from "../movementFx";
 import { playSfx, SFX_KINDS, type SfxKind } from "../../audio/sfx";
 import { ARENA_HEIGHT, ARENA_WIDTH } from "../arena";
 import { mix, withAlpha } from "../../render/color";
@@ -126,39 +127,45 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
 
   const api: EngineApi = {
     // ----- movement -------------------------------------------------------
-    /** leap {up?, forward?} — vertical spring with optional forward carry. */
+    /** leap {up?, forward?} — vertical spring with optional forward carry.
+     * Strong forward carry makes it a LUNGE: gap-closer poke on the way. */
     leap(a) {
-      setVel(caster, caster.facing * N(a.forward, 4, -30, 30), -N(a.up, 15, 0, 34));
-      pushEffect(ctx, { kind: "ring", x: pos().x, y: pos().y + 30, ttl: 0.3, color: rt.glow, radius: 18 });
+      const forward = N(a.forward, 4, -30, 30);
+      setVel(caster, caster.facing * forward, -N(a.up, 15, 0, 34));
+      leapJuice(caster, ctx, rt.glow, Math.abs(forward) >= 8);
     },
-    /** dash {speed?, up?} — horizontal burst along facing. */
+    /** dash {speed?, up?, iframes?} — snappy horizontal burst along facing.
+     * Dodges by default (brief i-frames) and pokes what it passes through. */
     dash(a) {
-      setVel(caster, caster.facing * N(a.speed, 17, -34, 34), -N(a.up, 2, -10, 20));
-      caster.invulnTimer = Math.max(caster.invulnTimer, N(a.iframes, 0, 0, 0.5));
+      setVel(caster, caster.facing * N(a.speed, 21, -34, 34), -N(a.up, 2, -10, 20));
+      caster.invulnTimer = Math.max(caster.invulnTimer, N(a.iframes, 0.15, 0, 0.5));
+      dashJuice(caster, ctx, rt.glow);
     },
-    /** blink / teleport {x?, y?, dx?, dy?, behindOpponent?} */
+    /** blink / teleport {x?, y?, dx?, dy?, behindOpponent?} — with no
+     * positional args it repositions USEFULLY: just behind the opponent. */
     teleport(a) {
       const p = pos();
       const f = foe();
+      const from = { x: caster.root.position.x, y: caster.root.position.y };
       let x = p.x;
       let y = p.y;
-      if (a.behindOpponent) {
-        x = f.root.position.x - f.facing * 46;
-        y = f.root.position.y;
-      } else if (a.x !== undefined || a.y !== undefined) {
+      if (a.x !== undefined || a.y !== undefined) {
         x = N(a.x, p.x, 30, ARENA_WIDTH - 30);
         y = N(a.y, p.y, 40, ARENA_HEIGHT - 60);
-      } else {
-        x = p.x + N(a.dx, caster.facing * 80, -300, 300);
+      } else if (!a.behindOpponent && (a.dx !== undefined || a.dy !== undefined)) {
+        x = p.x + N(a.dx, 0, -300, 300);
         y = p.y + N(a.dy, 0, -300, 300);
+      } else {
+        // behindOpponent, or the bare default: land just behind the foe.
+        x = f.root.position.x - f.facing * 46;
+        y = f.root.position.y;
       }
-      pushEffect(ctx, { kind: "spark", x: p.x, y: p.y - 20, ttl: 0.3, color: rt.glow, radius: 16 });
       Matter.Body.setPosition(caster.root, {
         x: clamp(x, 30, ARENA_WIDTH - 30),
         y: clamp(y, 40, ARENA_HEIGHT - 60),
       });
       Matter.Body.setVelocity(caster.root, { x: 0, y: 0 });
-      pushEffect(ctx, { kind: "spark", x: caster.root.position.x, y: caster.root.position.y - 20, ttl: 0.3, color: rt.glow, radius: 16 });
+      blinkJuice(caster, ctx, from, caster.root.position, rt.glow);
     },
     applyForce(a) {
       const v = caster.root.velocity;

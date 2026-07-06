@@ -11,7 +11,15 @@ import { runWeaponScript } from "./engine/customScript";
 import type { EngineEntity } from "./engine/api";
 import { elementGlow } from "../generation/enrich";
 import type { Arena } from "./arena";
-import { collapse, weaponMountAnchor, type Fighter, type Side } from "./stickman";
+import {
+  collapse,
+  snapshotSkeleton,
+  weaponMountAnchor,
+  type Afterimage,
+  type Fighter,
+  type Side,
+} from "./stickman";
+import { landingImpact } from "./movementFx";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
 import { attackTimingOf } from "./animation";
@@ -103,6 +111,8 @@ export interface CombatCtx {
   behaviors: BehaviorRuntime[];
   /** Behavior-spawned entities (clones, traps, turrets…). */
   entities: EngineEntity[];
+  /** Movement-juice ghost silhouettes (dash/blink/leap trails). */
+  afterimages: Afterimage[];
   /** Global freeze remaining (seconds) — set on weapon hits for punch. */
   hitstop: number;
   /** Game clock, fed by the loop; the animators sway/bob off it. */
@@ -674,6 +684,8 @@ function tickTimers(f: Fighter, dt: number): void {
   f.castTimer = Math.max(0, f.castTimer - dt);
   f.dropThrough = Math.max(0, f.dropThrough - dt);
   f.invulnTimer = Math.max(0, f.invulnTimer - dt);
+  f.blinkVanishTimer = Math.max(0, f.blinkVanishTimer - dt);
+
   if (f.regenTimer > 0 && f.alive) {
     f.regenTimer = Math.max(0, f.regenTimer - dt);
     f.hp = Math.min(f.maxHp, f.hp + f.regenRate * dt);
@@ -755,6 +767,47 @@ export function updateFighter(
   // timers, attacks and motion — the opponent ticks at full speed.
   const fdt = dt * f.timeFactor;
   tickTimers(f, fdt);
+  // Movement juice (movementFx.ts): afterimage trail along the path.
+  if (f.afterimageTimer > 0 && f.alive) {
+    f.afterimageTimer -= dt;
+    f.afterimageAcc += dt;
+    if (f.afterimageAcc >= 0.05) {
+      f.afterimageAcc = 0;
+      if (ctx.afterimages.length >= 14) ctx.afterimages.shift(); // anti-spam cap
+      ctx.afterimages.push({
+        sk: snapshotSkeleton(f.skeleton),
+        scale: f.scale,
+        facing: f.facing,
+        color: f.style.glow,
+        ttl: 0.3,
+        maxTtl: 0.3,
+      });
+    }
+  }
+
+  // Gap-closer poke: a dash/lunge that passes through the foe lands ONE
+  // light hit + small knockback. Mobility payoff, deliberately weak.
+  if (f.dashPokeTimer > 0) {
+    f.dashPokeTimer = Math.max(0, f.dashPokeTimer - dt);
+    const dx = opponent.root.position.x - f.root.position.x;
+    const dy = opponent.root.position.y - f.root.position.y;
+    if (!f.dashPokeHit && opponent.alive && f.alive && Math.abs(dx) < 46 * f.scale && Math.abs(dy) < 70) {
+      f.dashPokeHit = true;
+      dealDamage(opponent, rawDamage(f, 4), Math.sign(dx) || f.facing, ctx, {
+        source: "melee",
+        attacker: f,
+        knockbackMul: 0.7,
+      });
+    }
+  }
+
+  // Leap landing: armed at launch, fires the impact on touchdown.
+  if (f.leapLandState === 1 && !f.grounded) f.leapLandState = 2;
+  else if (f.leapLandState === 2 && f.grounded) {
+    f.leapLandState = 0;
+    landingImpact(f, ctx);
+  }
+
   tickEngineTransforms(f, ctx, dt);
   if (!f.alive) return; // the KO ragdoll belongs to the physics engine now
 
@@ -1042,6 +1095,10 @@ export function updateEffects(ctx: CombatCtx, dt: number): void {
       e.y += (e.vy ?? 0) * dt;
     }
     if (e.ttl <= 0) ctx.effects.splice(i, 1);
+  }
+  for (let i = ctx.afterimages.length - 1; i >= 0; i--) {
+    ctx.afterimages[i].ttl -= dt;
+    if (ctx.afterimages[i].ttl <= 0) ctx.afterimages.splice(i, 1);
   }
 }
 
