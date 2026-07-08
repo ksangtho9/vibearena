@@ -62,6 +62,68 @@ export class AllModelsBusyError extends Error {
   }
 }
 
+/** Tiny, cheap, high-variety call for the prompt-screen suggestion chips.
+ * Walks the model pool CHEAPEST-FIRST (reverse of the fighter chain) and
+ * reuses the same cooldown buckets; a one-liner trio needs no 70B. */
+export async function suggestWithGroq(avoid: string[]): Promise<string> {
+  const apiKey = process.env.GROQ_API_KEY;
+  if (!apiKey) throw new Error("GROQ_API_KEY is not set");
+  const system = `You invent example fighter prompts for a physics stickman arena game whose engine can do: melee/ranged weapons, lasers, clones, traps, gravity flips, time slow, growing giant, teleports, hazard zones, summons.
+Return ONLY JSON: {"simple": string, "medium": string, "wild": string}.
+- simple: one quirky character + ONE clear gimmick, <=12 words
+- medium: a character with TWO abilities, <=20 words
+- wild: an over-the-top MULTI-ability showcase (mix gravity/clones/lasers/time/size), <=35 words
+Each is a lowercase noun phrase starting with "a"/"an" (no quotes, no trailing period). Be surprising; never reuse famous IP.`;
+  const user = avoid.length
+    ? `Invent a fresh trio. Do NOT repeat or closely resemble any of these:\n${avoid.map((s) => `- ${s}`).join("\n")}`
+    : "Invent a fresh trio.";
+
+  let lastError: unknown = null;
+  let sawRateLimit = false;
+  for (const model of [...modelPool()].reverse()) {
+    if ((coolingUntil.get(model) ?? 0) > Date.now()) {
+      sawRateLimit = true;
+      continue;
+    }
+    try {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user },
+          ],
+          temperature: 1.3,
+          max_tokens: 300,
+          response_format: { type: "json_object" },
+        }),
+      });
+      if (res.status === 429 || res.status >= 500) {
+        coolingUntil.set(model, Date.now() + COOLDOWN_MS);
+        sawRateLimit = sawRateLimit || res.status === 429;
+        lastError = new Error(`${model}: ${res.status}`);
+        continue;
+      }
+      if (!res.ok) {
+        lastError = new Error(`${model}: ${res.status} ${await res.text()}`);
+        continue;
+      }
+      const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+      const content = body.choices?.[0]?.message?.content;
+      if (!content) {
+        lastError = new Error(`${model}: empty suggestion response`);
+        continue;
+      }
+      return content;
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  throw new AllModelsBusyError(sawRateLimit, lastError);
+}
+
 export async function generateWithGroq(_system: string, userPrompt: string): Promise<string> {
   const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) throw new Error("GROQ_API_KEY is not set");

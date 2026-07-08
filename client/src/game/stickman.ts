@@ -5,6 +5,7 @@ import type { BehaviorRuntime } from "./engine/interpreter";
 import { mix, parseColor, shade, withAlpha } from "../render/color";
 import { playSfx } from "../audio/sfx";
 import { drawGearBack, drawGearFront, drawHeadgear } from "./gear";
+import { emptyInjuries, goreOf, injurySeverity, injuryTier, type InjuryState } from "./injury";
 import {
   drawWeapon as drawParametricWeapon,
   weaponIsFloating,
@@ -111,6 +112,22 @@ export interface Fighter {
   /** UTILITY ability cooldown (separate key, separate clock). */
   utilityCooldown: number;
   shieldTimer: number;
+  /** Theme/element/color of the active shield (drives the dome's look). */
+  shieldStyle: { color: string; element: string; theme: string | null } | null;
+  /** Rooted in place (vines/ice): movement zeroed, can still act. */
+  rootedTimer: number;
+  /** Marked/cursed: the NEXT hit taken is amplified by markMul. */
+  markTimer: number;
+  markMul: number;
+  /** Counter stance: the next MELEE hit taken is negated + riposted. */
+  counterTimer: number;
+  /** Charge rush: while >0, body contact delivers chargeDamage once. */
+  chargeTimer: number;
+  chargeDamage: number;
+  chargeSpeed: number;
+  chargeHit: boolean;
+  /** Weapon-clash debounce (simultaneous active swings spark, not spam). */
+  clashCd: number;
   /** Fraction of damage the active shield blocks (from ability params). */
   shieldCoverage: number;
   buffTimer: number;
@@ -185,6 +202,22 @@ export interface Fighter {
   dashPokeHit: boolean;
   /** Ambient state-VFX emission accumulator (effectsJuice upkeep). */
   fxAcc: number;
+  /** Cumulative absorbed damage per body region (injury system). */
+  injuries: InjuryState;
+  /** Combo: index of the NEXT swing variant (0–3). */
+  comboIndex: number;
+  /** Combo: variant of the CURRENT/most-recent swing (drives the animator). */
+  comboVariant: number;
+  /** Combo: true while every gap in the chain beat the fast window. */
+  comboChainOk: boolean;
+  /** Combo: time left to CHAIN (fast window → finisher eligibility). */
+  comboChainTimer: number;
+  /** Combo: time left to keep CYCLING variants (lenient window). */
+  comboCycleTimer: number;
+  /** Combo: the current swing is a qualified finisher (launch on hit). */
+  comboFinisher: boolean;
+  /** What this fighter bleeds (robots spark instead). */
+  gore: "blood" | "sparks";
   /** Full (attack-speed-scaled) duration of the current swing — drawWeapon
    * uses it to sync mounted-weapon attack motion to the phase windows. */
   attackTotal: number;
@@ -194,6 +227,8 @@ export interface Fighter {
   guardCooldown: number;
   /** LLM-drawn head accessory runtime (onRenderHead); null = keyword shape. */
   headRenderRuntime: BehaviorRuntime | null;
+  /** Weapon motion-smear this frame (world angles), from the animator. */
+  weaponSmear: { from: number; to: number } | null;
   /** Mid-air jumps spent since last grounded (wings grant extra). */
   airJumpsUsed: number;
   /** Block indicator fade 0→1 (render-only). */
@@ -296,6 +331,16 @@ export function createFighter(
     abilityCooldown: 0,
     utilityCooldown: 0,
     shieldTimer: 0,
+    shieldStyle: null,
+    rootedTimer: 0,
+    markTimer: 0,
+    markMul: 1.5,
+    counterTimer: 0,
+    chargeTimer: 0,
+    chargeDamage: 0,
+    chargeSpeed: 22,
+    chargeHit: false,
+    clashCd: 0,
     shieldCoverage: 0.7,
     buffTimer: 0,
     introTimer: 0,
@@ -341,11 +386,20 @@ export function createFighter(
     dashPokeTimer: 0,
     dashPokeHit: false,
     fxAcc: 0,
+    injuries: emptyInjuries(),
+    comboIndex: 0,
+    comboVariant: 0,
+    comboChainOk: true,
+    comboChainTimer: 0,
+    comboCycleTimer: 0,
+    comboFinisher: false,
+    gore: goreOf(`${spec.name} ${spec.flavor ?? ""} ${spec.appearance.accessories.join(" ")}`),
     attackTotal: 0,
     hasShield,
     guardCooldown: 0,
     blockVis: 0,
     headRenderRuntime: null,
+    weaponSmear: null,
     airJumpsUsed: 0,
     buffs: { speedMul: 1, strengthMul: 1, defenseMul: 1 },
     trail: [],
@@ -695,6 +749,15 @@ export function weaponMountAnchor(fighter: Fighter, time: number): Vec {
     case "body":
       return { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 };
     case "floating": {
+      // Blocking: the construct sweeps to the FRONT as a tight barrier
+      // instead of orbiting the whole body (pose-only; coverage unchanged).
+      if (fighter.blocking) {
+        const b = time * 5;
+        return {
+          x: fighter.root.position.x + fighter.facing * 26 * fighter.scale + Math.cos(b) * 5 * fighter.scale,
+          y: fighter.root.position.y - 24 * fighter.scale + Math.sin(b) * 12 * fighter.scale,
+        };
+      }
       const a = time * 1.6;
       return {
         x: fighter.root.position.x + Math.cos(a) * 44 * fighter.scale,
@@ -736,7 +799,59 @@ function drawWeapon(
   };
 
   if (mount === "hand" || mount === "dual") {
-    paint(hand, angle);
+    // Motion smear: on the strike's fastest transition the weapon renders as
+    // ghosted copies fanned along its arc (plus a glow streak) instead of a
+    // crisp weapon — one-frame speed. Angles come from the animator.
+    if (fighter.weaponSmear) {
+      // BOLD slash streak: a filled tapered wedge sweeping the whole arc
+      // (weapon-glow fill + hot white leading edge), bracketed by a faint
+      // ghost blade at the start and a crisp blade at the leading end.
+      const { from, to } = fighter.weaponSmear;
+      let span = to - from;
+      while (span > Math.PI) span -= Math.PI * 2;
+      while (span < -Math.PI) span += Math.PI * 2;
+      const tip = weaponTipLength(fighter.style.weapon.form, fighter.style.weapon.size) * fighter.scale;
+      const rOut = tip * 1.08;
+      // Comet streak over the LEADING portion of the sweep: a tapered wedge
+      // that starts as a point at the trailing edge and widens to the full
+      // blade at the leading edge — reads as a hard directional slash.
+      const start = from + span * 0.3;
+      const cSpan = to - start;
+      ctx.save();
+      const trail = (kIn: number, alpha: number) => {
+        ctx.beginPath();
+        ctx.moveTo(hand.x + Math.cos(start) * rOut * 0.55, hand.y + Math.sin(start) * rOut * 0.55);
+        ctx.arc(hand.x, hand.y, rOut, start, to, cSpan < 0);
+        ctx.lineTo(hand.x + Math.cos(to) * rOut * kIn, hand.y + Math.sin(to) * rOut * kIn);
+        // Inner edge sweeps back to the trailing point.
+        ctx.arc(hand.x, hand.y, rOut * kIn, to, start + cSpan * 0.15, cSpan >= 0);
+        ctx.closePath();
+        ctx.fillStyle = withAlpha(fighter.style.glow, alpha);
+        ctx.shadowColor = fighter.style.glow;
+        ctx.shadowBlur = 9;
+        ctx.fill();
+      };
+      trail(0.3, 0.8); // body of the streak
+      trail(0.66, 0.6); // brighter outer band
+      // Hot white leading edge along the final blade position.
+      ctx.strokeStyle = withAlpha("#ffffff", 0.95);
+      ctx.lineWidth = 3.5 * fighter.scale;
+      ctx.lineCap = "round";
+      ctx.beginPath();
+      ctx.moveTo(hand.x + Math.cos(to) * rOut * 0.25, hand.y + Math.sin(to) * rOut * 0.25);
+      ctx.lineTo(hand.x + Math.cos(to) * rOut, hand.y + Math.sin(to) * rOut);
+      ctx.stroke();
+      ctx.restore();
+      // Ghost blade at the start of the arc, crisp blade at the leading end.
+      ctx.save();
+      ctx.globalAlpha = 0.3;
+      paint(hand, from);
+      ctx.restore();
+      paint(hand, to);
+      if (mount !== "dual") return;
+    } else {
+      paint(hand, angle);
+    }
     if (mount === "dual") {
       // Mirror of the main weapon in the off hand, idle-angled.
       paint({ x: fighter.skeleton.handL.x, y: fighter.skeleton.handL.y }, -angle, true);
@@ -1370,6 +1485,56 @@ export function drawAfterimage(ctx: CanvasRenderingContext2D, a: Afterimage): vo
   ctx.restore();
 }
 
+/** Fixed gash layouts per region (deterministic — wounds don't flicker). */
+const GASHES: Record<"head" | "torso" | "arm" | "legs", [number, number, number][]> = {
+  // [offsetX, offsetY, angle] per gash, in fighter units around the anchor.
+  head: [[-2, -2, 0.6], [3, 1, -0.4]],
+  torso: [[-2, -4, 0.9], [3, 2, 0.4], [-1, 6, -0.5]],
+  arm: [[0, -2, 0.7], [2, 3, -0.3]],
+  legs: [[-1, 0, 0.5], [2, 6, -0.6]],
+};
+
+function drawWounds(ctx: CanvasRenderingContext2D, f: Fighter): void {
+  if (!f.alive && !f.ragdoll) return;
+  const sk = f.skeleton;
+  const s = f.scale;
+  const dark = f.gore === "sparks" ? "#3a3f4a" : "#6e1219";
+  const bright = f.gore === "sparks" ? "#8a94a6" : "#a31f28";
+  const anchors: Record<"head" | "torso" | "arm" | "legs", { x: number; y: number }> = {
+    head: sk.head,
+    torso: { x: (sk.neck.x + sk.hips.x) / 2, y: (sk.neck.y + sk.hips.y) / 2 },
+    arm: { x: (sk.shoulderR.x + sk.elbowR.x) / 2, y: (sk.shoulderR.y + sk.elbowR.y) / 2 },
+    legs: { x: (sk.hipL.x + sk.kneeL.x) / 2, y: (sk.hipL.y + sk.kneeL.y) / 2 },
+  };
+  ctx.save();
+  ctx.lineCap = "round";
+  for (const region of ["head", "torso", "arm", "legs"] as const) {
+    const sev = injurySeverity(f, region);
+    if (sev < 0.99 && injuryTier(f, region) === 0) continue;
+    const at = anchors[region];
+    const maimed = injuryTier(f, region) === 2;
+    // Darkened bruise patch.
+    ctx.globalAlpha = 0.25 + 0.3 * sev;
+    ctx.fillStyle = dark;
+    ctx.beginPath();
+    ctx.arc(at.x, at.y, (region === "torso" ? 6.5 : 4.5) * s * (0.7 + 0.5 * sev), 0, Math.PI * 2);
+    ctx.fill();
+    // Gash strokes (more + bolder when maimed).
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = bright;
+    ctx.lineWidth = (maimed ? 1.8 : 1.2) * s;
+    const gashes = GASHES[region].slice(0, maimed ? 3 : 2);
+    for (const [gx, gy, ga] of gashes) {
+      const len = (maimed ? 4.5 : 3) * s;
+      ctx.beginPath();
+      ctx.moveTo(at.x + gx * s - Math.cos(ga) * len, at.y + gy * s - Math.sin(ga) * len);
+      ctx.lineTo(at.x + gx * s + Math.cos(ga) * len, at.y + gy * s + Math.sin(ga) * len);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
 /**
  * THE fighter renderer — the single source of truth for drawing any fighter
  * on any surface (game, preview card, clones, future UIs). It owns body,
@@ -1444,6 +1609,10 @@ export function renderFighter(
   // Functional gear over the body (chest plate etc.).
   drawGearFront(ctx, fighter, time);
 
+  // INJURIES: darkened/reddened patches + gash marks on hurt regions,
+  // scaling with severity (drawn deterministically — no flicker).
+  drawWounds(ctx, fighter);
+
   // Head accessory: an LLM onRenderHead program owns the look when alive;
   // otherwise the keyword-derived parametric shape (viking → horned helm…).
   const hgRt = fighter.headRenderRuntime;
@@ -1461,20 +1630,77 @@ export function renderFighter(
     attackStyleOf(fighter.style.weapon.form, fighter.spec.weapon.type) === "cast"
   ) {
     const len = weaponTipLength(fighter.style.weapon.form, fighter.style.weapon.size) * s;
+    const tipX = sk.handR.x + Math.cos(weaponAngle) * len;
+    const tipY = sk.handR.y + Math.sin(weaponAngle) * len;
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     ctx.shadowColor = fighter.style.glow;
-    ctx.shadowBlur = 18;
-    ctx.fillStyle = withAlpha(fighter.style.glow, 0.55 + 0.3 * Math.sin(time * 20));
-    ctx.beginPath();
-    ctx.arc(
-      sk.handR.x + Math.cos(weaponAngle) * len,
-      sk.handR.y + Math.sin(weaponAngle) * len,
-      6 * s,
-      0,
-      Math.PI * 2,
-    );
-    ctx.fill();
+    ctx.shadowBlur = 14;
+    ctx.strokeStyle = withAlpha(fighter.style.glow, 0.8);
+    ctx.fillStyle = withAlpha(fighter.style.glow, 0.8);
+    // Element-shaped CHARGE at the tip — gathering energy, not a glow disc.
+    const el = fighter.style.element;
+    const flick = Math.sin(time * 22);
+    if (el === "fire") {
+      // Flame licks: three flickering triangles leaning off the tip.
+      for (let i = 0; i < 3; i++) {
+        const a = -Math.PI / 2 + (i - 1) * 0.7 + flick * 0.15;
+        const h = (6 + 3 * Math.sin(time * 17 + i * 2)) * s;
+        ctx.beginPath();
+        ctx.moveTo(tipX + Math.cos(a - 0.5) * 3 * s, tipY + Math.sin(a - 0.5) * 3 * s);
+        ctx.lineTo(tipX + Math.cos(a) * h, tipY + Math.sin(a) * h);
+        ctx.lineTo(tipX + Math.cos(a + 0.5) * 3 * s, tipY + Math.sin(a + 0.5) * 3 * s);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else if (el === "ice") {
+      // Orbiting shard points.
+      for (let i = 0; i < 4; i++) {
+        const a = time * 4 + (i / 4) * Math.PI * 2;
+        const px = tipX + Math.cos(a) * 7 * s;
+        const py = tipY + Math.sin(a) * 7 * s;
+        ctx.beginPath();
+        ctx.moveTo(px, py - 3 * s);
+        ctx.lineTo(px + 2 * s, py);
+        ctx.lineTo(px, py + 3 * s);
+        ctx.lineTo(px - 2 * s, py);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else if (el === "lightning") {
+      // Two mini crackling bolts around the tip.
+      ctx.lineWidth = 1.6 * s;
+      for (let i = 0; i < 2; i++) {
+        const a = time * 9 + i * Math.PI;
+        const ex = tipX + Math.cos(a) * 9 * s;
+        const ey = tipY + Math.sin(a) * 9 * s;
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo((tipX + ex) / 2 + flick * 3 * s, (tipY + ey) / 2 - flick * 2 * s);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+      }
+    } else if (el === "holy") {
+      // Short rotating rays.
+      ctx.lineWidth = 1.8 * s;
+      for (let i = 0; i < 4; i++) {
+        const a = time * 2 + (i / 4) * Math.PI * 2;
+        ctx.beginPath();
+        ctx.moveTo(tipX + Math.cos(a) * 3 * s, tipY + Math.sin(a) * 3 * s);
+        ctx.lineTo(tipX + Math.cos(a) * (8 + flick) * s, tipY + Math.sin(a) * (8 + flick) * s);
+        ctx.stroke();
+      }
+    } else {
+      // Default/arcane/shadow: converging wisp arcs spiraling into the tip.
+      ctx.lineWidth = 1.6 * s;
+      for (let i = 0; i < 3; i++) {
+        const a = -time * 5 + (i / 3) * Math.PI * 2;
+        const r0 = (9 - ((time * 14 + i * 3) % 6)) * s;
+        ctx.beginPath();
+        ctx.arc(tipX, tipY, Math.max(1.5 * s, r0), a, a + 1.1);
+        ctx.stroke();
+      }
+    }
     ctx.restore();
   }
 
@@ -1529,59 +1755,228 @@ export function renderFighter(
     ctx.restore();
   }
 
-  // Shield bubble: a real translucent dome with a drifting shimmer band,
-  // scaled in over the first beat. Absorb ripples come from dealDamage.
+  // Shield: a SOFT translucent energy dome — gentle rim, low alpha — whose
+  // accents follow the casting ability's theme/element (a fire ward wears
+  // flame licks; a holy aegis, rays; frost, facets). Never one loud shape
+  // for every shield. Absorb ripples come from dealDamage.
   if (fighter.shieldTimer > 0) {
     const cxs = sk.hips.x;
     const cys = sk.hips.y - 24 * s;
     const rise = Math.min(1, (3 - Math.min(3, fighter.shieldTimer)) * 6 + 0.35);
     const rr = 58 * s * rise;
+    const sc = fighter.shieldStyle?.color ?? fighter.style.glow;
+    const flavor = fighter.shieldStyle?.theme ?? fighter.shieldStyle?.element ?? "none";
     ctx.save();
-    // Glassy fill.
+    // Glassy fill (soft).
     const dome = ctx.createRadialGradient(cxs, cys, rr * 0.3, cxs, cys, rr);
-    dome.addColorStop(0, withAlpha(fighter.style.glow, 0.03));
-    dome.addColorStop(0.82, withAlpha(fighter.style.glow, 0.1));
-    dome.addColorStop(1, withAlpha(fighter.style.glow, 0.28));
+    dome.addColorStop(0, withAlpha(sc, 0.03));
+    dome.addColorStop(0.82, withAlpha(sc, 0.08));
+    dome.addColorStop(1, withAlpha(sc, 0.2));
     ctx.fillStyle = dome;
     ctx.beginPath();
     ctx.arc(cxs, cys, rr, 0, Math.PI * 2);
     ctx.fill();
-    // Rim + slow-drifting shimmer band.
-    ctx.globalAlpha = 0.5 + 0.18 * Math.sin(time * 9);
-    ctx.strokeStyle = fighter.style.glow;
-    ctx.lineWidth = 2.5;
-    ctx.shadowColor = fighter.style.glow;
-    ctx.shadowBlur = 14;
+    // Gentle rounded rim: low alpha, slow breathing glow.
+    ctx.globalAlpha = 0.24 + 0.07 * Math.sin(time * 3.2);
+    ctx.strokeStyle = sc;
+    ctx.lineWidth = 1.8;
+    ctx.shadowColor = sc;
+    ctx.shadowBlur = 8;
     ctx.beginPath();
     ctx.arc(cxs, cys, rr, 0, Math.PI * 2);
     ctx.stroke();
-    ctx.globalAlpha = 0.65;
+    // Drifting shimmer band (the "energy is alive" read).
+    ctx.globalAlpha = 0.3;
+    ctx.lineWidth = 1.3;
     ctx.strokeStyle = "#ffffff";
-    ctx.lineWidth = 1.5;
-    const band = time * 1.7;
+    const band = time * 1.4;
     ctx.beginPath();
-    ctx.arc(cxs, cys, rr * 0.92, band, band + 0.9);
+    ctx.arc(cxs, cys, rr * 0.93, band, band + 0.8);
+    ctx.stroke();
+    // THEMED accents, all quiet (alpha ≤ 0.4).
+    ctx.globalAlpha = 0.38;
+    ctx.strokeStyle = sc;
+    ctx.fillStyle = sc;
+    if (flavor === "fire") {
+      // Three flame licks flickering up the rim.
+      for (let i = 0; i < 3; i++) {
+        const a = -Math.PI / 2 + (i - 1) * 0.9 + Math.sin(time * 7 + i * 2) * 0.08;
+        const bx = cxs + Math.cos(a) * rr;
+        const by = cys + Math.sin(a) * rr;
+        const h = (5 + 2 * Math.sin(time * 11 + i * 3)) * s;
+        ctx.beginPath();
+        ctx.moveTo(bx - 2 * s, by);
+        ctx.lineTo(bx, by - h);
+        ctx.lineTo(bx + 2 * s, by);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else if (flavor === "ice") {
+      // Four still crystal facets set into the rim.
+      for (let i = 0; i < 4; i++) {
+        const a = 0.5 + (i / 4) * Math.PI * 2;
+        const bx = cxs + Math.cos(a) * rr;
+        const by = cys + Math.sin(a) * rr;
+        ctx.beginPath();
+        ctx.moveTo(bx, by - 3.4 * s);
+        ctx.lineTo(bx + 2.2 * s, by);
+        ctx.lineTo(bx, by + 3.4 * s);
+        ctx.lineTo(bx - 2.2 * s, by);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else if (flavor === "bolt" || flavor === "lightning") {
+      // One jagged rim segment that hops around (crackling containment).
+      const seg = Math.floor(time * 5) % 6;
+      const a0 = (seg / 6) * Math.PI * 2;
+      ctx.lineWidth = 1.6;
+      ctx.beginPath();
+      for (let i = 0; i <= 4; i++) {
+        const a = a0 + (i / 4) * 1.0;
+        const wob = i % 2 === 0 ? 1 : 0.92 + 0.1 * Math.sin(time * 31 + i);
+        const px = cxs + Math.cos(a) * rr * wob;
+        const py = cys + Math.sin(a) * rr * wob;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    } else if (flavor === "holy") {
+      // Four soft rays breathing outward from the crown.
+      ctx.lineWidth = 1.4;
+      for (let i = 0; i < 4; i++) {
+        const a = -Math.PI / 2 + (i - 1.5) * 0.5;
+        const l = (6 + 2 * Math.sin(time * 2.5 + i)) * s;
+        ctx.beginPath();
+        ctx.moveTo(cxs + Math.cos(a) * rr, cys + Math.sin(a) * rr);
+        ctx.lineTo(cxs + Math.cos(a) * (rr + l), cys + Math.sin(a) * (rr + l));
+        ctx.stroke();
+      }
+    } else if (flavor === "void" || flavor === "shadow") {
+      // A smoky counter-rotating inner ring.
+      ctx.lineWidth = 2.2;
+      ctx.globalAlpha = 0.28;
+      const sp = -time * 1.1;
+      ctx.beginPath();
+      ctx.arc(cxs, cys, rr * 0.8, sp, sp + 1.4);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cxs, cys, rr * 0.8, sp + Math.PI, sp + Math.PI + 1.4);
+      ctx.stroke();
+    } else if (flavor === "wall") {
+      // Vertical strut shadows inside the dome (a braced barrier).
+      ctx.lineWidth = 1.4;
+      for (let i = -1; i <= 1; i++) {
+        const bx = cxs + i * rr * 0.42;
+        const half = Math.sqrt(Math.max(0, rr * rr - (bx - cxs) * (bx - cxs))) * 0.92;
+        ctx.beginPath();
+        ctx.moveTo(bx, cys - half);
+        ctx.lineTo(bx, cys + half);
+        ctx.stroke();
+      }
+    }
+    // default/arcane: dome + shimmer band only — quiet is a look too.
+    ctx.restore();
+  }
+  // ROOTED: binding tendrils around the shins (movement is zeroed).
+  if (fighter.rootedTimer > 0 && fighter.alive) {
+    ctx.save();
+    ctx.strokeStyle = withAlpha("#5a8f4a", 0.85);
+    ctx.lineWidth = 2 * s;
+    const fx = (sk.footL.x + sk.footR.x) / 2;
+    const fy = Math.max(sk.footL.y, sk.footR.y);
+    for (let i = 0; i < 3; i++) {
+      const px = fx + (i - 1) * 7 * s;
+      const sway = Math.sin(time * 6 + i * 2.1) * 2 * s;
+      ctx.beginPath();
+      ctx.moveTo(px, fy);
+      ctx.quadraticCurveTo(px + sway, fy - 8 * s, px - sway, fy - 15 * s);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+  // MARKED: a slowly rotating curse sigil overhead.
+  if (fighter.markTimer > 0 && fighter.alive) {
+    ctx.save();
+    ctx.strokeStyle = withAlpha("#c77dff", 0.8);
+    ctx.lineWidth = 1.6 * s;
+    ctx.shadowColor = "#c77dff";
+    ctx.shadowBlur = 8;
+    const mx = sk.head.x;
+    const my = sk.head.y - 16 * s;
+    const spin = time * 2;
+    ctx.beginPath();
+    for (let i = 0; i <= 4; i++) {
+      const a = spin + (i / 4) * Math.PI * 2;
+      const px = mx + Math.cos(a) * 5 * s;
+      const py = my + Math.sin(a) * 5 * s;
+      if (i === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
     ctx.stroke();
     ctx.restore();
   }
-  // Buff motes.
+  // COUNTER STANCE: a poised glint tracing the guard arm.
+  if (fighter.counterTimer > 0 && fighter.alive) {
+    ctx.save();
+    ctx.strokeStyle = withAlpha("#ffd75e", 0.5 + 0.3 * Math.sin(time * 12));
+    ctx.lineWidth = 2.2 * s;
+    ctx.shadowColor = "#ffd75e";
+    ctx.shadowBlur = 9;
+    ctx.beginPath();
+    ctx.arc(sk.hips.x + fighter.facing * 12 * s, sk.hips.y - 22 * s, 16 * s, -1.1, 1.1);
+    ctx.stroke();
+    ctx.restore();
+  }
+  // Buff aura: element-shaped orbiters (flame ticks / shards / bolts /
+  // stars) — not the one-size-fits-all spinning dots.
   if (fighter.buffTimer > 0) {
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     ctx.fillStyle = withAlpha(fighter.style.glow, 0.8);
+    ctx.strokeStyle = withAlpha(fighter.style.glow, 0.85);
     ctx.shadowColor = fighter.style.glow;
     ctx.shadowBlur = 8;
-    for (let i = 0; i < 3; i++) {
-      const a = time * 6 + (i * Math.PI * 2) / 3;
-      ctx.beginPath();
-      ctx.arc(
-        sk.hips.x + Math.cos(a) * 30 * s,
-        sk.hips.y - 20 * s + Math.sin(a) * 40 * s,
-        2.2 * s,
-        0,
-        Math.PI * 2,
-      );
-      ctx.fill();
+    const el = fighter.style.element;
+    for (let i = 0; i < 4; i++) {
+      const a = time * (4.5 + (i % 2)) + (i * Math.PI * 2) / 4;
+      const px = sk.hips.x + Math.cos(a) * (26 + i * 3) * s;
+      const py = sk.hips.y - 20 * s + Math.sin(a) * (34 + i * 3) * s;
+      if (el === "fire") {
+        ctx.beginPath();
+        ctx.moveTo(px - 2 * s, py + 2.5 * s);
+        ctx.lineTo(px, py - 3.5 * s);
+        ctx.lineTo(px + 2 * s, py + 2.5 * s);
+        ctx.closePath();
+        ctx.fill();
+      } else if (el === "ice") {
+        ctx.beginPath();
+        ctx.moveTo(px, py - 3 * s);
+        ctx.lineTo(px + 2 * s, py);
+        ctx.lineTo(px, py + 3 * s);
+        ctx.lineTo(px - 2 * s, py);
+        ctx.closePath();
+        ctx.fill();
+      } else if (el === "lightning") {
+        ctx.lineWidth = 1.4 * s;
+        ctx.beginPath();
+        ctx.moveTo(px - 2 * s, py - 3 * s);
+        ctx.lineTo(px + 1 * s, py - 0.5 * s);
+        ctx.lineTo(px - 1 * s, py + 0.5 * s);
+        ctx.lineTo(px + 2 * s, py + 3 * s);
+        ctx.stroke();
+      } else if (el === "holy") {
+        ctx.lineWidth = 1.3 * s;
+        ctx.beginPath();
+        ctx.moveTo(px - 2.6 * s, py);
+        ctx.lineTo(px + 2.6 * s, py);
+        ctx.moveTo(px, py - 2.6 * s);
+        ctx.lineTo(px, py + 2.6 * s);
+        ctx.stroke();
+      } else {
+        ctx.beginPath();
+        ctx.arc(px, py, (1.6 + (i % 2)) * s, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
     ctx.restore();
   }

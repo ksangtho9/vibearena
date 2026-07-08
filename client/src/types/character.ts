@@ -197,7 +197,9 @@ export interface AbilitySpec {
   customScript?: string;
 }
 
-/** Which kinds live in which slot (enrich sorts misplaced ones). */
+/** Fallback-kind homes per slot. Slot classification is POSITIONAL for
+ * behavior-composed abilities (a composed attack keeps whatever kind tag it
+ * wears); these lists only sort BARE legacy specs. */
 export const ATTACK_ABILITY_KINDS = ["aoe", "projectile"] as const;
 export const UTILITY_ABILITY_KINDS = ["dash", "shield", "heal", "buff"] as const;
 

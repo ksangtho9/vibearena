@@ -1,4 +1,5 @@
 import Matter from "matter-js";
+import { ARENA_WIDTH } from "./arena";
 import type {
   AbilityMotif,
   ElementKind,
@@ -22,15 +23,31 @@ import {
 import { landingImpact } from "./movementFx";
 import { gearAirJumps, gearDefenseBonus } from "./gear";
 import {
-  auraGlow,
-  impactSparks,
+  accrueInjury,
+  applyInjuryPosture,
+  hitSpatter,
+  injuryDamageMul,
+  injuryFlinchMul,
+  injuryGuardDrainMul,
+  injuryJumpMul,
+  injuryMoveMul,
+  injuryParryMul,
+  injuryWindupMul,
+  maimedDrip,
+  pickInjuryRegion,
+  tickInjuries,
+} from "./injury";
+import {
+  impactFlash,
   particleBurst,
   risingMotes,
+  shockwave,
   shockwaveRing,
+  slashArc,
 } from "./effectsJuice";
 import type { InputState } from "./input";
 import { useAbility } from "./abilities";
-import { attackTimingOf } from "./animation";
+import { attackTimingOf, comboFinisherTimingFor } from "./animation";
 import { playSfx } from "../audio/sfx";
 
 /**
@@ -75,12 +92,20 @@ export interface Projectile {
   returning?: boolean;
   /** Re-hit debounce for piercing/reflected projectiles. */
   rehit?: number;
+  /** Modifier: flies through fighters instead of expiring on hit. */
+  pierce?: boolean;
+  /** Modifier: remaining ground/wall bounces (ricochet shot). */
+  bounces?: number;
+  /** Modifier: splits into a fan of 3 smaller shots on first hit. */
+  splitOnHit?: boolean;
   /** Trail-particle emission accumulator. */
   trailAcc?: number;
 }
 
 export interface Effect {
-  kind: "ring" | "spark" | "text" | "motif" | "shape" | "particle" | "decal";
+  kind:
+    | "ring" | "spark" | "text" | "motif" | "shape" | "particle" | "decal"
+    | "shockwave" | "lightning" | "slasharc" | "flash";
   x: number;
   y: number;
   ttl: number;
@@ -109,9 +134,11 @@ export interface Effect {
   vy?: number;
   gravity?: number;
   size?: number;
-  particleShape?: "circle" | "square" | "spark" | "star";
+  particleShape?: "circle" | "square" | "spark" | "star" | "shard";
   /** Flat ground mark (kind "decal"): scorch/frost/crack under AoEs. */
   decalKind?: "scorch" | "frost" | "crack";
+  /** Deterministic jitter seed (lightning forks, shockwave wobble, shards). */
+  seed?: number;
 }
 
 export interface CombatCtx {
@@ -170,8 +197,9 @@ const HITSTOP_BY_SOURCE: Record<DamageSource, number> = {
   ability: 0.07,
 };
 
-const speedOf = (f: Fighter) => (3 + f.spec.stats.speed * 0.035) * f.buffs.speedMul;
-const jumpVelOf = (f: Fighter) => 11 + f.spec.stats.speed * 0.015;
+const speedOf = (f: Fighter) =>
+  (3 + f.spec.stats.speed * 0.035) * f.buffs.speedMul * injuryMoveMul(f);
+const jumpVelOf = (f: Fighter) => (11 + f.spec.stats.speed * 0.015) * injuryJumpMul(f);
 
 const isMissile = (f: Fighter) => f.spec.weapon.type !== "melee";
 
@@ -182,11 +210,38 @@ export function weaponPropMag(f: Fighter, kind: WeaponPropertyKind): number {
 
 /** attackSpeed property: faster phases (and cooldown), traded in dealDamage
  * against per-hit output. */
-const attackSpeedScale = (f: Fighter) => 1 / (1 + weaponPropMag(f, "attackSpeed") * 0.04);
+const attackSpeedScale = (f: Fighter) =>
+  (1 / (1 + weaponPropMag(f, "attackSpeed") * 0.04)) * injuryWindupMul(f);
+
+/**
+ * SWING COMBO — consecutive melee attacks cycle 4 variants (never the same
+ * swing twice in a row); chaining every hit inside the fast window makes the
+ * 4th a FINISHER (launch + extra knockback). Both windows are grace beyond
+ * the swing itself: CHAIN must beat the 0.55s cooldown by a real margin but
+ * stay tight; CYCLE is lenient so even sloppy mashing keeps the variety.
+ */
+const COMBO_CHAIN_GRACE = 0.35; // s after the swing ends to CHAIN
+const COMBO_CYCLE_GRACE = 1.2; // s after the swing ends to keep CYCLING
+
+/** The fighter's finisher timing when their family has an authored combo
+ * (every melee family now); null for ranged/mounted. */
+function finisherTimingOf(f: Fighter): ReturnType<typeof comboFinisherTimingFor> {
+  return comboFinisherTimingFor(f.style.weapon.form, f.spec.weapon.type, f.spec.weapon.mount);
+}
+
+function resetCombo(f: Fighter): void {
+  f.comboIndex = 0;
+  f.comboChainOk = true;
+  f.comboChainTimer = 0;
+  f.comboCycleTimer = 0;
+}
 
 /** Phase timing follows the weapon's form, scaled by the attackSpeed property. */
 function attackTiming(f: Fighter): { windup: number; active: number; recovery: number; total: number } {
-  const base = attackTimingOf(f.style.weapon.form, f.spec.weapon.type);
+  // The family finisher (4th combo swing) is its own heavier attack;
+  // hits 1–3 use the shared style timing untouched.
+  const fin = f.comboVariant === 3 ? finisherTimingOf(f) : null;
+  const base = fin ?? attackTimingOf(f.style.weapon.form, f.spec.weapon.type);
   const ts = attackSpeedScale(f);
   return {
     windup: base.windup * ts,
@@ -198,7 +253,11 @@ function attackTiming(f: Fighter): { windup: number; active: number; recovery: n
 
 /** Per-hit weapon damage after the attackSpeed trade-off. */
 function weaponHitDamage(f: Fighter): number {
-  return rawDamage(f, f.spec.weapon.damage) * (1 - weaponPropMag(f, "attackSpeed") * 0.025);
+  return (
+    rawDamage(f, f.spec.weapon.damage) *
+    (1 - weaponPropMag(f, "attackSpeed") * 0.025) *
+    injuryDamageMul(f)
+  );
 }
 
 /** Roll the crit property: returns the (possibly boosted) damage + crit flag. */
@@ -225,6 +284,10 @@ export interface DamageOpts {
   source?: DamageSource;
   /** Set on weapon-sourced hits so the attacker's properties apply. */
   attacker?: Fighter;
+  /** Contact height (world Y) — picks which body region gets injured. */
+  hitY?: number;
+  /** Qualified combo finisher: forces a launch + heavier knockback. */
+  finisher?: boolean;
 }
 
 /**
@@ -275,10 +338,33 @@ export function dealDamage(
     return;
   }
 
+  // COUNTER STANCE (behavior verb): the next MELEE hit is negated and
+  // riposted — the attacker takes the sting instead. Distinct from reflect
+  // (projectiles) and parry (player-timed).
+  if (target.counterTimer > 0 && (opts.source ?? "ability") === "melee" && opts.attacker?.alive) {
+    target.counterTimer = 0;
+    const att = opts.attacker;
+    playSfx("parry", { pitch: 1.2, volume: 0.8 });
+    slashArc(ctx, target.root.position.x + target.facing * 16, target.root.position.y - 22, {
+      radius: 30, angle: target.facing > 0 ? -0.4 : Math.PI + 0.4, spread: 1.6,
+      color: "#ffd75e", width: 8, ttl: 0.25,
+    });
+    pushEffect(ctx, { kind: "text", x: target.root.position.x, y: target.root.position.y - 84, ttl: 0.8, color: "#ffd75e", text: "COUNTERED!" });
+    att.hitstunTimer = Math.max(att.hitstunTimer, 0.5);
+    att.attackAnim = 0;
+    att.attackWindow = 0;
+    dealDamage(att, Math.max(4, Math.round(amount * 0.7)), (-dir || 1) as number, ctx, { source: "ability" });
+    ctx.hitstop = Math.max(ctx.hitstop, 0.08);
+    return;
+  }
+
   // BLOCK: guard stance negates the frontal hit at the cost of guard meter.
   if (frontal && target.blocking) {
     const preMitigation = amount * DAMAGE_SCALE * 0.45; // drain ~ hit weight
-    target.guard -= preMitigation * target.guardDrainMul;
+    // Torso injuries make the block less stable (faster guard drain), and
+    // the blocking ARM soaks a reduced share of the punishment.
+    target.guard -= preMitigation * target.guardDrainMul * injuryGuardDrainMul(target);
+    accrueInjury(target, pickInjuryRegion(target, undefined, { blocked: true }), preMitigation * 0.3);
     target.guardRegenDelay = 0.8;
     const { x, y } = target.root.position;
     if (target.guard > 0) {
@@ -346,6 +432,13 @@ export function dealDamage(
   const gearedDefense = effectiveDefense + gearDefenseBonus(target.spec);
   let dmg = amount * (130 / (130 + gearedDefense)) * DAMAGE_SCALE;
   // setScale(): bigger = tankier (the giant hurtbox has a payoff), smaller =
+  // MARK/CURSE: the stored amplification fires on the next hit, once.
+  if (target.markTimer > 0) {
+    dmg *= target.markMul;
+    target.markTimer = 0;
+    pushEffect(ctx, { kind: "flash", x: target.root.position.x, y: target.root.position.y - 26, ttl: 0.22, color: "#c77dff", radius: 26 });
+    pushEffect(ctx, { kind: "text", x: target.root.position.x, y: target.root.position.y - 96, ttl: 0.7, color: "#c77dff", text: "MARKED!" });
+  }
   // frailer (the dodge tradeoff). Clamped so nothing bricks the match.
   dmg *= Math.max(0.6, Math.min(1.45, 1 / target.displayScale));
   if (target.shieldTimer > 0) {
@@ -359,6 +452,20 @@ export function dealDamage(
   dmg = Math.max(1, Math.round(dmg));
 
   target.hp = Math.max(0, target.hp - dmg);
+  resetCombo(target); // taking a hit breaks your own combo
+
+  // INJURY: the landed hit wounds a region (by contact height when known)
+  // and sprays directional spatter from the contact point.
+  const region = pickInjuryRegion(target, opts.hitY);
+  accrueInjury(target, region, dmg);
+  hitSpatter(
+    ctx,
+    target,
+    target.root.position.x - Math.sign(dir) * 8 * target.scale,
+    opts.hitY ?? target.root.position.y - 20 * target.scale,
+    Math.sign(dir) || 1,
+    dmg,
+  );
 
   const { x, y } = target.root.position;
   playSfx(dmg >= 18 ? "hitHeavy" : "hit", {
@@ -368,7 +475,7 @@ export function dealDamage(
   pushEffect(ctx, { kind: "text", x, y: y - 70, ttl: 0.7, color: "#e8b33c", text: `${dmg}` });
   pushEffect(ctx, { kind: "spark", x, y: y - 20, ttl: 0.25, color: target.color, radius: 14 });
 
-  const kb = Math.min(12, (4.5 + dmg * 0.22) * knockbackMul);
+  const kb = Math.min(14, (4.5 + dmg * 0.22) * knockbackMul * (opts.finisher ? 1.6 : 1));
   Matter.Body.setVelocity(target.root, {
     x: dir * kb,
     y: Math.min(target.root.velocity.y, -kb * 0.4),
@@ -377,9 +484,10 @@ export function dealDamage(
   // Hit reaction: ranged/thrown never launch; abilities launch on their
   // knockback multiplier; melee only on a genuinely heavy hit.
   const launches =
-    source === "ability"
+    opts.finisher === true ||
+    (source === "ability"
       ? knockbackMul > 1.3 || dmg >= LAUNCH_DAMAGE
-      : source === "melee" && dmg >= LAUNCH_DAMAGE;
+      : source === "melee" && dmg >= LAUNCH_DAMAGE);
 
   if (launches) {
     target.launchedTimer = LAUNCH_TIME;
@@ -388,7 +496,10 @@ export function dealDamage(
     target.attackWindow = 0;
   } else if (target.shieldTimer <= 0) {
     // stagger property lengthens the lockout (hard-capped for 2P fairness).
-    const stun = Math.min(0.45, HITSTUN_BY_SOURCE[source] + prop("stagger") * 0.03);
+    const stun = Math.min(
+      0.55,
+      (HITSTUN_BY_SOURCE[source] + prop("stagger") * 0.03) * injuryFlinchMul(target),
+    );
     target.hitstunTimer = Math.max(target.hitstunTimer, stun);
     // Only a real stagger (melee-tier) interrupts an attack in progress.
     if (stun >= HITSTUN_BY_SOURCE.melee) {
@@ -451,6 +562,10 @@ export function spawnProjectile(
     onHit?: () => void;
     /** Boomerang flight path (returns to the thrower). */
     boomerang?: boolean;
+    /** Modifiers: pierce through fighters / ricochet / split on hit. */
+    pierce?: boolean;
+    bounces?: number;
+    splitOnHit?: boolean;
   },
 ): void {
   // Launch from the weapon hand joint unless the engine placed it elsewhere.
@@ -504,14 +619,37 @@ export function spawnProjectile(
     element: opts.element,
     onHit: opts.onHit,
     boomerang: opts.boomerang,
+    pierce: opts.pierce,
+    bounces: opts.bounces,
+    splitOnHit: opts.splitOnHit,
   });
   playSfx("projectile", { pitch: 1.4 - opts.radius * 0.06, volume: 0.7 });
 }
 
 function startAttack(f: Fighter): void {
+  // COMBO advance (melee only), on attack START. Cycle lapse falls back to
+  // variant 0; a chain lapse only forfeits the finisher qualification.
+  if (!isMissile(f)) {
+    if (f.comboCycleTimer <= 0) {
+      f.comboIndex = 0;
+      f.comboChainOk = true;
+    } else if (f.comboChainTimer <= 0) {
+      f.comboChainOk = false;
+    }
+    f.comboVariant = f.comboIndex;
+    f.comboFinisher = f.comboIndex === 3 && f.comboChainOk;
+    f.comboIndex = (f.comboIndex + 1) % 4; // wrap: after the 4th, back to 1
+  } else {
+    f.comboVariant = 0;
+    f.comboFinisher = false;
+  }
   const ts = attackSpeedScale(f);
   f.attackCooldown = (isMissile(f) ? MISSILE_ATTACK_COOLDOWN : MELEE_ATTACK_COOLDOWN) * ts;
   f.attackAnim = attackTiming(f).total;
+  if (!isMissile(f)) {
+    f.comboChainTimer = f.attackAnim + COMBO_CHAIN_GRACE * ts;
+    f.comboCycleTimer = f.attackAnim + COMBO_CYCLE_GRACE * ts;
+  }
   f.attackTotal = f.attackAnim; // drawWeapon syncs mounted-weapon strikes to this
   f.attackWindow = 0;
   f.hasHitThisSwing = false;
@@ -610,7 +748,7 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
     const seg = weaponSegment(f, ctx.time);
     for (const e of ctx.entities) {
       if (e.side === f.side || e.dead || e.hurtCd > 0) continue;
-      if (e.kind !== "clone" && e.kind !== "minion" && e.kind !== "turret") continue;
+      if (e.kind !== "clone" && e.kind !== "minion" && e.kind !== "turret" && e.kind !== "totem") continue;
       const dx = e.x - f.root.position.x;
       const reach = Math.hypot(seg.to.x - seg.from.x, seg.to.y - seg.from.y) + 20;
       if (Math.sign(dx) === f.facing && Math.abs(dx) < reach && Math.abs(e.y - 30 - f.root.position.y) < 70) {
@@ -619,6 +757,56 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
         pushEffect(ctx, { kind: "spark", x: e.x, y: e.y - 20, ttl: 0.2, color: e.glow, radius: 10 });
         if (e.hp <= 0) e.dead = true;
       }
+    }
+  }
+
+  // WEAPON CLASH: both fighters mid-ACTIVE swing with meeting steel →
+  // the exchange sparks out instead of trading damage. Explicitly NOT a
+  // parry: barely any hitstop, no opening — both are free to swing again.
+  if (
+    f.attackWindow > 0 &&
+    opponent.attackWindow > 0 &&
+    !f.hasHitThisSwing &&
+    !opponent.hasHitThisSwing &&
+    f.clashCd <= 0 &&
+    opponent.clashCd <= 0 &&
+    opponent.alive &&
+    f.spec.weapon.type === "melee" &&
+    opponent.spec.weapon.type === "melee"
+  ) {
+    const a = weaponSegment(f, ctx.time);
+    const b = weaponSegment(opponent, ctx.time);
+    // Arcs meet: either blade tip is close to the other blade's span, and
+    // the fighters actually face each other.
+    const facingOff =
+      Math.sign(opponent.root.position.x - f.root.position.x) === f.facing &&
+      Math.sign(f.root.position.x - opponent.root.position.x) === opponent.facing;
+    const segDist = (s: { from: Matter.Vector; to: Matter.Vector }, pnt: Matter.Vector) => {
+      const dx = s.to.x - s.from.x;
+      const dy = s.to.y - s.from.y;
+      const len2 = dx * dx + dy * dy || 1;
+      const t = Math.max(0, Math.min(1, ((pnt.x - s.from.x) * dx + (pnt.y - s.from.y) * dy) / len2));
+      return Math.hypot(pnt.x - (s.from.x + dx * t), pnt.y - (s.from.y + dy * t));
+    };
+    const meet = Math.min(segDist(a, b.to), segDist(b, a.to), segDist(a, b.from)) < 16;
+    if (facingOff && meet) {
+      // Neither swing lands this exchange.
+      f.hasHitThisSwing = true;
+      opponent.hasHitThisSwing = true;
+      f.clashCd = 0.35;
+      opponent.clashCd = 0.35;
+      const cx = (a.to.x + b.to.x) / 2;
+      const cy = (a.to.y + b.to.y) / 2;
+      // Parry-family spark, pitched higher + lighter (steel-on-steel ring).
+      playSfx("parry", { pitch: 1.5, volume: 0.7 });
+      pushEffect(ctx, { kind: "spark", x: cx, y: cy, ttl: 0.28, color: "#ffe95e", radius: 16 });
+      pushEffect(ctx, { kind: "flash", x: cx, y: cy, ttl: 0.16, color: "#ffffff", radius: 14 });
+      // Small mutual separation so blades don't grind — an impulse, not a launch.
+      const dir = Math.sign(f.root.position.x - opponent.root.position.x) || 1;
+      Matter.Body.setVelocity(f.root, { x: dir * 4.5, y: f.root.velocity.y });
+      Matter.Body.setVelocity(opponent.root, { x: -dir * 4.5, y: opponent.root.velocity.y });
+      // A few frames of hitstop at most — far below a parry's stun.
+      ctx.hitstop = Math.max(ctx.hitstop, 0.04);
     }
   }
 
@@ -634,7 +822,19 @@ function progressAttack(f: Fighter, opponent: Fighter, ctx: CombatCtx): void {
     if (hits.length > 0) {
       f.hasHitThisSwing = true;
       const { damage, crit } = rollCrit(f, weaponHitDamage(f));
-      dealDamage(opponent, damage, f.facing, ctx, { source: "melee", attacker: f });
+      dealDamage(opponent, damage, f.facing, ctx, {
+        source: "melee",
+        attacker: f,
+        hitY: (seg.from.y + seg.to.y) / 2,
+        finisher: f.comboFinisher,
+      });
+      if (f.comboFinisher) {
+        pushEffect(ctx, {
+          kind: "text", x: opponent.root.position.x, y: opponent.root.position.y - 88,
+          ttl: 0.9, color: "#ffd75e", text: "FINISHER!",
+        });
+        ctx.hitstop = Math.max(ctx.hitstop, 0.1);
+      }
       if (f.weaponRuntime) dispatchHandler(f.weaponRuntime, ctx, "onHitTarget");
       if (crit) {
         pushEffect(ctx, {
@@ -720,6 +920,13 @@ function updateGrounded(f: Fighter, ctx: CombatCtx): void {
 
 function tickTimers(f: Fighter, dt: number): void {
   f.attackCooldown = Math.max(0, f.attackCooldown - dt);
+  f.comboChainTimer = Math.max(0, f.comboChainTimer - dt);
+  f.comboCycleTimer = Math.max(0, f.comboCycleTimer - dt);
+  f.rootedTimer = Math.max(0, f.rootedTimer - dt);
+  f.markTimer = Math.max(0, f.markTimer - dt);
+  f.counterTimer = Math.max(0, f.counterTimer - dt);
+  f.chargeTimer = Math.max(0, f.chargeTimer - dt);
+  f.clashCd = Math.max(0, f.clashCd - dt);
   f.attackAnim = Math.max(0, f.attackAnim - dt);
   f.jumpCooldown = Math.max(0, f.jumpCooldown - dt);
   f.abilityCooldown = Math.max(0, f.abilityCooldown - dt);
@@ -863,7 +1070,9 @@ export function updateFighter(
     f.fxAcc = 0;
     const { x, y } = f.root.position;
     if (f.regenTimer > 0) risingMotes(ctx, x, y - 20 * f.scale, { count: 2, color: "#8fd18a", ttl: 0.6 });
-    if (f.buffTimer > 0) auraGlow(ctx, f, { ttl: 0.3 });
+    if (f.buffTimer > 0) {
+      risingMotes(ctx, x, y - 22 * f.scale, { count: 2, color: f.style.glow, ttl: 0.55 });
+    }
     if (f.gravityTimer > 0) {
       particleBurst(ctx, x, y - 20, {
         count: 2, color: f.style.glow, speed: 90, spread: 0.5,
@@ -884,7 +1093,14 @@ export function updateFighter(
         });
       }
     }
-    if (f.reflectTimer > 0) auraGlow(ctx, f, { color: "#ffd75e", ttl: 0.25, radius: 30 * f.scale });
+    if (f.reflectTimer > 0) {
+      // Mirror glint: a rotating crescent, not the generic halo ring.
+      slashArc(ctx, x, y - 22 * f.scale, {
+        radius: 30 * f.scale, angle: ctx.time * 4, spread: 0.9,
+        color: "#ffd75e", width: 3.5, ttl: 0.22,
+      });
+    }
+    maimedDrip(ctx, f); // slow bleed from maimed regions
   }
 
   tickEngineTransforms(f, ctx, dt);
@@ -929,11 +1145,12 @@ export function updateFighter(
   f.guardCooldown = Math.max(0, f.guardCooldown - dt);
   f.parryTimer = Math.max(0, f.parryTimer - dt);
   if (input.block && !f.blockHeld && !stunned && f.introTimer <= 0 && f.guardCooldown <= 0) {
-    f.parryTimer = f.parryWindow;
+    f.parryTimer = f.parryWindow * injuryParryMul(f);
   }
   if (f.blockHeld && !input.block && f.blocking) {
     f.guardCooldown = Math.max(f.guardCooldown, 0.35); // released the guard
   }
+  if (input.block && !f.blockHeld) resetCombo(f); // guarding drops the combo
   f.blockHeld = input.block;
   f.blocking =
     input.block &&
@@ -960,7 +1177,11 @@ export function updateFighter(
     // Guard stance: rooted to a slow shuffle, no attacks or casts.
     const speedScale = f.blocking ? 0.25 : 1;
     if (dir !== 0) {
-      Matter.Body.setVelocity(f.root, { x: dir * speedOf(f) * f.timeFactor * speedScale, y: v.y });
+      const rootMul = f.rootedTimer > 0 ? 0 : 1; // rooted: legs bound, arms free
+      Matter.Body.setVelocity(f.root, { x: dir * speedOf(f) * f.timeFactor * speedScale * rootMul, y: v.y });
+    } else if (f.chargeTimer > 0 && !f.chargeHit) {
+      // Charge rush: the committed sprint carries itself — no damping.
+      Matter.Body.setVelocity(f.root, { x: f.facing * f.chargeSpeed * f.timeFactor, y: v.y });
     } else if (f.grounded) {
       Matter.Body.setVelocity(f.root, { x: v.x * 0.8, y: v.y });
     }
@@ -1010,6 +1231,20 @@ export function updateFighter(
     }
   }
 
+  // CHARGE RUSH (behavior verb): while charging, first body contact lands
+  // the fused strike — movement and attack in one committed action.
+  if (f.chargeTimer > 0 && !f.chargeHit && opponent.alive && f.alive) {
+    const gap = Math.abs(opponent.root.position.x - f.root.position.x);
+    const vgap = Math.abs(opponent.root.position.y - f.root.position.y);
+    if (gap < 42 * f.displayScale && vgap < 70) {
+      f.chargeHit = true;
+      f.chargeTimer = 0;
+      dealDamage(opponent, f.chargeDamage, f.facing, ctx, { source: "melee", attacker: f, knockbackMul: 1.4 });
+      impactFlash(ctx, opponent.root.position.x, opponent.root.position.y - 22, { color: f.style.glow, radius: 26 });
+      ctx.hitstop = Math.max(ctx.hitstop, 0.06);
+    }
+  }
+
   progressAttack(f, opponent, ctx);
 
   // Pose the skeleton — the single source of truth for how this looks.
@@ -1028,6 +1263,9 @@ export function updateFighter(
     blocking: f.blocking,
     alive: f.alive,
     attackElapsed: f.attackAnim > 0 ? (timing.total - f.attackAnim) / ts : -1,
+    comboVariant: f.comboVariant,
+    aimX: opponent.root.position.x,
+    aimY: opponent.root.position.y - 20 * opponent.scale,
     weaponForm: f.style.weapon.form,
     weaponMount: f.spec.weapon.mount ?? "hand",
     weaponSize: f.style.weapon.size,
@@ -1041,6 +1279,11 @@ export function updateFighter(
   });
   f.skeleton = frame.skeleton;
   f.weaponAngle = frame.weaponAngle;
+  f.weaponSmear = frame.smear ?? null;
+  // Hurt-posture OVERLAY on top of whatever pose the animator produced
+  // (limp, arm favoring the ribs, low-HP hunch) — keyframes untouched.
+  applyInjuryPosture(f, ctx.time);
+  tickInjuries(f, dt);
 }
 
 export function updateProjectiles(
@@ -1053,10 +1296,17 @@ export function updateProjectiles(
 
   for (let i = ctx.projectiles.length - 1; i >= 0; i--) {
     const p = ctx.projectiles[i];
-    p.ttl -= dt;
+    // Timestop parity: a projectile runs on its OWNER's clock, exactly like
+    // the fighter freeze rule (root.timeScale = timeFactor). Matter halts
+    // the body's integration; pdt zeroes ttl/trail/steering so the shot
+    // hangs mid-air (spin included — it's ttl-driven) and resumes cleanly.
+    const owner = p.ownerSide === "player" ? fighters.player : fighters.bot;
+    if (p.body.timeScale !== owner.timeFactor) p.body.timeScale = owner.timeFactor;
+    const pdt = dt * owner.timeFactor;
+    p.ttl -= pdt;
 
     // Element-tinted trail: a small fading mote every few frames.
-    p.trailAcc = (p.trailAcc ?? 0) + dt;
+    p.trailAcc = (p.trailAcc ?? 0) + pdt;
     if (p.trailAcc >= 0.055) {
       p.trailAcc = 0;
       pushEffect(ctx, {
@@ -1082,7 +1332,7 @@ export function updateProjectiles(
     }
 
     const target = p.ownerSide === "player" ? fighters.bot : fighters.player;
-    p.rehit = Math.max(0, (p.rehit ?? 0) - dt);
+    p.rehit = Math.max(0, (p.rehit ?? 0) - pdt);
 
     // Boomerang: fly out, then arc back toward the thrower; despawn on
     // return. Can clip the target on both passes (rehit debounce).
@@ -1103,15 +1353,54 @@ export function updateProjectiles(
       }
     }
 
+    // PROJECTILE SWIPE: a mid-swing defender bats incoming shots out of
+    // the air — the ACTIVE weapon arc destroys any enemy projectile that
+    // enters it. Ownership is inherent (a shot never tests vs its owner);
+    // one swing can clear several; the swinger barely feels it.
+    if (target.attackWindow > 0 && target.alive && target.spec.weapon.type === "melee") {
+      // The swing arc sweeps the whole frontal sector during the active
+      // window, so the swipe zone is that sector: facing side, inside the
+      // blade's reach, around chest height.
+      const seg = weaponSegment(target, ctx.time);
+      const reach = Math.hypot(seg.to.x - seg.from.x, seg.to.y - seg.from.y) + p.radius;
+      const px = p.body.position.x;
+      const py = p.body.position.y;
+      const relX = px - target.root.position.x;
+      const inSector =
+        Math.sign(relX) === target.facing &&
+        Math.abs(relX) < reach + 8 &&
+        Math.abs(py - (target.root.position.y - 14 * target.scale)) < 44 * target.scale;
+      if (inSector) {
+        playSfx("parry", { pitch: 1.7, volume: 0.55 });
+        pushEffect(ctx, { kind: "spark", x: px, y: py, ttl: 0.25, color: "#ffe95e", radius: 12 });
+        pushEffect(ctx, { kind: "flash", x: px, y: py, ttl: 0.14, color: target.style.glow, radius: 10 });
+        ctx.hitstop = Math.max(ctx.hitstop, 0.02); // barely a blink
+        Matter.Composite.remove(arena.world, p.body);
+        ctx.projectiles.splice(i, 1);
+        continue;
+      }
+    }
+
     // Enemy entities body-block projectiles (clones/minions/turrets).
+    // Clones use their real fighter-sized hurtbox (feet at e.y, body above)
+    // — the old single low sphere let chest-height shots sail clean over
+    // them. Resolution matches melee-vs-clone: damage, pop at 0 hp.
     let blocked = false;
     for (const e of ctx.entities) {
-      if (e.side === p.ownerSide || e.dead) continue;
-      if (e.kind !== "clone" && e.kind !== "minion" && e.kind !== "turret") continue;
-      if (Math.hypot(e.x - p.body.position.x, e.y - 26 - p.body.position.y) < p.radius + 20) {
+      if (e.side === p.ownerSide || e.dead) continue; // never a friendly clone
+      if (e.kind !== "clone" && e.kind !== "minion" && e.kind !== "turret" && e.kind !== "totem") continue;
+      const px = p.body.position.x;
+      const py = p.body.position.y;
+      const hitEntity =
+        e.kind === "clone"
+          ? Math.abs(px - e.x) < 14 * (e.clone?.fighter.scale ?? 1) + p.radius &&
+            py < e.y + 4 &&
+            py > e.y - 92 * (e.clone?.fighter.scale ?? 1) - p.radius
+          : Math.hypot(e.x - px, e.y - 26 - py) < p.radius + 20;
+      if (hitEntity) {
         e.hp -= p.damage;
         if (e.hp <= 0) e.dead = true;
-        pushEffect(ctx, { kind: "spark", x: e.x, y: e.y - 24, ttl: 0.25, color: e.glow, radius: 12 });
+        pushEffect(ctx, { kind: "spark", x: px, y: py, ttl: 0.25, color: e.glow, radius: 12 });
         blocked = true;
         break;
       }
@@ -1135,7 +1424,7 @@ export function updateProjectiles(
       let diff = wanted - current;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
-      const turn = Math.max(-0.05, Math.min(0.05, diff));
+      const turn = Math.max(-0.05, Math.min(0.05, diff)) * owner.timeFactor;
       Matter.Body.setVelocity(p.body, {
         x: Math.cos(current + turn) * speed,
         y: Math.sin(current + turn) * speed,
@@ -1173,7 +1462,7 @@ export function updateProjectiles(
       playSfx("block", { pitch: 1.5, volume: 0.8 });
       playSfx("parry", { pitch: 0.9, volume: 0.6 });
       shockwaveRing(ctx, tx + target.facing * 20, ty - 22, { color: "#ffe95e", radius: 14, expand: 150, thickness: 3.5, ttl: 0.3 });
-      impactSparks(ctx, p.body.position.x, p.body.position.y, { color: "#ffe95e", count: 6 });
+      impactFlash(ctx, p.body.position.x, p.body.position.y, { color: "#ffe95e", radius: 16 });
       pushEffect(ctx, { kind: "text", x: tx, y: ty - 84, ttl: 0.8, color: "#ffe95e", text: "REFLECTED!" });
       continue;
     }
@@ -1198,6 +1487,7 @@ export function updateProjectiles(
       dealDamage(target, damage, Math.sign(p.body.velocity.x) || 1, ctx, {
         source: p.source,
         attacker: weaponShot ? attacker : undefined,
+        hitY: p.body.position.y,
       });
       if (crit) {
         pushEffect(ctx, {
@@ -1209,9 +1499,14 @@ export function updateProjectiles(
           text: "CRIT!",
         });
       }
-      impactSparks(ctx, p.body.position.x, p.body.position.y, { color: p.glow, count: 6 });
-      shockwaveRing(ctx, p.body.position.x, p.body.position.y, {
-        color: p.glow, radius: 6, expand: p.radius * 26, thickness: 2.5, ttl: 0.22,
+      // IMPACT, not a firework: a spike flash + a small shockwave silhouette
+      // anchoring it, plus just a few short sparks. No streak spray.
+      impactFlash(ctx, p.body.position.x, p.body.position.y, { color: p.glow, radius: 7 + p.radius * 2.2 });
+      shockwave(ctx, p.body.position.x, p.body.position.y, {
+        radius: 4, expand: p.radius * 20, color: p.glow, thickness: 2, ttl: 0.16,
+      });
+      particleBurst(ctx, p.body.position.x, p.body.position.y, {
+        count: 3, color: p.glow, speed: 110, gravity: 190, size: 2.2, shape: "spark", ttl: 0.18,
       });
       // Behavior-engine hook: this projectile came from a program.
       try {
@@ -1219,9 +1514,46 @@ export function updateProjectiles(
       } catch (err) {
         console.warn("[vibearena] projectile onHit behavior failed:", err);
       }
-      // Boomerangs pierce: damage, keep flying, debounce re-hits.
-      if (p.boomerang) {
+      // SPLIT: the shot shatters into a fan of 3 smaller, weaker shards.
+      if (p.splitOnHit) {
+        p.splitOnHit = false;
+        const owner = p.ownerSide === "player" ? fighters.player : fighters.bot;
+        for (const off of [-0.45, 0, 0.45]) {
+          spawnProjectile(owner, ctx, {
+            damage: Math.max(2, Math.round(p.damage * 0.4)),
+            speed: 11,
+            radius: Math.max(2, p.radius * 0.6),
+            arc: false,
+            source: p.source,
+            angle: off,
+            element: p.element,
+            glow: p.glow,
+            visual: "bolt",
+            origin: { x: p.body.position.x, y: p.body.position.y },
+          });
+        }
+      }
+      // Boomerangs + PIERCE shots keep flying; debounce re-hits.
+      if (p.boomerang || p.pierce) {
         p.rehit = 0.45;
+        continue;
+      }
+    }
+
+    // BOUNCE: ricochet off the ground (and arena edges) while charges last.
+    if ((p.bounces ?? 0) > 0 && !p.arc) {
+      const v = p.body.velocity;
+      const px = p.body.position.x;
+      if (hitGround && v.y > 0) {
+        p.bounces = (p.bounces ?? 0) - 1;
+        Matter.Body.setVelocity(p.body, { x: v.x, y: -Math.abs(v.y) * 0.9 });
+        Matter.Body.setPosition(p.body, { x: px, y: arena.groundY - p.radius - 2 });
+        impactFlash(ctx, px, arena.groundY - 6, { color: p.glow, radius: 10, ttl: 0.14 });
+        continue;
+      }
+      if ((px < 20 && v.x < 0) || (px > ARENA_WIDTH - 20 && v.x > 0)) {
+        p.bounces = (p.bounces ?? 0) - 1;
+        Matter.Body.setVelocity(p.body, { x: -v.x, y: v.y });
         continue;
       }
     }

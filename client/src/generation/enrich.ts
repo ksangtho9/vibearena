@@ -402,6 +402,9 @@ const DEFAULT_MOTIF: Record<AbilitySpec["kind"], AbilityMotif> = {
 const isAttackKind = (k: AbilitySpec["kind"]) =>
   (ATTACK_ABILITY_KINDS as readonly string[]).includes(k);
 
+/** A composed behavior/script IS a real attack, whatever its kind tag. */
+const hasAction = (a?: AbilitySpec) => Boolean(a && (a.behavior || a.customScript));
+
 const ELEMENT_TITLES: Record<Exclude<ElementKind, "none">, string> = {
   fire: "Flame", ice: "Frost", lightning: "Storm", poison: "Venom",
   shadow: "Shadow", holy: "Radiant", arcane: "Arcane",
@@ -432,9 +435,58 @@ function deriveUtilityAbility(spec: CharacterSpec): AbilitySpec {
     speed: { name: "Quickstep", kind: "dash" as const },
     defense: { name: "Brace", kind: "shield" as const },
     hp: { name: "Second Wind", kind: "heal" as const },
-    strength: { name: "War Cry", kind: "buff" as const },
+    strength: { name: "War Cry", kind: "buff" as const }, // armed by ensureActionAbility
   }[top];
   return { ...pick, cooldown: 7, power: 13 };
+}
+
+/**
+ * NO PURE STAT BOOSTS: a bare `buff` (stat mul, nothing happens on screen)
+ * may not be an ability's primary effect. Any buff arriving WITHOUT an
+ * authored behavior/script gets a deterministic ACTION attached — themed by
+ * its stat — with the stat change demoted to a brief side-rider. Buffs that
+ * carry their own behavior already have a real action and pass untouched.
+ */
+function ensureActionAbility(a: AbilitySpec): AbilitySpec {
+  if (a.kind !== "buff" || a.behavior || a.customScript) return a;
+  const stat = a.params?.stat ?? "strength";
+  const dur = Math.min(6, Math.max(2, a.params?.duration ?? 3));
+  const behavior =
+    stat === "speed"
+      ? {
+          // Blitz THROUGH the foe; the speed boost rides along briefly.
+          handlers: {
+            onCast: [
+              { do: "dash", speed: 26, iframes: 0.2 },
+              { do: "setTimeScale", target: "self", scale: 1.3, duration: dur },
+              { do: "drawBurst", radius: 26 },
+              { do: "spawnText", text: "SURGE" },
+            ],
+          },
+        }
+      : stat === "defense"
+        ? {
+            // Ground-shove that clears space; a short ward rides along.
+            handlers: {
+              onCast: [
+                { do: "pushRadial", radius: 110, force: 16 },
+                { do: "shield", duration: dur * 0.8, coverage: 0.45 },
+                { do: "drawShockwave", radius: 16, expand: 240 },
+              ],
+            },
+          }
+        : {
+            // Strength: a war-stomp that weakens the foe (relative might).
+            handlers: {
+              onCast: [
+                { do: "dealAoe", damage: 12, radius: 95, knockback: 1.4 },
+                { do: "applyStatus", type: "weaken", duration: dur, factor: 0.8 },
+                { do: "drawShockwave", radius: 14, expand: 220 },
+                { do: "screenShake", intensity: 6, duration: 0.25 },
+              ],
+            },
+          };
+  return { ...a, behavior: behavior as never };
 }
 
 /**
@@ -445,25 +497,30 @@ function resolveAbilitySlots(spec: CharacterSpec): { attack: AbilitySpec; utilit
   let attack: AbilitySpec;
   let utility: AbilitySpec;
 
-  if (isAttackKind(spec.ability.kind)) {
+  // POSITIONAL classification: the primary slot IS the attack. A composed
+  // behavior/customScript qualifies it regardless of its kind tag (a summon
+  // attack tagged "buff" stays the attack); kind-based sorting only applies
+  // to BARE legacy specs, where kind is all we have to go on.
+  if (hasAction(spec.ability) || isAttackKind(spec.ability.kind)) {
     attack = spec.ability;
-    // A second attack in the utility slot is dropped, not stacked.
+    // A BARE attack-kind in the utility slot is dropped, not stacked;
+    // a composed one is a legitimate second action and stays.
     utility =
-      spec.utility && !isAttackKind(spec.utility.kind)
+      spec.utility && !(isAttackKind(spec.utility.kind) && !hasAction(spec.utility))
         ? spec.utility
         : deriveUtilityAbility(spec);
   } else {
-    // The primary slot held a utility kind (old single-ability specs).
+    // The primary slot held a bare utility kind (old single-ability specs).
     utility = spec.ability;
     attack =
-      spec.utility && isAttackKind(spec.utility.kind)
+      spec.utility && (hasAction(spec.utility) || isAttackKind(spec.utility.kind))
         ? spec.utility
         : deriveAttackAbility(spec);
   }
 
   return {
-    attack: { ...attack, cooldown: Math.max(4, attack.cooldown) },
-    utility: { ...utility, cooldown: Math.max(5, utility.cooldown) },
+    attack: { ...ensureActionAbility(attack), cooldown: Math.max(4, attack.cooldown) },
+    utility: { ...ensureActionAbility(utility), cooldown: Math.max(5, utility.cooldown) },
   };
 }
 

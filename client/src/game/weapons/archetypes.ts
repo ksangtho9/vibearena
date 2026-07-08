@@ -716,13 +716,23 @@ function composeBladed(
     profile: "straight" as const, length: 0.6, width: 0.35, edges: 2 as const,
     count: 1 as const, fuller: false, tip: "point" as const,
   };
-  const bladeLen = Math.max(10, (T - bladeStart) * (0.7 + 0.35 * blade.length));
+  // GRIP FIX: the origin is the FIST. Previously the guard sat at +1.5 —
+  // inside the fist — so the hand read as gripping the crossguard. Shift the
+  // whole drawing forward so the fist wraps the MIDDLE of the handle:
+  // handle + pommel visibly behind the hand, guard + blade clearly ahead.
+  // The drawn blade is shortened by the same shift so the visual tip stays
+  // on the mechanical TIP/reach used by combat (hitbox untouched).
+  const hiltShift = gripLen * 0.5;
+  const bladeLen = Math.max(10, (T - bladeStart - hiltShift) * (0.7 + 0.35 * blade.length));
 
+  ctx.save();
+  ctx.translate(hiltShift, 0);
   drawPommel(ctx, s, p, parts.pommel, -gripLen - 1.5);
   drawHaft(ctx, s, p, -gripLen, 0, 3, parts.haft.wrapped);
   drawBlades(ctx, s, p, blade, bladeStart, bladeLen);
   drawGuard(ctx, s, p, parts.guard, 1.5, gripLen);
   drawAdornments(ctx, s, p, { pommelX: -gripLen - 1.5, guardX: 2.5, bladeBaseX: bladeStart + 2, reach: bladeLen }, time);
+  ctx.restore();
 }
 
 /** Hafted: long handle with a head (axe/hammer) or chained ball (flail). */

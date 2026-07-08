@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { AllModelsBusyError, generateWithGroq } from "./providers/groq";
+import { AllModelsBusyError, generateWithGroq, suggestWithGroq } from "./providers/groq";
 import { generateWithOpenRouter } from "./providers/openrouter";
 // Single source of truth for the system prompt, shared with the client build.
 import { SYSTEM_PROMPT } from "../client/src/generation/prompt";
@@ -28,6 +28,77 @@ const limiter = rateLimit({
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true, provider: activeProvider().name });
+});
+
+/** Local suggestion pool — served when no key / rotation exhausted, so the
+ * prompt screen always has chips. Mirrors the client's own fallback. */
+const SUGGEST_FALLBACK: [string, string, string][] = [
+  [
+    "a mailman whose letters explode on delivery",
+    "a sushi chef who flash-freezes the floor and flings knife fans",
+    "a karaoke banshee whose high note flips gravity, spawns two backup-singer clones, and lasers the crowd on the chorus",
+  ],
+  [
+    "a crossing guard whose stop sign hits like a truck",
+    "a beekeeper who lobs hive grenades and hides behind a living swarm",
+    "an origami warlord who folds paper clones, rains razor cranes from above, and grows into a giant crane when cornered",
+  ],
+  [
+    "a barista who steams foes with a portafilter flamethrower",
+    "a gravedigger who trips you into open graves and heals under moonlight",
+    "a weather anchor who slows time for the forecast, drops localized blizzards, and rides a tornado that hurls boomerang lightning",
+  ],
+];
+
+const suggestLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "suggestion limit reached" },
+});
+
+app.post("/api/suggest", suggestLimiter, async (req, res) => {
+  const avoidRaw = Array.isArray(req.body?.avoid) ? (req.body.avoid as unknown[]) : [];
+  const avoid = avoidRaw
+    .filter((s): s is string => typeof s === "string")
+    .map((s) => s.slice(0, 220))
+    .slice(-40);
+
+  const fallback = () => {
+    const trio = SUGGEST_FALLBACK[Math.floor(Math.random() * SUGGEST_FALLBACK.length)];
+    res.json({ suggestions: { simple: trio[0], medium: trio[1], wild: trio[2] }, source: "fallback" });
+  };
+
+  if (activeProvider().name !== "groq") {
+    fallback();
+    return;
+  }
+  try {
+    const content = await suggestWithGroq(avoid);
+    const start = content.indexOf("{");
+    const end = content.lastIndexOf("}");
+    const parsed = JSON.parse(content.slice(start, end + 1)) as Record<string, unknown>;
+    const clean = (v: unknown) => {
+      if (typeof v !== "string" || v.trim().length < 8) return null;
+      let s = v.trim();
+      if (s.length > 220) {
+        s = s.slice(0, 220);
+        const cut = s.lastIndexOf(" ");
+        if (cut > 80) s = s.slice(0, cut); // never end mid-word
+      }
+      return s;
+    };
+    const simple = clean(parsed.simple);
+    const medium = clean(parsed.medium);
+    const wild = clean(parsed.wild);
+    if (!simple || !medium || !wild) throw new Error("suggestion trio failed validation");
+    res.json({ suggestions: { simple, medium, wild }, source: "llm" });
+  } catch (err) {
+    // Suggestions are decoration — never surface an error to the screen.
+    console.error("[vibearena] suggest failed:", String(err).slice(0, 200));
+    fallback();
+  }
 });
 
 app.post("/api/generate", limiter, async (req, res) => {

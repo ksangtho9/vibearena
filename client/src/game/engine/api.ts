@@ -8,17 +8,23 @@ import type { CombatCtx } from "../combat";
 import { dealDamage, pushEffect, rawDamage, spawnProjectile } from "../combat";
 import { attackTimingOf } from "../animation";
 import { blinkJuice, dashJuice, leapJuice } from "../movementFx";
+import { injuryDashMul } from "../injury";
 import {
   aoeDetonation,
   beamCore,
   chargeUp,
   fieldTint,
   groundDecal,
+  impactFlash,
   impactSparks,
+  lightningArc,
   materialize,
   particleBurst,
   shake,
+  shardBurst,
+  shockwave,
   shockwaveRing,
+  slashArc,
   vortex,
 } from "../effectsJuice";
 import { playSfx, SFX_KINDS, type SfxKind } from "../../audio/sfx";
@@ -49,8 +55,9 @@ const MAX_ENTITY_TTL = 15;
 
 export type EntityKind =
   | "clone" | "minion" | "trap" | "turret" | "wall" | "orbital"
-  | "hazard" | "beam";
-const ENTITY_KINDS: EntityKind[] = ["clone", "minion", "trap", "turret", "wall", "orbital"];
+  | "hazard" | "beam"
+  | "totem";
+const ENTITY_KINDS: EntityKind[] = ["clone", "minion", "trap", "turret", "wall", "orbital", "totem"];
 
 export type HazardKind = "fire" | "ice" | "spikes" | "void";
 
@@ -150,7 +157,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
     /** dash {speed?, up?, iframes?} — snappy horizontal burst along facing.
      * Dodges by default (brief i-frames) and pokes what it passes through. */
     dash(a) {
-      setVel(caster, caster.facing * N(a.speed, 21, -34, 34), -N(a.up, 2, -10, 20));
+      setVel(caster, caster.facing * N(a.speed, 21, -34, 34) * injuryDashMul(caster), -N(a.up, 2, -10, 20));
       caster.invulnTimer = Math.max(caster.invulnTimer, N(a.iframes, 0.15, 0, 0.5));
       dashJuice(caster, ctx, rt.glow);
     },
@@ -213,6 +220,9 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
           element: element(a.element),
           visual: "bolt",
           glow: rt.glow,
+          pierce: Boolean(a.pierce),
+          bounces: a.bounce ? Math.round(N(a.bounce, 2, 1, 4)) : undefined,
+          splitOnHit: Boolean(a.split),
           origin: fromAbove
             ? { x: fx + (Math.random() - 0.5) * 140, y: 30 + Math.random() * 30, straightDown: true }
             : undefined,
@@ -308,6 +318,7 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
     shield(a) {
       caster.shieldTimer = Math.max(caster.shieldTimer, N(a.duration, 2, 0.2, 8));
       caster.shieldCoverage = N(a.coverage, 0.6, 0, 0.95);
+      caster.shieldStyle = { color: colorOf(a.color, rt.glow), element: rt.element, theme: null };
     },
     /** applyStatus {type: "burn"|"stun"|"slow"|"weaken", ...} on the opponent. */
     applyStatus(a) {
@@ -329,6 +340,25 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
           f.buffs.strengthMul = N(a.factor, 0.7, 0.2, 1);
           f.buffTimer = Math.max(f.buffTimer, N(a.duration, 2.5, 0.2, 8));
           break;
+        case "poison":
+          // STACKING DoT: each application ADDS ticking damage (capped),
+          // unlike burn which just refreshes. Rewards repeat-application kits.
+          f.dotPerSec = Math.min(30, f.dotPerSec + N(a.dps, 3, 1, 12));
+          f.dotTimer = Math.max(f.dotTimer, N(a.duration, 3, 0.2, 8));
+          f.dotColor = "#8fd18a";
+          pushEffect(ctx, { kind: "text", x: f.root.position.x, y: f.root.position.y - 84, ttl: 0.5, color: "#8fd18a", text: "POISON+" });
+          break;
+        case "root":
+          // Hard stop (vines/ice around the legs): no movement, arms free.
+          f.rootedTimer = Math.max(f.rootedTimer, N(a.duration, 1.2, 0.2, 2.5));
+          particleBurst(ctx, f.root.position.x, ctx.arena.groundY - 4, { count: 7, color: "#5a8f4a", speed: 60, gravity: -30, ttl: 0.5 });
+          break;
+        case "mark":
+          // Curse: the NEXT hit they take is amplified.
+          f.markTimer = Math.max(f.markTimer, N(a.duration, 4, 0.5, 8));
+          f.markMul = N(a.factor, 1.5, 1.1, 2.2);
+          pushEffect(ctx, { kind: "flash", x: f.root.position.x, y: f.root.position.y - 60, ttl: 0.3, color: "#c77dff", radius: 14 });
+          break;
         default:
           break;
       }
@@ -343,6 +373,51 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
       const dir = Math.sign(pos().x - f.root.position.x) || -caster.facing;
       setVel(f, dir * N(a.strength, 12, 0, 36), -N(a.up, 3, 0, 16));
       vortex(ctx, f.root.position.x, f.root.position.y - 20, { color: rt.glow, dir: 1 });
+    },
+    /** grapple {mode?: "pull"|"self", damage?} — chain-hook the foe: yank
+     * THEM to you (default) or zip yourself to them. */
+    grapple(a) {
+      const f = foe();
+      const me = pos();
+      const fp = f.root.position;
+      // Chain visual: a taut line + hook flash at the far end.
+      pushEffect(ctx, { kind: "shape", shape: "line", x: me.x, y: me.y - 24, x2: fp.x, y2: fp.y - 20, color: rt.glow, width: 3, ttl: 0.22 });
+      impactFlash(ctx, fp.x, fp.y - 20, { color: rt.glow, radius: 14, ttl: 0.18 });
+      playSfx("swing", { pitch: 0.7, volume: 0.7 });
+      const dmg = N(a.damage, 0, 0, MAX_DAMAGE_PER_ACTION);
+      if (a.mode === "self") {
+        // Zip TO them, stopping just short.
+        const dir = Math.sign(fp.x - me.x) || caster.facing;
+        Matter.Body.setVelocity(caster.root, { x: dir * 26, y: -3 });
+      } else {
+        // Yank THEM in, popping them slightly airborne. Damage FIRST with
+        // the knockback aimed toward the caster, so the hit reinforces the
+        // yank instead of cancelling it.
+        const dir = Math.sign(me.x - fp.x) || (-f.facing as number);
+        if (dmg > 0) dealDamage(f, dmg, dir, ctx, { source: "ability", attacker: caster });
+        Matter.Body.setVelocity(f.root, { x: dir * Math.min(24, Math.abs(fp.x - me.x) / 8 + 12), y: -5 });
+      }
+      if (dmg > 0 && a.mode === "self") dealDamage(f, dmg, caster.facing, ctx, { source: "ability", attacker: caster });
+    },
+    /** counter {duration?} — a brief stance that negates + ripostes the
+     * next MELEE hit (reflect covers projectiles; this covers fists). */
+    counter(a) {
+      caster.counterTimer = Math.max(caster.counterTimer, N(a.duration, 1, 0.2, 2.5));
+      slashArc(ctx, pos().x + caster.facing * 14, pos().y - 22, {
+        radius: 26, angle: caster.facing > 0 ? -0.5 : Math.PI + 0.5, spread: 1.3,
+        color: rt.glow, width: 5, ttl: 0.3,
+      });
+      playSfx("parry", { pitch: 0.85, volume: 0.5 });
+    },
+    /** charge {speed?, damage?} — a committed rush that delivers its strike
+     * on body contact (movement + attack fused). */
+    charge(a) {
+      caster.chargeTimer = 0.6;
+      caster.chargeHit = false;
+      caster.chargeDamage = N(a.damage, 14, 1, MAX_DAMAGE_PER_ACTION);
+      caster.chargeSpeed = N(a.speed, 22, 8, 32);
+      Matter.Body.setVelocity(caster.root, { x: caster.facing * caster.chargeSpeed, y: -1 });
+      dashJuice(caster, ctx, rt.glow);
     },
     /** lifesteal {damage?, percent?} — drain: hurt the foe, drink a share. */
     lifesteal(a) {
@@ -594,6 +669,62 @@ export function createEngineApi(rt: BehaviorRuntime, ctx: CombatCtx): EngineApi 
         element: element(a.element),
       });
     },
+    /** drawShockwave {x?, y?, radius?, expand?, color?, thickness?, ttl?} —
+     * expanding wobbled ring (a real impact wave, not a clean circle). */
+    drawShockwave(a) {
+      shockwave(ctx, N(a.x, pos().x, 0, ARENA_WIDTH), N(a.y, pos().y, 0, ARENA_HEIGHT), {
+        radius: N(a.radius, 14, 2, 200),
+        expand: N(a.expand, 240, -200, 600),
+        color: colorOf(a.color, rt.glow),
+        thickness: N(a.thickness, 5, 1, 12),
+        ttl: dur(a.ttl, 0.4, 1.5),
+      });
+    },
+    /** drawLightning {x?, y?, x2?, y2?, color?, width?, ttl?} — jagged
+     * branching bolt between two points. */
+    drawLightning(a) {
+      lightningArc(
+        ctx,
+        { x: N(a.x, pos().x, 0, ARENA_WIDTH), y: N(a.y, pos().y - 20, 0, ARENA_HEIGHT) },
+        {
+          x: N(a.x2, foe().root.position.x, 0, ARENA_WIDTH),
+          y: N(a.y2, foe().root.position.y - 20, 0, ARENA_HEIGHT),
+        },
+        { color: colorOf(a.color, rt.glow), width: N(a.width, 2.5, 1, 6), ttl: dur(a.ttl, 0.22, 1) },
+      );
+    },
+    /** drawSlash {x?, y?, angle?, radius?, spread?, color?, width?, ttl?} —
+     * oriented crescent swipe (melee flourish / wind blade). */
+    drawSlash(a) {
+      slashArc(ctx, N(a.x, pos().x, 0, ARENA_WIDTH), N(a.y, pos().y - 20, 0, ARENA_HEIGHT), {
+        angle: N(a.angle, caster.facing > 0 ? 0 : Math.PI, -Math.PI * 2, Math.PI * 2),
+        radius: N(a.radius, 42, 10, 160),
+        spread: N(a.spread, 1.4, 0.3, 4),
+        color: colorOf(a.color, rt.glow),
+        width: N(a.width, 10, 2, 22),
+        ttl: dur(a.ttl, 0.22, 1),
+      });
+    },
+    /** spawnShards {x?, y?, count?, color?, speed?} — angular spinning
+     * debris with gravity (ice/earth/shatter). */
+    spawnShards(a) {
+      shardBurst(ctx, N(a.x, pos().x, 0, ARENA_WIDTH), N(a.y, pos().y - 16, 0, ARENA_HEIGHT), {
+        count: N(a.count, 8, 1, 16),
+        color: colorOf(a.color, rt.glow),
+        speed: N(a.speed, 150, 20, 400),
+      });
+    },
+    /** drawBurst {x?, y?, radius?, color?} — radial spike-line impact pop. */
+    drawBurst(a) {
+      impactFlash(ctx, N(a.x, pos().x, 0, ARENA_WIDTH), N(a.y, pos().y - 20, 0, ARENA_HEIGHT), {
+        color: colorOf(a.color, rt.glow),
+        radius: N(a.radius, 18, 4, 90),
+      });
+      impactSparks(ctx, N(a.x, pos().x, 0, ARENA_WIDTH), N(a.y, pos().y - 20, 0, ARENA_HEIGHT), {
+        color: colorOf(a.color, rt.glow),
+        count: 5,
+      });
+    },
     /** spawnText {text, x?, y?, color?} — floating words ("BONK!"). */
     spawnText(a) {
       pushEffect(ctx, {
@@ -759,6 +890,7 @@ function spawnEntityImpl(
   let y = p.y;
   if (kind === "trap") x = p.x + caster.facing * (70 + index * 40);
   if (kind === "wall") x = p.x + caster.facing * 90;
+  if (kind === "totem") x = p.x - caster.facing * (26 + index * 24); // planted behind
   if (a.x !== undefined) x = N(a.x, x, 30, ARENA_WIDTH - 30);
   if (a.y !== undefined) y = N(a.y, y, 40, groundY);
   if (a.atOpponent) x = f.root.position.x + (Math.random() - 0.5) * 40;
@@ -766,7 +898,7 @@ function spawnEntityImpl(
   const entity: EngineEntity = {
     ...baseEntity(rt, ctx, kind),
     x: clamp(x, 30, ARENA_WIDTH - 30),
-    y: kind === "trap" || kind === "wall" ? groundY : Math.min(y, groundY),
+    y: kind === "trap" || kind === "wall" || kind === "totem" ? groundY : Math.min(y, groundY),
     hp: N(a.hp, 30, 1, 500),
     ttl: N(a.ttl, kind === "clone" ? 5 : 8, 0.5, MAX_ENTITY_TTL),
     radius: kind === "minion" ? 10 : kind === "orbital" ? 7 : 14,
@@ -922,6 +1054,7 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
         });
         ghost.skeleton = frame.skeleton;
         ghost.weaponAngle = frame.weaponAngle;
+        ghost.weaponSmear = frame.smear ?? null;
         // Mounted clone weapons strike in sync too (drawWeapon reads these).
         ghost.attackAnim = c.attackAnim;
         ghost.attackTotal = c.attackTotal;
@@ -1080,6 +1213,23 @@ export function tickEntities(ctx: CombatCtx, dt: number): void {
       }
       case "wall":
         break; // static; Matter does the blocking
+      case "totem": {
+        // HEALING TOTEM: pulses health to its caster while it stands —
+        // killable (foe attacks pop it), capped by ttl + heal-per-pulse.
+        const owner = e.rt.caster;
+        if (e.fireTimer <= 0 && owner.alive && owner.hp < owner.maxHp) {
+          e.fireTimer = 0.8;
+          owner.hp = Math.min(owner.maxHp, owner.hp + 3);
+          // A mote drifts from the totem to the owner.
+          pushEffect(ctx, {
+            kind: "particle", x: e.x, y: e.y - 26,
+            vx: (owner.root.position.x - e.x) * 0.9, vy: (owner.root.position.y - 20 - e.y) * 0.9,
+            gravity: 0, size: 2.6, particleShape: "star", color: e.glow, ttl: 1,
+          });
+          pushEffect(ctx, { kind: "ring", x: e.x, y: e.y - 20, ttl: 0.5, color: e.glow, radius: 8, expand: 30, width: 1.6 });
+        }
+        break;
+      }
     }
 
     if (e.ttl <= 0 || !e.rt.caster.alive) {
@@ -1220,6 +1370,36 @@ export function renderEntities(g: CanvasRenderingContext2D, ctx: CombatCtx, time
         g.beginPath();
         g.arc(e.x, e.y, e.radius, 0, Math.PI * 2);
         g.fill();
+        break;
+      }
+      case "totem": {
+        // A carved post with a glowing eye + breathing crown ring.
+        g.fillStyle = mix(e.color, "#3a2c1c", 0.5);
+        g.strokeStyle = withAlpha("#1e1710", 0.8);
+        g.lineWidth = 1.4;
+        g.beginPath();
+        g.roundRect(e.x - 6, e.y - 40, 12, 40, 3);
+        g.fill();
+        g.stroke();
+        // Carved notches.
+        g.beginPath();
+        g.moveTo(e.x - 6, e.y - 14);
+        g.lineTo(e.x + 6, e.y - 14);
+        g.moveTo(e.x - 6, e.y - 27);
+        g.lineTo(e.x + 6, e.y - 27);
+        g.stroke();
+        // Glowing eye + soft crown.
+        g.shadowColor = e.glow;
+        g.shadowBlur = 10;
+        g.fillStyle = e.glow;
+        g.beginPath();
+        g.arc(e.x, e.y - 33, 3 + Math.sin(time * 5) * 0.6, 0, Math.PI * 2);
+        g.fill();
+        g.globalAlpha = 0.35;
+        g.strokeStyle = e.glow;
+        g.beginPath();
+        g.arc(e.x, e.y - 40, 8 + Math.sin(time * 3) * 1.5, Math.PI, Math.PI * 2);
+        g.stroke();
         break;
       }
     }

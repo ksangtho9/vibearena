@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useVibeStore } from "../store";
 
 /**
- * Curated example fighters in THREE escalating tiers. One chip is drawn from
- * each tier per mount (simplest first), so the suggestions read as a power
- * curve — intentionally NOT LLM-generated (no API cost just for loading the
- * page).
+ * Example fighters in THREE escalating tiers. A fresh trio is LLM-generated
+ * every time this screen shows (cheap model, high temperature, told to avoid
+ * everything already shown this session); the curated pools below are the
+ * instant first paint and the always-works fallback when the fetch fails.
  */
 const MEDIUM = [
   "a grumpy lumberjack with an axe that bursts into flames",
@@ -55,6 +55,40 @@ function pickExamples(): TieredExample[] {
   return TIERS.map((t) => ({ text: pickFrom(t.pool), pips: t.pips, label: t.label }));
 }
 
+/** Everything shown this session (module state) — sent to the LLM as
+ * "do not repeat", so Player 2 never sees Player 1's trio again. */
+const shownThisSession: string[] = [];
+
+function remember(texts: string[]): void {
+  for (const t of texts) if (!shownThisSession.includes(t)) shownThisSession.push(t);
+  while (shownThisSession.length > 40) shownThisSession.shift();
+}
+
+/** Fetch a fresh LLM trio; null on any failure (caller keeps the fallback). */
+async function fetchFreshExamples(signal: AbortSignal): Promise<TieredExample[] | null> {
+  try {
+    const res = await fetch("/api/suggest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ avoid: shownThisSession }),
+      signal,
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as {
+      suggestions?: { simple?: string; medium?: string; wild?: string } | null;
+    };
+    const s = body.suggestions;
+    if (!s?.simple || !s.medium || !s.wild) return null;
+    return [
+      { text: s.simple, pips: "◆", label: "warm-up" },
+      { text: s.medium, pips: "◆◆", label: "spicy" },
+      { text: s.wild, pips: "◆◆◆", label: "chaos" },
+    ];
+  } catch {
+    return null; // offline/aborted — the fallback trio stays on screen
+  }
+}
+
 /**
  * The fight poster. Type a fighter, get chalked onto the board.
  */
@@ -66,8 +100,20 @@ export function PromptScreen() {
   const toModeSelect = useVibeStore((s) => s.toModeSelect);
   const storedPrompt = useVibeStore((s) => s.prompt);
   const [text, setText] = useState(storedPrompt);
-  // Fresh random trio per mount (page load / each player's turn in 2P).
-  const [examples] = useState(pickExamples);
+  // Instant fallback trio, silently upgraded to a fresh LLM trio. Re-runs
+  // per player turn (promptFor) so P2 gets a different set than P1.
+  const [examples, setExamples] = useState(pickExamples);
+  useEffect(() => {
+    const ctrl = new AbortController();
+    void fetchFreshExamples(ctrl.signal).then((fresh) => {
+      if (fresh) {
+        setExamples(fresh);
+        remember(fresh.map((f) => f.text));
+      }
+    });
+    return () => ctrl.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [promptFor]);
   const generating = phase === "generating";
   const canSubmit = text.trim().length > 2 && !generating;
   const hotseat = mode === "2p";

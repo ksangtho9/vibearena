@@ -258,17 +258,26 @@ export function drawMotifEffect(
     }
     case "burst":
     default: {
-      // Quick radial spokes.
-      const n = 8;
-      ctx.lineWidth = 2.5;
+      // Jittered star-spikes + drifting motes — the fallback look should
+      // still have shape + motion, not read as another ring.
+      const n = 7;
       for (let i = 0; i < n; i++) {
-        const a = (i / n) * Math.PI * 2 + 0.3;
-        const inner = R * 0.15 + grow * R * 0.4;
-        const outer = inner + R * 0.28 * life + 4;
+        const j = Math.sin(i * 37.7) * 0.5; // fixed per-spike jitter
+        const a = (i / n) * Math.PI * 2 + 0.3 + j * 0.25;
+        const inner = R * (0.12 + Math.abs(j) * 0.1) + grow * R * 0.4;
+        const outer = inner + R * (0.2 + Math.abs(j) * 0.25) * life + 4;
+        ctx.lineWidth = 1.6 + Math.abs(j) * 2.2;
         ctx.beginPath();
         ctx.moveTo(e.x + Math.cos(a) * inner, e.y + Math.sin(a) * inner);
         ctx.lineTo(e.x + Math.cos(a) * outer, e.y + Math.sin(a) * outer);
         ctx.stroke();
+      }
+      for (let i = 0; i < 3; i++) {
+        const a = (i / 3) * Math.PI * 2 + grow * 2;
+        const r = R * (0.3 + grow * 0.5);
+        ctx.beginPath();
+        ctx.arc(e.x + Math.cos(a) * r, e.y + Math.sin(a) * r - grow * 10, 2.2, 0, Math.PI * 2);
+        ctx.fill();
       }
       break;
     }
@@ -635,6 +644,20 @@ export function drawProjectile(
  * belong here, nowhere else.
  */
 export function drawEffect(g: CanvasRenderingContext2D, e: Effect, time: number): void {
+  try {
+    drawEffectInner(g, e, time);
+  } catch {
+    // A malformed effect must never take down the render loop.
+  }
+}
+
+/** Cheap deterministic hash → [-1, 1] (lightning jitter, shockwave wobble). */
+const jitter = (seed: number, i: number) => {
+  const x = Math.sin(seed * 127.1 + i * 311.7) * 43758.5453;
+  return (x - Math.floor(x)) * 2 - 1;
+};
+
+function drawEffectInner(g: CanvasRenderingContext2D, e: Effect, time: number): void {
   if (e.kind === "motif") {
     drawMotifEffect(g, e, time);
     return;
@@ -680,7 +703,124 @@ export function drawEffect(g: CanvasRenderingContext2D, e: Effect, time: number)
   g.globalAlpha = Math.max(0, life) * 0.9;
   g.strokeStyle = e.color;
   g.fillStyle = e.color;
-  if (e.kind === "ring") {
+  if (e.kind === "shockwave") {
+    // Expanding ring with a wobbled edge + thickness falloff — an impact
+    // wave, not a clean circle.
+    const age = e.maxTtl - e.ttl;
+    const r = Math.max(2, (e.radius ?? 16) + (e.expand ?? 240) * age);
+    const seed = e.seed ?? 1;
+    g.lineWidth = Math.max(0.8, (e.width ?? 5) * life);
+    g.shadowColor = e.color;
+    g.shadowBlur = 12;
+    g.beginPath();
+    const STEPS = 26;
+    for (let i = 0; i <= STEPS; i++) {
+      const a = (i / STEPS) * Math.PI * 2;
+      const wobble = 1 + jitter(seed, i % STEPS) * 0.08;
+      const px = e.x + Math.cos(a) * r * wobble;
+      const py = e.y + Math.sin(a) * r * wobble;
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    }
+    g.closePath();
+    g.stroke();
+  } else if (e.kind === "lightning") {
+    // Jagged branching bolt start→end; jitter re-rolls over its life so it
+    // crackles. Glow pass + white-hot core.
+    const seed = (e.seed ?? 1) + Math.floor((e.maxTtl - e.ttl) * 24) * 7;
+    const x2 = e.x2 ?? e.x + 60;
+    const y2 = e.y2 ?? e.y;
+    const dx = x2 - e.x;
+    const dy = y2 - e.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len;
+    const ny = dx / len;
+    const SEG = 7;
+    const pts: [number, number][] = [];
+    for (let i = 0; i <= SEG; i++) {
+      const t = i / SEG;
+      const amp = i === 0 || i === SEG ? 0 : jitter(seed, i) * len * 0.14;
+      pts.push([e.x + dx * t + nx * amp, e.y + dy * t + ny * amp]);
+    }
+    const polyline = () => {
+      g.beginPath();
+      for (let i = 0; i < pts.length; i++) {
+        if (i === 0) g.moveTo(pts[i][0], pts[i][1]);
+        else g.lineTo(pts[i][0], pts[i][1]);
+      }
+      g.stroke();
+    };
+    g.lineWidth = e.width ?? 2.5;
+    g.shadowColor = e.color;
+    g.shadowBlur = 10;
+    polyline();
+    // Forks off two interior joints.
+    g.lineWidth = (e.width ?? 2.5) * 0.55;
+    for (const fi of [2, 4]) {
+      const [fx, fy] = pts[fi];
+      g.beginPath();
+      g.moveTo(fx, fy);
+      g.lineTo(
+        fx + (dx / SEG) * 0.9 + nx * jitter(seed, fi + 11) * len * 0.2,
+        fy + (dy / SEG) * 0.9 + ny * jitter(seed, fi + 17) * len * 0.2,
+      );
+      g.stroke();
+    }
+    g.strokeStyle = "#ffffff";
+    g.lineWidth = (e.width ?? 2.5) * 0.4;
+    g.shadowBlur = 0;
+    polyline();
+  } else if (e.kind === "slasharc") {
+    // Crescent swipe: arc width tapers thick→thin toward both ends.
+    const r = e.radius ?? 40;
+    const a0 = e.a0 ?? -0.6;
+    const a1 = e.a1 ?? 0.6;
+    const W = (e.width ?? 9) * (0.4 + 0.6 * life);
+    const STEPS = 14;
+    g.shadowColor = e.color;
+    g.shadowBlur = 10;
+    g.beginPath();
+    for (let i = 0; i <= STEPS; i++) {
+      const t = i / STEPS;
+      const a = a0 + (a1 - a0) * t;
+      const w = W * Math.sin(t * Math.PI);
+      const rr = r + w / 2;
+      const px = e.x + Math.cos(a) * rr;
+      const py = e.y + Math.sin(a) * rr;
+      if (i === 0) g.moveTo(px, py);
+      else g.lineTo(px, py);
+    }
+    for (let i = STEPS; i >= 0; i--) {
+      const t = i / STEPS;
+      const a = a0 + (a1 - a0) * t;
+      const w = W * Math.sin(t * Math.PI);
+      g.lineTo(e.x + Math.cos(a) * (r - w / 2), e.y + Math.sin(a) * (r - w / 2));
+    }
+    g.closePath();
+    g.fill();
+  } else if (e.kind === "flash") {
+    // Impact pop: radial spike-lines + a quick bloom ring — no filled disc.
+    const age = e.maxTtl - e.ttl;
+    const r = (e.radius ?? 18) * (0.5 + age / e.maxTtl);
+    const seed = e.seed ?? 1;
+    g.lineWidth = 2.2 * life + 0.6;
+    g.shadowColor = e.color;
+    g.shadowBlur = 14;
+    for (let i = 0; i < 6; i++) {
+      const a = (i / 6) * Math.PI * 2 + jitter(seed, i) * 0.3;
+      const l0 = r * 0.35;
+      const l1 = r * (0.9 + jitter(seed, i + 7) * 0.25);
+      g.beginPath();
+      g.moveTo(e.x + Math.cos(a) * l0, e.y + Math.sin(a) * l0);
+      g.lineTo(e.x + Math.cos(a) * l1, e.y + Math.sin(a) * l1);
+      g.stroke();
+    }
+    g.strokeStyle = "#ffffff";
+    g.lineWidth = 1.4;
+    g.beginPath();
+    g.arc(e.x, e.y, r * 0.3, 0, Math.PI * 2);
+    g.stroke();
+  } else if (e.kind === "ring") {
     const age = e.maxTtl - e.ttl;
     // expand (px/s) lets behaviors design their own ring motion.
     const r =
@@ -707,6 +847,20 @@ export function drawEffect(g: CanvasRenderingContext2D, e: Effect, time: number)
       g.moveTo(e.x, e.y);
       g.lineTo(e.x - ((e.vx ?? 0) / v) * size * 2, e.y - ((e.vy ?? 0) / v) * size * 2);
       g.stroke();
+    } else if (e.particleShape === "shard") {
+      // Angular rotating fragment (ice/earth/shatter debris).
+      const rot = (e.seed ?? 0) + (e.maxTtl - e.ttl) * 9;
+      g.save();
+      g.translate(e.x, e.y);
+      g.rotate(rot);
+      g.beginPath();
+      g.moveTo(-size, 0);
+      g.lineTo(-size * 0.2, -size * 0.8);
+      g.lineTo(size, 0);
+      g.lineTo(-size * 0.2, size * 0.6);
+      g.closePath();
+      g.fill();
+      g.restore();
     } else if (e.particleShape === "star") {
       g.beginPath();
       for (let k = 0; k < 8; k++) {
